@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+# Build script to create Mozaic.app bundle
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+
+# Load version info
+source "$ROOT/version.env"
+
+# Configuration
+CONF=${1:-release}
+SIGNING_MODE=${MOZAIC_SIGNING:-dev}
+SKIP_MAIN_ASSETS=${MOZAIC_SKIP_MAIN_ASSETS:-0}
+APP_NAME="Mozaic"
+BUNDLE_ID="com.zemuliu.Mozaic"
+DEVELOPMENT_LOCALIZATION="en"
+BUILD_DIR="$ROOT/.build/app"
+APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
+
+# Build for host architecture by default; allow overriding via ARCHES (e.g., "arm64 x86_64" for universal).
+ARCH_LIST=( ${ARCHES:-} )
+if [[ ${#ARCH_LIST[@]} -eq 0 ]]; then
+  HOST_ARCH=$(uname -m)
+  case "$HOST_ARCH" in
+    arm64) ARCH_LIST=(arm64) ;;
+    x86_64) ARCH_LIST=(x86_64) ;;
+    *) ARCH_LIST=("$HOST_ARCH") ;;
+  esac
+fi
+
+echo "🔨 Building $APP_NAME ($CONF) for ${ARCH_LIST[*]}..."
+
+# Clean previous build
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+
+# Build MozaicNotch helper app using xcodebuild
+echo "🔨 Building MozaicNotch helper app..."
+xcodebuild -project "$ROOT/../boring.notch/boringNotch.xcodeproj" \
+  -scheme boringNotch \
+  -configuration Release \
+  -derivedDataPath "$BUILD_DIR/boringNotch-derivedData" \
+  CODE_SIGN_IDENTITY="" \
+  CODE_SIGNING_REQUIRED=NO \
+  CODE_SIGNING_ALLOWED=NO
+
+# Build for each architecture
+for ARCH in "${ARCH_LIST[@]}"; do
+  echo "  → Building for $ARCH..."
+  swift build -c "$CONF" --arch "$ARCH" --product "$APP_NAME"
+done
+
+# Create app bundle structure
+echo "📦 Creating app bundle..."
+mkdir -p "$APP_BUNDLE/Contents/MacOS"
+mkdir -p "$APP_BUNDLE/Contents/Resources"
+mkdir -p "$APP_BUNDLE/Contents/Frameworks"
+
+# ── MozaicNotch Helper ────────────────────────────────────────────────────────
+echo "💿 Bundling MozaicNotch helper..."
+mkdir -p "$APP_BUNDLE/Contents/Helpers"
+cp -R "$BUILD_DIR/boringNotch-derivedData/Build/Products/Release/boringNotch.app" "$APP_BUNDLE/Contents/Helpers/MozaicNotch.app"
+
+# Rebrand the helper application inside the bundle
+mv "$APP_BUNDLE/Contents/Helpers/MozaicNotch.app/Contents/MacOS/boringNotch" "$APP_BUNDLE/Contents/Helpers/MozaicNotch.app/Contents/MacOS/MozaicNotch"
+plutil -replace CFBundleExecutable -string "MozaicNotch" "$APP_BUNDLE/Contents/Helpers/MozaicNotch.app/Contents/Info.plist"
+plutil -replace CFBundleName -string "MozaicNotch" "$APP_BUNDLE/Contents/Helpers/MozaicNotch.app/Contents/Info.plist"
+plutil -replace CFBundleDisplayName -string "Mozaic Notch" "$APP_BUNDLE/Contents/Helpers/MozaicNotch.app/Contents/Info.plist"
+plutil -replace CFBundleIdentifier -string "com.zemuliu.MozaicNotch" "$APP_BUNDLE/Contents/Helpers/MozaicNotch.app/Contents/Info.plist"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+build_product_path() {
+  local name="$1"
+  local arch="$2"
+  case "$arch" in
+    arm64|x86_64) echo ".build/${arch}-apple-macosx/$CONF/$name" ;;
+    *) echo ".build/$CONF/$name" ;;
+  esac
+}
+
+verify_binary_arches() {
+  local binary="$1"; shift
+  local expected=("$@")
+  local actual
+  actual=$(lipo -archs "$binary")
+  for arch in "${expected[@]}"; do
+    if [[ "$actual" != *"$arch"* ]]; then
+      echo "ERROR: $binary missing arch $arch (have: ${actual})" >&2
+      exit 1
+    fi
+  done
+}
+
+# Compile an asset catalog into a given output directory.
+# Errors are intentionally NOT suppressed — a failed actool should stop the build.
+compile_asset_catalog() {
+  local source_catalog="$1"
+  local output_dir="$2"
+  if [[ ! -d "$source_catalog" ]]; then
+    echo "ERROR: asset catalog not found: $source_catalog" >&2
+    return 1
+  fi
+  xcrun actool \
+    --compile "$output_dir" \
+    --platform macosx \
+    --minimum-deployment-target 15.4 \
+    "$source_catalog"
+}
+
+emit_bundle_localizations_plist() {
+  local resources_dir="$1"
+  local development_localization="$2"
+  local localization
+  local localization_dir
+  {
+    if [[ -n "$development_localization" ]]; then
+      printf '%s\n' "$development_localization"
+    fi
+    find "$resources_dir" -type d -name '*.lproj' -print | while IFS= read -r localization_dir; do
+      localization=$(basename "$localization_dir" .lproj)
+      [[ "$localization" == "Base" ]] && continue
+      printf '%s\n' "$localization"
+    done
+  } | LC_ALL=C sort -u | while IFS= read -r localization; do
+    [[ -z "$localization" ]] && continue
+    printf '        <string>%s</string>\n' "$localization"
+  done
+}
+
+# Install binary (handles universal builds via lipo)
+install_binary() {
+  local name="$1"
+  local dest="$2"
+  local binaries=()
+  for arch in "${ARCH_LIST[@]}"; do
+    local src
+    src=$(build_product_path "$name" "$arch")
+    if [[ ! -f "$src" ]]; then
+      echo "ERROR: Missing ${name} build for ${arch} at ${src}" >&2
+      exit 1
+    fi
+    binaries+=("$src")
+  done
+  if [[ ${#ARCH_LIST[@]} -gt 1 ]]; then
+    lipo -create "${binaries[@]}" -output "$dest"
+  else
+    cp "${binaries[0]}" "$dest"
+  fi
+  chmod +x "$dest"
+  verify_binary_arches "$dest" "${ARCH_LIST[@]}"
+}
+
+# ── Executable ───────────────────────────────────────────────────────────────
+
+install_binary "$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+
+BUILD_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+# Create PkgInfo
+echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
+
+# ── AppleScript definition ───────────────────────────────────────────────────
+
+SDEF_PATH="$ROOT/Sources/Mozaic/Resources/Mozaic.sdef"
+if [[ -f "$SDEF_PATH" ]]; then
+  echo "📜 Copying AppleScript definition..."
+  cp "$SDEF_PATH" "$APP_BUNDLE/Contents/Resources/Mozaic.sdef"
+fi
+
+# ── App icon and main asset catalog ──────────────────────────────────────────
+# AppIcon.icon is an Icon Composer package (macOS 26+). actool consumes it
+# directly and produces Assets.car with full dark/light appearance layers.
+# The top-level Assets.car also needs AccentColor because Info.plist references
+# NSAccentColorName from the main bundle.
+
+ICON_SOURCE="$ROOT/Sources/Mozaic/Resources/AppIcon.icon"
+APP_ASSET_CATALOG="$ROOT/Sources/Mozaic/Resources/Assets.xcassets"
+
+# Copy the .icon bundle into the app for Liquid Glass dark/light switching
+if [[ -d "$ICON_SOURCE" ]]; then
+  echo "🎨 Copying AppIcon.icon bundle..."
+  cp -R "$ICON_SOURCE" "$APP_BUNDLE/Contents/Resources/AppIcon.icon"
+fi
+
+# Compile AppIcon.icon and AccentColor into Contents/Resources/Assets.car.
+# Xcode 26's actool currently fails on macOS 15 runners while processing
+# Icon Composer assets because it loads newer AVFCore/CoreMedia symbols.
+# UI-test CI can opt out via MOZAIC_SKIP_MAIN_ASSETS=1; release builds should
+# keep compiling these assets so AppIcon/AccentColor remain complete.
+if [[ "$SKIP_MAIN_ASSETS" == "1" ]]; then
+  echo "⚠️  Skipping main asset catalog compilation (MOZAIC_SKIP_MAIN_ASSETS=1)."
+elif [[ -d "$ICON_SOURCE" ]] && [[ -d "$APP_ASSET_CATALOG" ]] && command -v xcrun &>/dev/null; then
+  echo "🎨 Compiling main asset catalog..."
+  ICON_PARTIAL_PLIST="$BUILD_DIR/AppIconPartialInfo.plist"
+  xcrun actool "$ICON_SOURCE" "$APP_ASSET_CATALOG" \
+    --compile "$APP_BUNDLE/Contents/Resources" \
+    --notices --warnings --errors \
+    --output-partial-info-plist "$ICON_PARTIAL_PLIST" \
+    --app-icon AppIcon \
+    --enable-on-demand-resources NO \
+    --development-region "$DEVELOPMENT_LOCALIZATION" \
+    --target-device mac \
+    --minimum-deployment-target 15.4 \
+    --platform macosx
+  if [[ ! -f "$APP_BUNDLE/Contents/Resources/Assets.car" ]]; then
+    echo "ERROR: actool did not produce Assets.car from $ICON_SOURCE and $APP_ASSET_CATALOG" >&2
+    exit 1
+  fi
+  echo "   ✓ App icon and accent color compiled to Contents/Resources/Assets.car"
+else
+  echo "⚠️  Warning: $ICON_SOURCE or $APP_ASSET_CATALOG not found. App will have incomplete assets."
+fi
+
+# Overwrite with our beautiful custom app icon
+if [[ -f "$ROOT/Sources/Mozaic/Resources/AppIcon.icns" ]]; then
+  echo "🎨 Overwriting AppIcon.icns with custom Mozaic icon..."
+  cp "$ROOT/Sources/Mozaic/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+fi
+
+# ── Sparkle.framework ────────────────────────────────────────────────────────
+
+SPARKLE_FRAMEWORK=""
+for arch in "${ARCH_LIST[@]}"; do
+  CANDIDATE=$(build_product_path "" "$arch")
+  CANDIDATE_DIR=$(dirname "$CANDIDATE")
+  if [[ -d "$CANDIDATE_DIR/Sparkle.framework" ]]; then
+    SPARKLE_FRAMEWORK="$CANDIDATE_DIR/Sparkle.framework"
+    break
+  fi
+done
+if [[ -z "$SPARKLE_FRAMEWORK" ]] && [[ -d ".build/$CONF/Sparkle.framework" ]]; then
+  SPARKLE_FRAMEWORK=".build/$CONF/Sparkle.framework"
+fi
+
+if [[ -n "$SPARKLE_FRAMEWORK" ]]; then
+  echo "✨ Embedding Sparkle.framework..."
+  cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
+  chmod -R a+rX "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+  install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+else
+  echo "WARN: Sparkle.framework not found in build output. Auto-updates will not work."
+fi
+
+# ── SwiftPM resource bundles ──────────────────────────────────────────────────
+# Mozaic_Mozaic.bundle contains Assets.xcassets compiled for Bundle.module.
+# It is kept separate from the top-level Assets.car produced above.
+
+FIRST_ARCH="${ARCH_LIST[0]}"
+BINARY_PATH=$(build_product_path "$APP_NAME" "$FIRST_ARCH")
+PREFERRED_BUILD_DIR=$(dirname "$BINARY_PATH")
+shopt -s nullglob
+SWIFTPM_BUNDLES=("${PREFERRED_BUILD_DIR}/"*.bundle)
+shopt -u nullglob
+
+if [[ ${#SWIFTPM_BUNDLES[@]} -gt 0 ]]; then
+  for bundle in "${SWIFTPM_BUNDLES[@]}"; do
+    bundle_name=$(basename "$bundle")
+    bundle_dest="$APP_BUNDLE/Contents/Resources/$bundle_name"
+    echo "  → Copying resource bundle: $bundle_name"
+    cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"
+    # Compile into the bundle's own dir only — NOT into Contents/Resources,
+    # which would overwrite the AppIcon Assets.car compiled above.
+    if [[ -d "$bundle_dest/Assets.xcassets" ]] && command -v actool &>/dev/null; then
+      echo "    ↳ Compiling bundle asset catalog"
+      compile_asset_catalog "$bundle_dest/Assets.xcassets" "$bundle_dest"
+    fi
+  done
+
+  for bundle in "${SWIFTPM_BUNDLES[@]}"; do
+    bundle_name=$(basename "$bundle")
+    bundle_dest="$APP_BUNDLE/Contents/Resources/$bundle_name"
+    for xcstrings in "$bundle"/*.xcstrings; do
+      if [[ -f "$xcstrings" ]]; then
+        echo "  → Compiling localization catalog: $(basename "$xcstrings")"
+        xcrun xcstringstool compile "$xcstrings" \
+          --output-directory "$bundle_dest"
+        xcrun xcstringstool compile "$xcstrings" \
+          --output-directory "$APP_BUNDLE/Contents/Resources"
+      fi
+    done
+  done
+fi
+
+# ── Info.plist ────────────────────────────────────────────────────────────────
+
+APP_LOCALIZATIONS_PLIST=$(emit_bundle_localizations_plist "$APP_BUNDLE/Contents/Resources" "$DEVELOPMENT_LOCALIZATION")
+
+cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>${DEVELOPMENT_LOCALIZATION}</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+${APP_LOCALIZATIONS_PLIST}
+    </array>
+    <key>CFBundleExecutable</key>
+    <string>${APP_NAME}</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <key>CFBundleIcons</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconName</key>
+            <string>AppIcon</string>
+        </dict>
+    </dict>
+    <key>NSAccentColorName</key>
+    <string>AccentColor</string>
+    <key>CFBundleIdentifier</key>
+    <string>${BUNDLE_ID}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>${APP_NAME}</string>
+    <key>CFBundleDisplayName</key>
+    <string>${APP_NAME}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${MARKETING_VERSION}</string>
+    <key>CFBundleVersion</key>
+    <string>${BUILD_NUMBER}</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.music</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>15.4</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2025 Sertac Ozercan. All rights reserved.</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>LSUIElement</key>
+    <false/>
+
+    <!-- URL Scheme Registration -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.zemuliu.Mozaic</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>mozaic</string>
+            </array>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+        </dict>
+    </array>
+
+    <!-- Sparkle Auto-Update Configuration -->
+    <key>SUFeedURL</key>
+    <string>https://raw.githubusercontent.com/Ryz3nPlayZ/Mozaic/main/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>qa2zoeXHqn+pluxQSGjn5HyIYA/iFtrEJz7S1BoslpI=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
+    <key>SUAllowsAutomaticUpdates</key>
+    <true/>
+    <key>SUEnableInstallerLauncherService</key>
+    <true/>
+
+    <!-- AppleScript Support -->
+    <key>NSAppleScriptEnabled</key>
+    <true/>
+    <key>OSAScriptingDefinition</key>
+    <string>Mozaic.sdef</string>
+
+    <!-- Core Audio process tap (Equalizer) - macOS 14.2+ TCC requires these -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Mozaic processes its own music output through a built-in equalizer. This permission only covers Mozaic's own playback — no other app's audio is captured.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Mozaic taps its own audio output (not the screen) so the built-in equalizer can apply effects to your music. No screen content is recorded.</string>
+
+    <!-- Build Metadata -->
+    <key>MozaicBuildTimestamp</key>
+    <string>${BUILD_TIMESTAMP}</string>
+    <key>MozaicGitCommit</key>
+    <string>${GIT_COMMIT}</string>
+</dict>
+</plist>
+PLIST
+
+# ── Strip extended attributes ─────────────────────────────────────────────────
+
+xattr -cr "$APP_BUNDLE" 2>/dev/null || true
+find "$APP_BUNDLE" -name '._*' -delete 2>/dev/null || true
+
+# ── Code signing ──────────────────────────────────────────────────────────────
+
+if [[ "$SIGNING_MODE" == "unsigned" || "$SIGNING_MODE" == "none" ]]; then
+  echo "🔓 Skipping code signing."
+  echo ""
+  echo "✅ Build complete!"
+  echo "📍 App location: $APP_BUNDLE"
+  echo "   Version: ${MARKETING_VERSION} (${BUILD_NUMBER})"
+  echo "   Commit:  ${GIT_COMMIT}"
+  echo "   Arches:  ${ARCH_LIST[*]}"
+  echo "   Signing: unsigned"
+  echo ""
+  echo "To run: open $APP_BUNDLE"
+  echo "To install: cp -r $APP_BUNDLE /Applications/"
+  exit 0
+fi
+
+echo "🔏 Signing app..."
+case "$SIGNING_MODE" in
+  adhoc)
+    CODESIGN_ARGS=(--force --sign -)
+    ;;
+  dev|development)
+    if [[ -n "${APP_IDENTITY:-}" ]]; then
+      CODESIGN_ID="$APP_IDENTITY"
+    else
+      CODESIGN_ID=$(security find-identity -v -p codesigning | grep "Apple Development" | head -1 | awk '{print $2}' || true)
+    fi
+    if [[ -z "$CODESIGN_ID" ]]; then
+      echo "WARN: No Apple Development certificate found. Falling back to ad-hoc signing."
+      CODESIGN_ARGS=(--force --sign -)
+    else
+      CODESIGN_ARGS=(--force --options runtime --sign "$CODESIGN_ID")
+    fi
+    ;;
+  developer-id|distribution|release)
+    if [[ -n "${APP_IDENTITY:-}" ]]; then
+      CODESIGN_ID="$APP_IDENTITY"
+    else
+      CODESIGN_ID=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.+)".*/\1/' || true)
+    fi
+    if [[ -z "$CODESIGN_ID" ]]; then
+      echo "ERROR: No Developer ID Application certificate found for release signing." >&2
+      exit 1
+    fi
+    CODESIGN_ARGS=(--force --timestamp --options runtime --sign "$CODESIGN_ID")
+    ;;
+  *)
+    echo "ERROR: Unknown MOZAIC_SIGNING mode: $SIGNING_MODE" >&2
+    echo "Expected one of: adhoc, dev, developer-id, unsigned" >&2
+    exit 1
+    ;;
+esac
+
+resign() { codesign "${CODESIGN_ARGS[@]}" "$1"; }
+
+# Sign Sparkle components innermost-first
+SPARKLE="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+if [[ -d "$SPARKLE" ]]; then
+  echo "  → Signing Sparkle.framework..."
+  [[ -f "$SPARKLE/Versions/B/Sparkle" ]] && resign "$SPARKLE/Versions/B/Sparkle"
+  [[ -f "$SPARKLE/Versions/B/Autoupdate" ]] && resign "$SPARKLE/Versions/B/Autoupdate"
+  [[ -d "$SPARKLE/Versions/B/Updater.app" ]] && {
+    [[ -f "$SPARKLE/Versions/B/Updater.app/Contents/MacOS/Updater" ]] && resign "$SPARKLE/Versions/B/Updater.app/Contents/MacOS/Updater"
+    resign "$SPARKLE/Versions/B/Updater.app"
+  }
+  [[ -d "$SPARKLE/Versions/B/XPCServices/Downloader.xpc" ]] && {
+    [[ -f "$SPARKLE/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader" ]] && resign "$SPARKLE/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
+    resign "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
+  }
+  [[ -d "$SPARKLE/Versions/B/XPCServices/Installer.xpc" ]] && {
+    [[ -f "$SPARKLE/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer" ]] && resign "$SPARKLE/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+    resign "$SPARKLE/Versions/B/XPCServices/Installer.xpc"
+  }
+  resign "$SPARKLE/Versions/B" 2>/dev/null || true
+  resign "$SPARKLE"
+fi
+
+# Sign the MozaicNotch helper app if bundled
+NOTCH_APP="$APP_BUNDLE/Contents/Helpers/MozaicNotch.app"
+if [[ -d "$NOTCH_APP" ]]; then
+  echo "  → Signing MozaicNotch helper app..."
+  
+  # Sign Sparkle framework inside Notch
+  NOTCH_SPARKLE="$NOTCH_APP/Contents/Frameworks/Sparkle.framework"
+  if [[ -d "$NOTCH_SPARKLE" ]]; then
+    echo "    ↳ Signing Sparkle.framework inside Notch..."
+    [[ -f "$NOTCH_SPARKLE/Versions/B/Sparkle" ]] && resign "$NOTCH_SPARKLE/Versions/B/Sparkle"
+    [[ -f "$NOTCH_SPARKLE/Versions/B/Autoupdate" ]] && resign "$NOTCH_SPARKLE/Versions/B/Autoupdate"
+    [[ -d "$NOTCH_SPARKLE/Versions/B/Updater.app" ]] && {
+      [[ -f "$NOTCH_SPARKLE/Versions/B/Updater.app/Contents/MacOS/Updater" ]] && resign "$NOTCH_SPARKLE/Versions/B/Updater.app/Contents/MacOS/Updater"
+      resign "$NOTCH_SPARKLE/Versions/B/Updater.app"
+    }
+    [[ -d "$NOTCH_SPARKLE/Versions/B/XPCServices/Downloader.xpc" ]] && {
+      [[ -f "$NOTCH_SPARKLE/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader" ]] && resign "$NOTCH_SPARKLE/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
+      resign "$NOTCH_SPARKLE/Versions/B/XPCServices/Downloader.xpc"
+    }
+    [[ -d "$NOTCH_SPARKLE/Versions/B/XPCServices/Installer.xpc" ]] && {
+      [[ -f "$NOTCH_SPARKLE/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer" ]] && resign "$NOTCH_SPARKLE/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+      resign "$NOTCH_SPARKLE/Versions/B/XPCServices/Installer.xpc"
+    }
+    resign "$NOTCH_SPARKLE/Versions/B" 2>/dev/null || true
+    resign "$NOTCH_SPARKLE"
+  fi
+
+  # Sign Lottie framework inside Notch
+  NOTCH_LOTTIE="$NOTCH_APP/Contents/Frameworks/Lottie.framework"
+  if [[ -d "$NOTCH_LOTTIE" ]]; then
+    echo "    ↳ Signing Lottie.framework inside Notch..."
+    [[ -f "$NOTCH_LOTTIE/Versions/A/Lottie" ]] && resign "$NOTCH_LOTTIE/Versions/A/Lottie"
+    resign "$NOTCH_LOTTIE/Versions/A" 2>/dev/null || true
+    resign "$NOTCH_LOTTIE"
+  fi
+
+  # Sign MediaRemoteAdapter framework inside Notch
+  NOTCH_MR="$NOTCH_APP/Contents/Frameworks/MediaRemoteAdapter.framework"
+  if [[ -d "$NOTCH_MR" ]]; then
+    echo "    ↳ Signing MediaRemoteAdapter.framework inside Notch..."
+    [[ -f "$NOTCH_MR/MediaRemoteAdapter" ]] && resign "$NOTCH_MR/MediaRemoteAdapter"
+    resign "$NOTCH_MR"
+  fi
+
+  # Sign XPC Helper
+  XPC_HELPER="$NOTCH_APP/Contents/XPCServices/BoringNotchXPCHelper.xpc"
+  if [[ -d "$XPC_HELPER" ]]; then
+    resign "$XPC_HELPER/Contents/MacOS/BoringNotchXPCHelper" 2>/dev/null || true
+    resign "$XPC_HELPER"
+  fi
+
+  resign "$NOTCH_APP/Contents/MacOS/MozaicNotch"
+  codesign "${CODESIGN_ARGS[@]}" --entitlements "$ROOT/../boring.notch/boringNotch/boringNotch.entitlements" "$NOTCH_APP"
+fi
+
+if [[ -f "$ROOT/Mozaic.entitlements" ]]; then
+  codesign "${CODESIGN_ARGS[@]}" --entitlements "$ROOT/Mozaic.entitlements" "$APP_BUNDLE"
+else
+  codesign "${CODESIGN_ARGS[@]}" "$APP_BUNDLE"
+fi
+
+echo ""
+echo "✅ Build complete!"
+echo "📍 App location: $APP_BUNDLE"
+echo "   Version: ${MARKETING_VERSION} (${BUILD_NUMBER})"
+echo "   Commit:  ${GIT_COMMIT}"
+echo "   Arches:  ${ARCH_LIST[*]}"
+echo ""
+echo "To run: open $APP_BUNDLE"
+echo "To install: cp -r $APP_BUNDLE /Applications/"
