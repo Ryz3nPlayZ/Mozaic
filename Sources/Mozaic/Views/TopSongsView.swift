@@ -1,0 +1,229 @@
+import SwiftUI
+
+/// View displaying all top songs for an artist.
+struct TopSongsView: View {
+    @State var viewModel: TopSongsViewModel
+    @Environment(PlayerService.self) private var playerService
+    @Environment(FavoritesManager.self) private var favoritesManager
+    @Environment(SongLikeStatusManager.self) private var likeStatusManager
+
+    var body: some View {
+        Group {
+            switch self.viewModel.loadingState {
+            case .idle, .loading:
+                if self.viewModel.songs.isEmpty {
+                    LoadingView(String(localized: "Loading songs..."))
+                } else {
+                    // Show existing songs while loading more
+                    self.songsListView
+                        .overlay(alignment: .top) {
+                            if self.viewModel.loadingState == .loading {
+                                ProgressView()
+                                    .controlSize(.regular)
+                                    .frame(width: 20, height: 20)
+                                    .padding()
+                            }
+                        }
+                }
+            case .loaded, .loadingMore:
+                self.songsListView
+            case let .error(error):
+                ErrorView(error: error) {
+                    Task {
+                        await self.viewModel.load()
+                    }
+                }
+            }
+        }
+        .navigationTitle(self.viewModel.title)
+        .toolbarBackgroundVisibility(.hidden, for: .automatic)
+        .topFade()
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if case .error = self.viewModel.loadingState {} else {
+                PlayerBar()
+            }
+        }
+        .task {
+            if self.viewModel.loadingState == .idle {
+                await self.viewModel.load()
+            }
+        }
+    }
+
+    // MARK: - Views
+
+    private var songsListView: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(Array(self.viewModel.songs.enumerated()), id: \.offset) { index, song in
+                    self.songRow(song, index: index)
+
+                    if index < self.viewModel.songs.count - 1 {
+                        Divider()
+                            .padding(.leading, 56)
+                    }
+                }
+            }
+            .padding(.vertical, 16)
+        }
+        // Edge-to-edge with a resting inset so the list extends under the
+        // floating glass sidebar; the accent backdrop refracts through it.
+        .contentMargins(.horizontal, DetailContentLayout.horizontalInset, for: .scrollContent)
+    }
+
+    // MARK: - Song Row
+
+    private func songRow(_ song: Song, index: Int) -> some View {
+        HoverObservingRow { isHovered in
+            Button {
+                self.playSongInQueue(startingAt: index)
+            } label: {
+                HStack(spacing: 12) {
+                    // Thumbnail
+                    SongThumbnailView(song: song, size: 44, cornerRadius: 4)
+
+                    // Title (with optional explicit badge)
+                    HStack(spacing: 6) {
+                        Text(song.title)
+                            .font(.system(size: 14))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        if song.isExplicit == true {
+                            ExplicitBadge()
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    // Artist column
+                    Text(song.artistsDisplay)
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .frame(width: 150, alignment: .leading)
+
+                    // Album column (if available)
+                    if let album = song.album {
+                        Text(album.title)
+                            .font(.system(size: 14))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .frame(width: 180, alignment: .leading)
+                    } else {
+                        Spacer()
+                            .frame(width: 180)
+                    }
+
+                    // Favorite toggle
+                    LikeButton(song: song, isRowHovered: isHovered)
+
+                    // Duration
+                    Text(song.durationDisplay)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 50, alignment: .trailing)
+                }
+                .padding(.vertical, 10)
+                .padding(.horizontal, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .contextMenu {
+            Button {
+                self.playSongInQueue(startingAt: index)
+            } label: {
+                Label("Play", systemImage: "play.fill")
+            }
+
+            Divider()
+
+            FavoritesContextMenu.menuItem(for: song, manager: self.favoritesManager)
+
+            Divider()
+
+            LikeDislikeContextMenu(song: song, likeStatusManager: self.likeStatusManager)
+
+            Divider()
+
+            StartRadioContextMenu.menuItem(for: song, playerService: self.playerService)
+
+            Divider()
+
+            Button {
+                SongActionsHelper.addToLibrary(song, playerService: self.playerService)
+            } label: {
+                Label("Add to Library", systemImage: "plus.circle")
+            }
+
+            Divider()
+
+            ShareContextMenu.menuItem(for: song)
+
+            Divider()
+
+            AddToQueueContextMenu(song: song, playerService: self.playerService)
+
+            Divider()
+
+            AddToPlaylistContextMenu(song: song, client: self.viewModel.client)
+
+            Divider()
+
+            // Go to Artist - show first artist with valid ID
+            if let artist = song.artists.first(where: { $0.hasNavigableId }) {
+                NavigationLink(value: artist) {
+                    Label("Go to Artist", systemImage: "person")
+                }
+            }
+
+            // Go to Album - show if album has valid browse ID
+            if let album = song.album, album.hasNavigableId {
+                let playlist = Playlist(
+                    id: album.id,
+                    title: album.title,
+                    description: nil,
+                    thumbnailURL: album.thumbnailURL ?? song.thumbnailURL,
+                    trackCount: album.trackCount,
+                    author: Artist.inline(name: album.artistsDisplay, namespace: "album-artist")
+                )
+                NavigationLink(value: playlist) {
+                    Label("Go to Album", systemImage: "square.stack")
+                }
+            }
+        }
+    }
+
+    // MARK: - Actions
+
+    private func playSongInQueue(startingAt index: Int) {
+        Task {
+            await self.playerService.playQueue(self.viewModel.songs, startingAt: index)
+        }
+    }
+}
+
+#Preview {
+    let songs = (1 ... 10).map { i in
+        Song(
+            id: "song\(i)",
+            title: "Song \(i)",
+            artists: [Artist(id: "artist1", name: "Test Artist")],
+            album: Album(id: "album1", title: "Test Album", artists: nil, thumbnailURL: nil, year: "2023", trackCount: 10),
+            duration: TimeInterval(180 + i * 30),
+            thumbnailURL: nil,
+            videoId: "video\(i)"
+        )
+    }
+    let destination = TopSongsDestination(
+        artistId: "artist1",
+        artistName: "Test Artist",
+        songs: songs,
+        songsBrowseId: nil,
+        songsParams: nil
+    )
+    let authService = AuthService()
+    let client = YTMusicClient(authService: authService, webKitManager: .shared)
+    TopSongsView(viewModel: TopSongsViewModel(destination: destination, client: client))
+        .environment(PlayerService())
+        .environment(FavoritesManager.shared)
+}

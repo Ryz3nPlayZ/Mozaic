@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mozaic}",
+            "name": "Debug Mozaic",
+            "target": "Mozaic",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Mozaic"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mozaic}",
+            "name": "Release Mozaic",
+            "target": "Mozaic",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Mozaic"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mozaic}",
+            "name": "Debug api-explorer",
+            "target": "api-explorer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug api-explorer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mozaic}",
+            "name": "Release api-explorer",
+            "target": "api-explorer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release api-explorer"
+        }
+    ]
+}

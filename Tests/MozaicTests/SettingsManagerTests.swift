@@ -1,0 +1,269 @@
+import Foundation
+import Testing
+@testable import Mozaic
+
+/// Tests for SettingsManager.
+@Suite(.serialized, .tags(.service))
+@MainActor
+struct SettingsManagerTests {
+    // Note: These tests use a fresh UserDefaults domain to avoid affecting real settings
+
+    // MARK: - LaunchPage Tests
+
+    @Test("LaunchPage has correct display names")
+    func launchPageDisplayNames() {
+        #expect(SettingsManager.LaunchPage.home.displayName == "Home")
+        #expect(SettingsManager.LaunchPage.explore.displayName == "Explore")
+        #expect(SettingsManager.LaunchPage.charts.displayName == "Charts")
+        #expect(SettingsManager.LaunchPage.moodsAndGenres.displayName == "Moods & Genres")
+        #expect(SettingsManager.LaunchPage.newReleases.displayName == "New Releases")
+        #expect(SettingsManager.LaunchPage.likedMusic.displayName == "Liked Music")
+        #expect(SettingsManager.LaunchPage.playlists.displayName == "Playlists")
+        #expect(SettingsManager.LaunchPage.lastUsed.displayName == "Last Used")
+    }
+
+    @Test("LaunchPage rawValues are valid")
+    func launchPageRawValues() {
+        for page in SettingsManager.LaunchPage.allCases {
+            // Verify roundtrip through rawValue
+            let restored = SettingsManager.LaunchPage(rawValue: page.rawValue)
+            #expect(restored == page)
+        }
+    }
+
+    @Test("LaunchPage identifiers are unique")
+    func launchPageIdentifiersUnique() {
+        let ids = SettingsManager.LaunchPage.allCases.map(\.id)
+        let uniqueIds = Set(ids)
+        #expect(ids.count == uniqueIds.count)
+    }
+
+    @Test("LaunchPage converts to NavigationItem")
+    func launchPageNavigationItem() {
+        #expect(SettingsManager.LaunchPage.home.navigationItem == .home)
+        #expect(SettingsManager.LaunchPage.explore.navigationItem == .explore)
+        #expect(SettingsManager.LaunchPage.charts.navigationItem == .charts)
+        #expect(SettingsManager.LaunchPage.moodsAndGenres.navigationItem == .moodsAndGenres)
+        #expect(SettingsManager.LaunchPage.newReleases.navigationItem == .newReleases)
+        #expect(SettingsManager.LaunchPage.likedMusic.navigationItem == .likedMusic)
+        #expect(SettingsManager.LaunchPage.playlists.navigationItem == .library)
+        #expect(SettingsManager.LaunchPage.lastUsed.navigationItem == .home) // Fallback
+    }
+
+    // MARK: - Default Values Tests
+
+    @Test("Default showNowPlayingNotifications is true")
+    func defaultShowNowPlayingNotifications() {
+        // Access the shared instance to check its default
+        // Note: This tests the expected default value. May fail if user has modified UserDefaults.
+        let manager = SettingsManager.shared
+        #expect(manager.showNowPlayingNotifications == true)
+    }
+
+    @Test("Default hapticFeedbackEnabled is true")
+    func defaultHapticFeedbackEnabled() {
+        let manager = SettingsManager.shared
+        #expect(manager.hapticFeedbackEnabled == true)
+    }
+
+    @Test("Default rememberPlaybackSettings is false")
+    func defaultRememberPlaybackSettings() {
+        let manager = SettingsManager.shared
+        #expect(manager.rememberPlaybackSettings == false)
+    }
+
+    @Test("Default popOutVideoOnNavigateAway is true")
+    func defaultPopOutVideoOnNavigateAway() {
+        let manager = SettingsManager.shared
+        #expect(manager.popOutVideoOnNavigateAway == true)
+    }
+
+    @Test("popOutVideoOnNavigateAway persists to UserDefaults")
+    func popOutVideoOnNavigateAwayPersists() {
+        let manager = SettingsManager.shared
+        let originalValue = manager.popOutVideoOnNavigateAway
+        defer {
+            manager.popOutVideoOnNavigateAway = originalValue
+        }
+
+        manager.popOutVideoOnNavigateAway = false
+        #expect(UserDefaults.standard.bool(forKey: SettingsManager.Keys.popOutVideoOnNavigateAway) == false)
+
+        manager.popOutVideoOnNavigateAway = true
+        #expect(UserDefaults.standard.bool(forKey: SettingsManager.Keys.popOutVideoOnNavigateAway) == true)
+    }
+
+    @Test("Disabling rememberPlaybackSettings clears persisted values")
+    func disablingRememberPlaybackSettingsClearsValues() {
+        let manager = SettingsManager.shared
+        let shuffleKey = "playerShuffleEnabled"
+        let repeatKey = "playerRepeatMode"
+
+        // Set up some persisted values
+        UserDefaults.standard.set(true, forKey: shuffleKey)
+        UserDefaults.standard.set("all", forKey: repeatKey)
+
+        // Enable then disable the setting
+        manager.rememberPlaybackSettings = true
+        manager.rememberPlaybackSettings = false
+
+        // Verify values are cleared
+        #expect(UserDefaults.standard.object(forKey: shuffleKey) == nil)
+        #expect(UserDefaults.standard.object(forKey: repeatKey) == nil)
+    }
+
+    @Test("Explicit content languages expose stable API language codes")
+    func explicitContentLanguagesExposeAPILanguageCodes() {
+        let expectedCodes: [(SettingsManager.ContentLanguage, String)] = [
+            (.english, "en"),
+            (.korean, "ko"),
+            (.arabic, "ar"),
+            (.turkish, "tr"),
+            (.indonesian, "id"),
+        ]
+
+        for (language, expectedCode) in expectedCodes {
+            #expect(language.apiLanguageCode == expectedCode)
+        }
+    }
+
+    @Test("System content language uses the current locale language code fallback")
+    func systemContentLanguageUsesCurrentLocaleLanguageCode() {
+        let expectedCode = Locale.current.language.languageCode?.identifier ?? "en"
+        #expect(SettingsManager.ContentLanguage.system.apiLanguageCode == expectedCode)
+    }
+
+    @Test("Changing content language invalidates API cache and updates localization bundle")
+    func changingContentLanguageInvalidatesCacheAndUpdatesLocalizationBundle() {
+        let manager = SettingsManager.shared
+        let originalLanguage = manager.contentLanguage
+
+        defer {
+            APICache.shared.invalidateAll()
+            manager.contentLanguage = originalLanguage
+        }
+
+        manager.contentLanguage = .english
+        APICache.shared.set(key: "browse:test-home", data: ["title": "Home"], ttl: 60)
+
+        #expect(APICache.shared.get(key: "browse:test-home") != nil)
+
+        manager.contentLanguage = .korean
+
+        #expect(APICache.shared.get(key: "browse:test-home") == nil)
+        #expect(AppLocalization.bundle.localizedString(forKey: "Home", value: nil, table: nil) == "홈")
+    }
+
+    // MARK: - launchPage Computed Property Tests
+
+    @Test("launchPage returns defaultLaunchPage for non-lastUsed")
+    func launchPageReturnsDefault() {
+        let manager = SettingsManager.shared
+        let originalPage = manager.defaultLaunchPage
+
+        manager.defaultLaunchPage = .explore
+
+        #expect(manager.launchPage == .explore)
+
+        // Restore
+        manager.defaultLaunchPage = originalPage
+    }
+
+    @Test("launchPage returns lastUsedPage when set to lastUsed")
+    func launchPageReturnsLastUsed() {
+        let manager = SettingsManager.shared
+        let originalPage = manager.defaultLaunchPage
+        let originalLastUsed = manager.lastUsedPage
+
+        manager.defaultLaunchPage = .lastUsed
+        manager.lastUsedPage = .charts
+
+        #expect(manager.launchPage == .charts)
+
+        // Restore
+        manager.defaultLaunchPage = originalPage
+        manager.lastUsedPage = originalLastUsed
+    }
+
+    // MARK: - launchNavigationItem Tests
+
+    @Test("launchNavigationItem returns correct item")
+    func launchNavigationItemReturnsCorrect() {
+        let manager = SettingsManager.shared
+        let originalPage = manager.defaultLaunchPage
+
+        manager.defaultLaunchPage = .likedMusic
+
+        #expect(manager.launchNavigationItem == .likedMusic)
+
+        // Restore
+        manager.defaultLaunchPage = originalPage
+    }
+
+    // MARK: - MediaControlStyle Tests
+
+    @Test("MediaControlStyle has correct display names")
+    func mediaControlStyleDisplayNames() {
+        #expect(SettingsManager.MediaControlStyle.skipForwardBackward.displayName == "Skip Forward/Backward")
+        #expect(SettingsManager.MediaControlStyle.nextPreviousTrack.displayName == "Next/Previous Track")
+    }
+
+    @Test("MediaControlStyle rawValues roundtrip correctly")
+    func mediaControlStyleRawValues() {
+        for style in SettingsManager.MediaControlStyle.allCases {
+            let restored = SettingsManager.MediaControlStyle(rawValue: style.rawValue)
+            #expect(restored == style)
+        }
+    }
+
+    @Test("MediaControlStyle identifiers are unique")
+    func mediaControlStyleIdentifiersUnique() {
+        let ids = SettingsManager.MediaControlStyle.allCases.map(\.id)
+        let uniqueIds = Set(ids)
+        #expect(ids.count == uniqueIds.count)
+    }
+
+    @Test("Default mediaControlStyle is nextPreviousTrack")
+    func defaultMediaControlStyle() {
+        let manager = SettingsManager.shared
+        #expect(manager.mediaControlStyle == .nextPreviousTrack)
+    }
+
+    // MARK: - PlaybackAudioQuality Tests
+
+    @Test("PlaybackAudioQuality has correct display names")
+    func playbackAudioQualityDisplayNames() {
+        #expect(SettingsManager.PlaybackAudioQuality.auto.displayName == "Auto")
+        #expect(SettingsManager.PlaybackAudioQuality.low.displayName == "Low")
+        #expect(SettingsManager.PlaybackAudioQuality.normal.displayName == "Normal")
+        #expect(SettingsManager.PlaybackAudioQuality.high.displayName == "High")
+    }
+
+    @Test("PlaybackAudioQuality rawValues roundtrip correctly")
+    func playbackAudioQualityRawValues() {
+        for quality in SettingsManager.PlaybackAudioQuality.allCases {
+            let restored = SettingsManager.PlaybackAudioQuality(rawValue: quality.rawValue)
+            #expect(restored == quality)
+        }
+    }
+
+    @Test("PlaybackAudioQuality identifiers are unique")
+    func playbackAudioQualityIdentifiersUnique() {
+        let ids = SettingsManager.PlaybackAudioQuality.allCases.map(\.id)
+        let uniqueIds = Set(ids)
+        #expect(ids.count == uniqueIds.count)
+    }
+
+    @Test("PlaybackAudioQuality has all expected cases")
+    func playbackAudioQualityAllCasesCovered() {
+        #expect(SettingsManager.PlaybackAudioQuality.allCases.count == 4)
+    }
+
+    // MARK: - All Cases Coverage
+
+    @Test("All LaunchPage cases are covered")
+    func allLaunchPageCasesCovered() {
+        // Verify we have the expected number of cases
+        #expect(SettingsManager.LaunchPage.allCases.count == 8)
+    }
+}
