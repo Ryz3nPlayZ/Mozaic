@@ -8,7 +8,7 @@ struct VideoRowView: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            VideoThumbnailView(video: self.video)
+            VideoThumbnailView(video: self.video, targetSize: CGSize(width: 160, height: 90))
                 .frame(width: 160)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -51,11 +51,11 @@ struct ChannelRowView: View {
         HStack(spacing: 12) {
             CachedAsyncImage(
                 url: self.channel.thumbnailURL,
-                targetSize: CGSize(width: 96, height: 96)
+                targetSize: CGSize(width: 48, height: 48)
             ) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             } placeholder: {
                 Circle()
                     .fill(.quaternary)
@@ -107,11 +107,11 @@ struct YouTubePlaylistRowView: View {
         HStack(alignment: .top, spacing: 12) {
             CachedAsyncImage(
                 url: self.playlist.thumbnailURL,
-                targetSize: CGSize(width: 320, height: 180)
+                targetSize: CGSize(width: 160, height: 90)
             ) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             } placeholder: {
                 Rectangle()
                     .fill(.quaternary)
@@ -172,11 +172,11 @@ struct YouTubePlaylistCard: View {
         VStack(alignment: .leading, spacing: 8) {
             CachedAsyncImage(
                 url: self.playlist.thumbnailURL,
-                targetSize: CGSize(width: 640, height: 360)
+                targetSize: CGSize(width: 320, height: 180)
             ) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             } placeholder: {
                 Rectangle()
                     .fill(.quaternary)

@@ -3,11 +3,13 @@ import SwiftUI
 // MARK: - HomeSectionItemCard
 
 /// Reusable card view for home section items (songs, playlists, albums, artists).
-struct HomeSectionItemCard: View {
+struct HomeSectionItemCard: View, Equatable {
     let item: HomeSectionItem
     let rank: Int?
     let playAction: (() -> Void)?
     let action: () -> Void
+    private let hasPlayAction: Bool
+    @Environment(AuthService.self) private var authService
 
     /// Card dimensions.
     private static let squareThumbnailSize = CGSize(width: 160, height: 160)
@@ -28,6 +30,19 @@ struct HomeSectionItemCard: View {
         self.rank = rank
         self.playAction = playAction
         self.action = action
+        self.hasPlayAction = playAction != nil
+    }
+
+    /// Lets SwiftUI skip re-evaluating unchanged cards when a shelf or its
+    /// parent re-renders (measured: this is what made Home scrolling hitch).
+    ///
+    /// Contract for callers: `action`/`playAction` must depend only on `item`
+    /// (and `rank`). If two cards compare equal, the old closures are kept, so
+    /// an action that captured section membership or index would go stale.
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.item.hasSameCardContent(as: rhs.item)
+            && lhs.rank == rhs.rank
+            && lhs.hasPlayAction == rhs.hasPlayAction
     }
 
     var body: some View {
@@ -50,16 +65,11 @@ struct HomeSectionItemCard: View {
                     self.regularContent
                 }
             }
+            // Hover feedback lives on the thumbnail (see `thumbnail`), so the
+            // button style only contributes press feedback and registers no
+            // hover responder.
             .buttonStyle(.interactiveCard(showShadow: false, hoverScale: 1))
         }
-        .scaleEffect(self.isHovering ? 1.02 : 1)
-        .shadow(
-            color: self.isHovering ? .black.opacity(0.15) : .clear,
-            radius: self.isHovering ? 12 : 0,
-            x: 0,
-            y: self.isHovering ? 4 : 0
-        )
-        .animation(AppAnimation.spring, value: self.isHovering)
         .onHover { hovering in
             withAnimation(AppAnimation.quick) {
                 self.isHovering = hovering
@@ -101,11 +111,18 @@ struct HomeSectionItemCard: View {
     // MARK: - Shared Components
 
     private var thumbnail: some View {
-        ZStack {
+        let thumbnailURLs = self.thumbnailURLs
+        let thumbnailURL = thumbnailURLs.first { !self.failedThumbnailURLs.contains($0) }
+
+        return ZStack {
             self.thumbnailBackground
 
-            if let url = self.thumbnailURL {
-                CachedAsyncImage(url: url, targetSize: self.thumbnailSize, onFailure: self.thumbnailFailureHandler) { image in
+            if let thumbnailURL {
+                CachedAsyncImage(
+                    url: thumbnailURL,
+                    targetSize: self.thumbnailSize,
+                    onFailure: self.thumbnailFailureHandler(for: thumbnailURL, in: thumbnailURLs)
+                ) { image in
                     image
                         .resizable()
                         .aspectRatio(contentMode: self.thumbnailContentMode)
@@ -118,6 +135,9 @@ struct HomeSectionItemCard: View {
         }
         .frame(width: self.thumbnailSize.width, height: self.thumbnailSize.height)
         .clipShape(.rect(cornerRadius: 8))
+        // Lift only the thumbnail and add its shadow on hover while preserving
+        // the loaded image's identity.
+        .modifier(ThumbnailHoverLift(isHovering: self.isHovering))
         .overlay {
             // Play overlay on hover (for songs)
             if case .song = self.item, self.isHovering {
@@ -128,7 +148,7 @@ struct HomeSectionItemCard: View {
         .overlay(alignment: .topTrailing) {
             // Favorite heart in the corner for songs
             if case let .song(song) = self.item {
-                LikeButton(song: song, isRowHovered: self.isHovering)
+                LikeButton(song: song, isRowHovered: self.isHovering, allowsActions: self.authService.hasPersonalAccount)
                     .padding(6)
             }
         }
@@ -136,7 +156,7 @@ struct HomeSectionItemCard: View {
 
     private var supportsPlaylistPlayAction: Bool {
         guard case .playlist = self.item else { return false }
-        return self.playAction != nil
+        return self.hasPlayAction
     }
 
     @ViewBuilder
@@ -145,10 +165,6 @@ struct HomeSectionItemCard: View {
             Rectangle()
                 .fill(Color(nsColor: .controlBackgroundColor).opacity(0.55))
         }
-    }
-
-    private var thumbnailURL: URL? {
-        self.thumbnailURLs.first { !self.failedThumbnailURLs.contains($0) }
     }
 
     private var thumbnailURLs: [URL] {
@@ -163,10 +179,8 @@ struct HomeSectionItemCard: View {
         return Self.uniqueURLs([self.item.thumbnailURL?.highQualityThumbnailURL])
     }
 
-    private var thumbnailFailureHandler: (@MainActor () -> Void)? {
-        guard let thumbnailURL,
-              self.hasFallback(after: thumbnailURL)
-        else {
+    private func thumbnailFailureHandler(for thumbnailURL: URL, in thumbnailURLs: [URL]) -> (@MainActor () -> Void)? {
+        guard self.hasFallback(after: thumbnailURL, in: thumbnailURLs) else {
             return nil
         }
 
@@ -189,9 +203,9 @@ struct HomeSectionItemCard: View {
         self.isVideoSong ? .fit : .fill
     }
 
-    private func hasFallback(after url: URL) -> Bool {
-        guard let index = self.thumbnailURLs.firstIndex(of: url) else { return false }
-        let fallbackURLs = self.thumbnailURLs.dropFirst(index + 1)
+    private func hasFallback(after url: URL, in thumbnailURLs: [URL]) -> Bool {
+        guard let index = thumbnailURLs.firstIndex(of: url) else { return false }
+        let fallbackURLs = thumbnailURLs.dropFirst(index + 1)
         return fallbackURLs.contains { !self.failedThumbnailURLs.contains($0) }
     }
 
@@ -297,14 +311,29 @@ struct HomeSectionItemCard: View {
     }
 
     private var isVideoSong: Bool {
-        guard case let .song(song) = self.item else { return false }
+        self.item.isVideoSong
+    }
+}
 
-        if let musicVideoType = song.musicVideoType {
-            return musicVideoType != .atv
-        }
+// MARK: - ThumbnailHoverLift
 
-        let subtitle = song.artistsDisplay.lowercased()
-        return subtitle.contains("views") || subtitle.contains("video")
+private struct ThumbnailHoverLift: ViewModifier {
+    let isHovering: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                // Keep the stateful image outside the conditional branch.
+                if self.isHovering {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(.black.opacity(0.15))
+                        .blur(radius: 12)
+                        .offset(y: 4)
+                        .allowsHitTesting(false)
+                }
+            }
+            .scaleEffect(self.isHovering ? 1.02 : 1)
+            .animation(AppAnimation.spring, value: self.isHovering)
     }
 }
 
@@ -326,7 +355,7 @@ private struct LiquidGlassPlayIcon: View {
 
 // MARK: - SongCoverPlayOverlay
 
-private struct SongCoverPlayOverlay: View {
+struct SongCoverPlayOverlay: View {
     let size: CGSize
 
     var body: some View {
@@ -351,4 +380,6 @@ private struct SongCoverPlayOverlay: View {
         }
     }
     .padding()
+    .environment(AuthService())
+    .environment(SongLikeStatusManager.shared)
 }

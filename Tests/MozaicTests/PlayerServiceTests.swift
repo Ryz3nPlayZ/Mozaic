@@ -181,6 +181,19 @@ struct PlayerServiceTests {
         #expect(self.playerService.volume == 1.0)
     }
 
+    @Test("Immediate volume commands preserve dispatch order")
+    func immediateVolumeChanges() {
+        var appliedVolumes: [Double] = []
+        self.playerService.applyMusicPlaybackVolume = { appliedVolumes.append($0) }
+
+        self.playerService.setVolumeImmediately(0.4)
+        self.playerService.setVolumeImmediately(0.7)
+
+        #expect(appliedVolumes == [0.4, 0.7])
+        #expect(self.playerService.volume == 0.7)
+        #expect(UserDefaults.standard.double(forKey: "playerVolume") == 0.7)
+    }
+
     // MARK: - Queue Tests
 
     @Test("Play queue sets queue")
@@ -261,8 +274,17 @@ struct PlayerServiceTests {
 
     @Test("Play empty queue does nothing")
     func playQueueEmptyDoesNothing() async {
+        let song = TestFixtures.makeSong(id: "empty-noop-current")
+        await self.playerService.playQueue([song], startingAt: 0)
+        let intent = self.playerService.currentMusicPlaybackIntent
+        let occurrence = self.playerService.currentMusicPlaybackOccurrence
+
         await self.playerService.playQueue([], startingAt: 0)
-        #expect(self.playerService.queue.isEmpty)
+
+        #expect(self.playerService.queue == [song])
+        #expect(self.playerService.currentTrack == song)
+        #expect(self.playerService.currentMusicPlaybackIntent == intent)
+        #expect(self.playerService.currentMusicPlaybackOccurrence == occurrence)
     }
 
     // MARK: - User Interaction Tests

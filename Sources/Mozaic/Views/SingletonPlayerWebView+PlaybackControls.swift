@@ -3,62 +3,70 @@ import WebKit
 // MARK: - SingletonPlayerWebView Playback Controls Extension
 
 extension SingletonPlayerWebView {
+    /// Enables/disables startup autoplay blocking inside the observer script.
+    func setAutoplayBlocked(_ blocked: Bool) {
+        guard let webView else { return }
+        let script = """
+            (function() {
+                window.__mozaicBlockAutoplay = \(blocked ? "true" : "false");
+                if (window.__mozaicAutoplayBlockTimer) {
+                    clearInterval(window.__mozaicAutoplayBlockTimer);
+                    window.__mozaicAutoplayBlockTimer = null;
+                }
+                if (!window.__mozaicBlockAutoplay) return 'autoplay-allowed';
+                window.__mozaicAutoplayPending = false;
+                \(WebPlaybackAudioOutput.stopScript)
+                var ticks = 0;
+                const timer = setInterval(function() {
+                    if (!window.__mozaicBlockAutoplay) {
+                        clearInterval(timer);
+                        if (window.__mozaicAutoplayBlockTimer === timer) window.__mozaicAutoplayBlockTimer = null;
+                        return;
+                    }
+                    const video = document.querySelector('video');
+                    if (video && !video.paused) {
+                        try { video.pause(); } catch (_) {}
+                    }
+                    ticks += 1;
+                    if (ticks >= 20) {
+                        clearInterval(timer);
+                        if (window.__mozaicAutoplayBlockTimer === timer) window.__mozaicAutoplayBlockTimer = null;
+                    }
+                }, 150);
+                window.__mozaicAutoplayBlockTimer = timer;
+                return 'autoplay-blocked';
+            })();
+        """
+        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
     struct PlaybackSnapshot {
         let progress: TimeInterval
         let duration: TimeInterval
         let videoId: String?
     }
 
+    nonisolated static let playbackSnapshotScript = """
+        (function() {
+            const video = document.querySelector('video');
+            if (!video || video.readyState < 1 || !video.__mozaicBoundVideoId
+                || !(video.__mozaicMediaGeneration > 0)) return null;
+            const source = video.currentSrc || video.src || '';
+            if (!source || source !== video.__mozaicBoundMediaSource) return null;
+            return {
+                progress: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+                duration: Number.isFinite(video.duration) ? video.duration : 0,
+                videoId: video.__mozaicBoundVideoId
+            };
+        })();
+    """
+
     /// Reads playback time from the live WebView video element.
     func currentPlaybackSnapshot() async -> PlaybackSnapshot? {
         guard let webView else { return nil }
 
-        let script = """
-            (function() {
-                function currentPlayerData() {
-                    const ytmusicPlayer = document.querySelector('ytmusic-player');
-                    if (ytmusicPlayer && ytmusicPlayer.playerApi
-                        && typeof ytmusicPlayer.playerApi.getVideoData === 'function') {
-                        const data = ytmusicPlayer.playerApi.getVideoData();
-                        if (data && typeof data === 'object') return data;
-                    }
-
-                    const moviePlayer = document.getElementById('movie_player');
-                    if (moviePlayer && typeof moviePlayer.getVideoData === 'function') {
-                        const data = moviePlayer.getVideoData();
-                        if (data && typeof data === 'object') return data;
-                    }
-
-                    return null;
-                }
-
-                function currentVideoId() {
-                    const playerData = currentPlayerData();
-                    if (playerData) {
-                        const playerVideoId = playerData.video_id || playerData.videoId || '';
-                        if (playerVideoId) return playerVideoId;
-                    }
-
-                    try {
-                        const url = new URL(window.location.href);
-                        return url.searchParams.get('v') || '';
-                    } catch (e) {
-                        return '';
-                    }
-                }
-
-                const video = document.querySelector('video');
-                if (!video) return null;
-                return {
-                    progress: Number.isFinite(video.currentTime) ? video.currentTime : 0,
-                    duration: Number.isFinite(video.duration) ? video.duration : 0,
-                    videoId: currentVideoId()
-                };
-            })();
-        """
-
         return await withCheckedContinuation { continuation in
-            webView.evaluateJavaScript(script) { result, error in
+            webView.evaluateJavaScript(Self.playbackSnapshotScript) { result, error in
                 if let error {
                     self.logger.error("currentPlaybackSnapshot error: \(error.localizedDescription)")
                     continuation.resume(returning: nil)
@@ -95,21 +103,66 @@ extension SingletonPlayerWebView {
         }
     }
 
+    nonisolated static var playPauseCommandScript: String {
+        """
+        (function() {
+            const playBtn = document.querySelector('.play-pause-button.ytmusic-player-bar');
+            if (playBtn) {
+                const video = document.querySelector('video');
+                const wantsPlay = !video || video.paused;
+                window.__mozaicAutoplayPending = wantsPlay;
+                window.__mozaicPlaybackSuppressed = !wantsPlay;
+                if (wantsPlay) {
+                    window.__mozaicBlockAutoplay = false;
+                    \(WebPlaybackAudioOutput.prepareScript)
+                    window.__mozaicAutoplayAttempts = 0;
+                    window.__mozaicAutoplayRetryScheduled = false;
+                    if (video && typeof window.__mozaicAttemptAutoplayRecovery === 'function') {
+                        return window.__mozaicAttemptAutoplayRecovery(video, playBtn);
+                    }
+                } else {
+                    \(WebPlaybackAudioOutput.stopScript)
+                }
+                playBtn.click();
+                return 'clicked';
+            }
+            const video = document.querySelector('video');
+            if (video) {
+                if (video.paused) {
+                    window.__mozaicAutoplayPending = true;
+                    window.__mozaicPlaybackSuppressed = false;
+                    window.__mozaicBlockAutoplay = false;
+                    \(WebPlaybackAudioOutput.prepareScript)
+                    window.__mozaicAutoplayAttempts = 0;
+                    window.__mozaicAutoplayRetryScheduled = false;
+                    if (typeof window.__mozaicAttemptAutoplayRecovery === 'function') {
+                        return window.__mozaicAttemptAutoplayRecovery(video, null);
+                    }
+                    video.play();
+                    return 'played';
+                } else {
+                    window.__mozaicAutoplayPending = false;
+                    window.__mozaicPlaybackSuppressed = true;
+                    \(WebPlaybackAudioOutput.stopScript)
+                    video.pause();
+                    return 'paused';
+                }
+            }
+            return 'no-element';
+        })();
+        """
+    }
+
     /// Toggle play/pause.
     func playPause() {
         guard let webView else { return }
+        let generation = self.documentGeneration.currentGeneration
+        guard self.documentGeneration.accepts(generation: generation) else { return }
 
         let script = """
-            (function() {
-                const playBtn = document.querySelector('.play-pause-button.ytmusic-player-bar');
-                if (playBtn) { playBtn.click(); return 'clicked'; }
-                const video = document.querySelector('video');
-                if (video) {
-                    if (video.paused) { video.play(); return 'played'; }
-                    else { video.pause(); return 'paused'; }
-                }
-                return 'no-element';
-            })();
+            if (window.__mozaicDocumentGeneration === \(generation)) {
+                \(Self.playPauseCommandScript)
+            }
         """
         webView.evaluateJavaScript(script) { [weak self] _, error in
             if let error {
@@ -118,18 +171,72 @@ extension SingletonPlayerWebView {
         }
     }
 
+    nonisolated static var playCommandScript: String {
+        """
+        (function() {
+            window.__mozaicAutoplayPending = true;
+            window.__mozaicPlaybackSuppressed = false;
+            window.__mozaicBlockAutoplay = false;
+            window.__mozaicResumeAdOnly = false;
+            window.__mozaicAutoplayAttempts = 0;
+            window.__mozaicAutoplayRetryScheduled = false;
+            const video = document.querySelector('video');
+            if (video && video.paused) {
+                \(WebPlaybackAudioOutput.prepareScript)
+                if (typeof window.__mozaicAttemptAutoplayRecovery === 'function') {
+                    return window.__mozaicAttemptAutoplayRecovery(video, null);
+                }
+                video.play();
+                return 'played';
+            }
+            return video ? 'already-playing' : 'pending-media';
+        })();
+        """
+    }
+
     /// Play (resume).
     func play() {
         guard let webView else { return }
+        let generation = self.documentGeneration.currentGeneration
+        guard self.documentGeneration.accepts(generation: generation) else { return }
+        webView.evaluateJavaScript("""
+            if (window.__mozaicDocumentGeneration === \(generation)) {
+                \(Self.playCommandScript)
+            }
+        """, completionHandler: nil)
+    }
 
-        let script = """
+    /// During restored playback, a paused preroll ad must advance before the
+    /// content seek can be reconciled. Never unsuppress ordinary content here.
+    func resumeReadyAdvertisementIfPresent() {
+        guard let webView else { return }
+        let generation = self.documentGeneration.currentGeneration
+        guard self.documentGeneration.accepts(generation: generation) else { return }
+        webView.evaluateJavaScript("""
             (function() {
+                if (window.__mozaicDocumentGeneration !== \(generation)) return 'stale';
+                window.__mozaicBlockAutoplay = false;
+                if (window.__mozaicAutoplayBlockTimer) {
+                    clearInterval(window.__mozaicAutoplayBlockTimer);
+                    window.__mozaicAutoplayBlockTimer = null;
+                }
+                \(PlaybackAdDetectionScript.detection)
+                const isAd = isAdShowing();
                 const video = document.querySelector('video');
-                if (video && video.paused) { video.play(); return 'played'; }
-                return 'already-playing';
+                if (!isAd || !video || !video.currentSrc || video.readyState < 1) return 'not-ready-ad';
+                window.__mozaicPlaybackSuppressed = false;
+                window.__mozaicAutoplayPending = true;
+                window.__mozaicResumeAdOnly = true;
+                if (video.paused) {
+                    if (typeof window.__mozaicAttemptAutoplayRecovery === 'function') {
+                        window.__mozaicAttemptAutoplayRecovery(video, null);
+                    } else {
+                        video.play();
+                    }
+                }
+                return 'playing-ad';
             })();
-        """
-        webView.evaluateJavaScript(script, completionHandler: nil)
+        """, completionHandler: nil)
     }
 
     /// Pause.
@@ -138,6 +245,9 @@ extension SingletonPlayerWebView {
 
         let script = """
             (function() {
+            window.__mozaicAutoplayPending = false;
+            window.__mozaicPlaybackSuppressed = true;
+            \(WebPlaybackAudioOutput.stopScript)
                 const video = document.querySelector('video');
                 if (video && !video.paused) { video.pause(); return 'paused'; }
                 return 'already-paused';
@@ -196,13 +306,12 @@ extension SingletonPlayerWebView {
         webView.evaluateJavaScript(script, completionHandler: nil)
     }
 
-    /// Atomically pause and seek the underlying video.
-    func seekAndPause(to time: Double) {
-        guard let webView else { return }
-
+    /// Pure script for atomically pausing and seeking the underlying video.
+    nonisolated static func seekAndPauseScript(to time: Double) -> String {
         let safeTime = time.isFinite ? max(time, 0) : 0
-        let script = """
+        return """
             (function() {
+                \(WebPlaybackAudioOutput.stopScript)
                 const video = document.querySelector('video');
                 if (!video) { return 'no-video'; }
                 video.pause();
@@ -211,13 +320,50 @@ extension SingletonPlayerWebView {
                 return 'seeked-paused';
             })();
         """
-        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
+    /// Atomically pause and seek the underlying video.
+    func seekAndPause(to time: Double) {
+        guard let webView else { return }
+        webView.evaluateJavaScript(Self.seekAndPauseScript(to: time), completionHandler: nil)
     }
 
     /// Seeks to the start and resumes playback without a full page load (repeat-one, same-URL recovery).
     func restartInPlaceFromBeginning() {
-        self.seek(to: 0)
-        self.play()
+        guard let webView else { return }
+        if let nativeGeneration = self.coordinator?.playerService.currentMusicPlaybackOccurrence?.nativeGeneration {
+            self.setNativePlaybackGeneration(nativeGeneration)
+        }
+        let documentGeneration = self.documentGeneration.currentGeneration
+        guard self.documentGeneration.accepts(generation: documentGeneration) else { return }
+        let script = """
+            (function() {
+                if (window.__mozaicDocumentGeneration !== \(documentGeneration)) return 'stale';
+                window.__mozaicBlockAutoplay = false;
+                if (window.__mozaicAutoplayBlockTimer) {
+                    clearInterval(window.__mozaicAutoplayBlockTimer);
+                    window.__mozaicAutoplayBlockTimer = null;
+                }
+                window.__mozaicAutoplayPending = true;
+                window.__mozaicPlaybackSuppressed = false;
+                window.__mozaicResumeAdOnly = false;
+                window.__mozaicAutoplayAttempts = 0;
+                window.__mozaicAutoplayRetryScheduled = false;
+                const video = document.querySelector('video');
+                if (!video) return 'no-video';
+                video.currentTime = 0;
+                if (typeof window.__mozaicAdvanceMediaGeneration === 'function') {
+                    window.__mozaicAdvanceMediaGeneration();
+                }
+                if (typeof window.__mozaicAttemptAutoplayRecovery === 'function') {
+                    window.__mozaicAttemptAutoplayRecovery(video, null);
+                } else {
+                    video.play();
+                }
+                return 'restarted';
+            })();
+        """
+        webView.evaluateJavaScript(script, completionHandler: nil)
     }
 
     /// Set volume (0.0 - 1.0).
@@ -270,11 +416,13 @@ extension SingletonPlayerWebView {
     }
 
     /// Show the native AirPlay picker for the WebView's video element.
-    func showAirPlayPicker() {
+    func showAirPlayPicker(at screenPoint: CGPoint? = nil) {
         guard let webView else {
             DiagnosticsLogger.airplay.warning("showAirPlayPicker called but webView is nil")
             return
         }
+
+        AirPlayPickerAnchor.preparePicker(in: webView, at: screenPoint)
 
         let script = """
             (function() {
@@ -282,7 +430,6 @@ extension SingletonPlayerWebView {
                 if (!video) return 'no-video';
                 if (typeof video.webkitShowPlaybackTargetPicker !== 'function') return 'unsupported';
 
-                window.__mozaicAirPlayRequested = true;
                 video.webkitShowPlaybackTargetPicker();
                 return 'picker-shown';
             })();

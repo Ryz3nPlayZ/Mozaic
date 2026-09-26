@@ -9,46 +9,47 @@ import SwiftUI
 struct PersistentPlayerView: NSViewRepresentable {
     @Environment(WebKitManager.self) private var webKitManager
     @Environment(PlayerService.self) private var playerService
+    @Environment(AuthService.self) private var authService
 
-    let videoId: String
+    let videoId: String?
     let isExpanded: Bool // Retained for compatibility; audio playback keeps this hidden.
 
     private let logger = DiagnosticsLogger.player
 
     func makeNSView(context _: Context) -> NSView {
-        self.logger.info("PersistentPlayerView.makeNSView for videoId: \(self.videoId)")
+        self.logger.info("PersistentPlayerView.makeNSView for videoId: \(self.videoId ?? "nil")")
 
         let container = NSView(frame: .zero)
         container.wantsLayer = true
 
-        // Get or create the singleton WebView
         let webView = SingletonPlayerWebView.shared.getWebView(
             webKitManager: self.webKitManager,
-            playerService: self.playerService
+            playerService: self.playerService,
+            usesCookieFreeDataStore: self.authService.shouldUseCookieFreePlaybackDataStore
         )
 
-        // Remove from any previous superview and add to this container
         webView.removeFromSuperview()
         webView.frame = container.bounds
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
         // Restored sessions keep the hidden WebView inert until the user explicitly resumes.
-        if self.playerService.shouldAutoloadPendingVideo,
-           SingletonPlayerWebView.shared.currentVideoId != self.videoId
+        if let videoId = self.videoId,
+           self.playerService.shouldAutoloadPendingVideo,
+           SingletonPlayerWebView.shared.currentVideoId != videoId
         {
-            self.logger.info("Initial hidden load for videoId: \(self.videoId)")
-            SingletonPlayerWebView.shared.loadVideo(videoId: self.videoId)
+            self.logger.info("Initial hidden load for videoId: \(videoId)")
+            SingletonPlayerWebView.shared.loadVideo(videoId: videoId)
         }
 
         return container
     }
 
     func updateNSView(_ container: NSView, context _: Context) {
-        // Ensure WebView is in this container
         let webView = SingletonPlayerWebView.shared.getWebView(
             webKitManager: self.webKitManager,
-            playerService: self.playerService
+            playerService: self.playerService,
+            usesCookieFreeDataStore: self.authService.shouldUseCookieFreePlaybackDataStore
         )
 
         if webView.superview !== container {
@@ -61,31 +62,18 @@ struct PersistentPlayerView: NSViewRepresentable {
 
         webView.frame = container.bounds
 
-        if self.playerService.shouldAutoloadPendingVideo,
-           SingletonPlayerWebView.shared.currentVideoId != self.videoId
+        if let videoId = self.videoId,
+           self.playerService.shouldAutoloadPendingVideo,
+           SingletonPlayerWebView.shared.currentVideoId != videoId
         {
-            SingletonPlayerWebView.shared.loadVideo(videoId: self.videoId)
+            SingletonPlayerWebView.shared.loadVideo(videoId: videoId)
         }
-    }
-}
-
-// MARK: - MiniPlayerToast
-
-/// A small toast-style view that appears when mini player is shown.
-/// Uses Liquid Glass materialize transition for smooth appearance.
-struct MiniPlayerToast: View {
-    let videoId: String
-
-    var body: some View {
-        PersistentPlayerView(videoId: self.videoId, isExpanded: true)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .compatGlassTransition(.materialize)
     }
 }
 
 // MARK: - MiniPlayerWindow
 
-struct MiniPlayerWindow: View {
+struct MiniPlayerWindow: View { // swiftlint:disable:this type_body_length
     private enum Layout {
         static let chromeTopInset: CGFloat = 12
         static let trafficLightSize: CGFloat = 13
@@ -98,6 +86,7 @@ struct MiniPlayerWindow: View {
         case queue
     }
 
+    @Environment(AuthService.self) private var authService
     @Environment(PlayerService.self) private var playerService
 
     let client: any YTMusicClientProtocol
@@ -105,19 +94,31 @@ struct MiniPlayerWindow: View {
     @State private var settings = SettingsManager.shared
     @State private var seekValue: Double = 0
     @State private var isSeeking = false
+    @State private var seekHold = PlayerBarSeekHold()
     @State private var volumeValue: Double = 1
     @State private var isAdjustingVolume = false
     @State private var detailPane: DetailPane = .lyrics
     @State private var isHovering = false
+    @State private var airPlayAnchor = AirPlayPickerAnchor()
 
     var body: some View {
         ZStack(alignment: .top) {
-            self.surface
+            self.surface.overlay { WindowDragHandle() }
 
             self.panelBody
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             self.hoverChrome
+        }
+        .background(alignment: .bottomTrailing) {
+            // The picker needs the playback WebView in a visible window. Move
+            // the same WebView here while the main window is hidden.
+            if self.playerService.shouldHostPlaybackInMiniPlayer {
+                PersistentPlayerView(videoId: self.playerService.pendingPlayVideoId, isExpanded: false)
+                    .frame(width: 1, height: 1)
+                    .opacity(0)
+                    .allowsHitTesting(false)
+            }
         }
         .environment(\.usesLegacyMacOS15UI, self.settings.useLegacyMacOS15UI)
         .contentShape(.rect)
@@ -127,13 +128,23 @@ struct MiniPlayerWindow: View {
         .clipShape(.rect(cornerRadius: self.cornerRadius))
         .accessibilityIdentifier(AccessibilityID.MiniPlayer.container)
         .onChange(of: self.playerService.progress) { _, newValue in
-            if !self.isSeeking, self.playerService.duration > 0 {
-                self.seekValue = newValue / self.playerService.duration
+            self.seekHold.reconcile(observedProgress: newValue)
+            if !self.isSeeking, !self.seekHold.isActive, self.playerService.duration > 0 {
+                self.seekValue = self.displayedPlaybackProgress / self.playerService.duration
             }
         }
         .onChange(of: self.playerService.duration) { _, _ in
-            if !self.isSeeking {
+            self.seekHold.reconcile(observedProgress: self.playerService.progress)
+            if !self.isSeeking, !self.seekHold.isActive {
                 self.syncSeekValue()
+            }
+        }
+        .onChange(of: self.currentTrackIdentity) { _, _ in
+            self.clearSeekHold()
+        }
+        .onChange(of: self.playerService.isShowingAd) { _, isShowingAd in
+            if isShowingAd {
+                self.clearSeekHold()
             }
         }
         .onChange(of: self.playerService.volume) { _, newValue in
@@ -223,6 +234,7 @@ struct MiniPlayerWindow: View {
         VStack(spacing: 7) {
             HStack(spacing: 10) {
                 self.artwork(size: 42, cornerRadius: 6)
+                    .overlay { WindowDragHandle() }
 
                 VStack(alignment: .leading, spacing: 2) {
                     self.titleText
@@ -232,6 +244,7 @@ struct MiniPlayerWindow: View {
                         .opacity(0.8)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay { WindowDragHandle() }
 
                 self.hoverOnly {
                     self.trackActionButtons
@@ -249,6 +262,7 @@ struct MiniPlayerWindow: View {
     private var squareArtworkBody: some View {
         ZStack(alignment: .bottom) {
             self.fullFrameArtwork
+                .overlay { WindowDragHandle() }
             self.squareArtworkTopBackdrop
 
             self.hoverOnly {
@@ -264,6 +278,7 @@ struct MiniPlayerWindow: View {
                             .font(.system(size: 10, weight: .medium))
                             .opacity(0.76)
                     }
+                    .overlay { WindowDragHandle() }
                     Spacer()
                     self.hoverOnly {
                         self.trackActionButtons
@@ -286,6 +301,7 @@ struct MiniPlayerWindow: View {
             VStack(spacing: 7) {
                 HStack(spacing: 10) {
                     self.artwork(size: 42, cornerRadius: 6)
+                        .overlay { WindowDragHandle() }
 
                     VStack(alignment: .leading, spacing: 2) {
                         self.titleText
@@ -295,6 +311,7 @@ struct MiniPlayerWindow: View {
                             .opacity(0.8)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay { WindowDragHandle() }
 
                     self.hoverOnly {
                         self.trackActionButtons
@@ -462,28 +479,34 @@ struct MiniPlayerWindow: View {
     }
 
     private var airPlayButton: some View {
-        ZStack {
-            MiniPlayerAirPlayRoutePickerView()
-                .frame(width: 22, height: 22)
-
-            MiniPlayerGlassIconLabel(systemName: "airplayaudio", isActive: self.playerService.isAirPlayConnected, size: 22)
-                .allowsHitTesting(false)
+        self.hoverIconButton(
+            systemName: "airplayaudio",
+            accessibilityID: AccessibilityID.MiniPlayer.airplayButton,
+            label: self.playerService.isAirPlayConnected ? String(localized: "AirPlay Connected") : String(localized: "AirPlay"),
+            isActive: self.playerService.isAirPlayConnected
+        ) {
+            HapticService.toggle()
+            self.playerService.showAirPlayPicker(at: self.airPlayAnchor.screenPoint)
         }
-        .compatGlass(interactive: true, in: .circle)
-        .shadow(color: .black.opacity(0.46), radius: 7, y: 2)
-        .accessibilityIdentifier(AccessibilityID.MiniPlayer.airplayButton)
-        .accessibilityLabel(self.playerService.isAirPlayConnected ? String(localized: "AirPlay Connected") : String(localized: "AirPlay"))
-        .disabled(self.playerService.currentTrack == nil)
-        .simultaneousGesture(TapGesture().onEnded {
-            self.playerService.markAirPlayRequested()
-        })
+        .background {
+            AirPlayPickerAnchorView(anchor: self.airPlayAnchor)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
     }
 
+    @ViewBuilder
     private var trackActionButtons: some View {
-        HStack(spacing: 5) {
-            self.likeButton
-            self.moreMenu
+        if self.hasPersonalAccount {
+            HStack(spacing: 5) {
+                self.likeButton
+                self.moreMenu
+            }
         }
+    }
+
+    private var hasPersonalAccount: Bool {
+        self.authService.hasPersonalAccount
     }
 
     private var likeButton: some View {
@@ -491,6 +514,7 @@ struct MiniPlayerWindow: View {
         let label = isLiked ? String(localized: "Remove Like") : String(localized: "Like")
 
         return Button {
+            guard self.hasPersonalAccount else { return }
             self.playerService.likeCurrentTrack()
         } label: {
             MiniPlayerGlassIconLabel(systemName: isLiked ? "hand.thumbsup.fill" : "hand.thumbsup", isActive: isLiked, size: 23, fontSize: 12)
@@ -652,11 +676,10 @@ struct MiniPlayerWindow: View {
             }
             .controlSize(.small)
             .tint(PackageResourceLookup.brandAccent)
-            .disabled(self.playerService.duration <= 0 || self.playerService.isCurrentItemLive)
+            .disabled(self.playerService.duration <= 0 || self.playerService.isCurrentItemLive || self.playerService.isShowingAd)
             .accessibilityIdentifier(AccessibilityID.MiniPlayer.seekSlider)
-
             HStack {
-                Text(self.formatTime(self.isSeeking ? self.seekValue * self.playerService.duration : self.playerService.progress))
+                Text(self.formatTime(self.isSeeking ? self.seekValue * self.playerService.duration : self.displayedPlaybackProgress))
                 Spacer()
                 Text(self.playerService.isCurrentItemLive ? String(localized: "LIVE") : self.remainingTimeText)
             }
@@ -664,6 +687,7 @@ struct MiniPlayerWindow: View {
             .monospacedDigit()
             .foregroundStyle(.white.opacity(0.76))
             .shadow(color: .black.opacity(0.56), radius: 2, y: 1)
+            .overlay { WindowDragHandle() }
         }
     }
 
@@ -747,18 +771,27 @@ struct MiniPlayerWindow: View {
                     ContentUnavailableView(
                         String(localized: "No Queue"),
                         systemImage: "list.bullet",
-                        description: Text("Songs you play next will appear here.")
+                        description: Text(String(localized: "Songs you play next will appear here."))
                     )
                     .foregroundStyle(.white.opacity(0.76))
                     .frame(maxWidth: .infinity, minHeight: 210)
                 } else {
-                    ForEach(Array(self.playerService.queue.enumerated()), id: \.offset) { index, song in
+                    ForEach(Array(self.playerService.queueEntries.enumerated()), id: \.element.id) { index, entry in
+                        let song = entry.song
                         HStack(spacing: 7) {
                             SongThumbnailView(song: song, size: 21, cornerRadius: 4)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(song.title)
-                                    .font(.system(size: 9, weight: index == self.playerService.currentIndex ? .semibold : .regular))
-                                    .lineLimit(1)
+                                HStack(spacing: 4) {
+                                    Text(song.title)
+                                        .font(.system(size: 9, weight: index == self.playerService.activePlaybackQueueIndex ? .semibold : .regular))
+                                        .lineLimit(1)
+                                    if entry.source == .suggested {
+                                        Image(systemName: "sparkles")
+                                            .font(.system(size: 8, weight: .semibold))
+                                            .foregroundStyle(PackageResourceLookup.brandAccent)
+                                            .accessibilityLabel(Text(String(localized: "Suggested")))
+                                    }
+                                }
                                 Text(song.artistsDisplay)
                                     .font(.system(size: 8))
                                     .foregroundStyle(.white.opacity(0.58))
@@ -769,7 +802,7 @@ struct MiniPlayerWindow: View {
                         .foregroundStyle(.white.opacity(0.88))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
-                        .background(index == self.playerService.currentIndex ? Color.white.opacity(0.12) : Color.clear, in: .rect(cornerRadius: 10))
+                        .background(index == self.playerService.activePlaybackQueueIndex ? Color.white.opacity(0.12) : Color.clear, in: .rect(cornerRadius: 10))
                     }
                 }
             }
@@ -795,7 +828,15 @@ struct MiniPlayerWindow: View {
     }
 
     private var remainingTimeText: String {
-        "-\(self.formatTime(max(0, self.playerService.duration - self.playerService.progress)))"
+        "-\(self.formatTime(max(0, self.playerService.duration - self.displayedPlaybackProgress)))"
+    }
+
+    private var displayedPlaybackProgress: TimeInterval {
+        self.seekHold.displayProgress(observedProgress: self.playerService.progress)
+    }
+
+    private var currentTrackIdentity: String {
+        self.playerService.currentTrack?.videoId ?? "none"
     }
 
     private var repeatIcon: String {
@@ -820,16 +861,29 @@ struct MiniPlayerWindow: View {
 
     private func syncSeekValue() {
         if self.playerService.duration > 0 {
-            self.seekValue = self.playerService.progress / self.playerService.duration
+            self.seekValue = self.displayedPlaybackProgress / self.playerService.duration
         } else {
             self.seekValue = 0
         }
     }
 
     private func performSeek() {
-        guard self.playerService.duration > 0 else { return }
+        guard self.playerService.duration > 0, !self.playerService.isShowingAd else { return }
         let target = self.seekValue * self.playerService.duration
+        let holdID = self.seekHold.begin(target: target)
         Task { await self.playerService.seek(to: target) }
+        Task { @MainActor in
+            try? await Task.sleep(for: PlayerBarSeekHold.timeout)
+            if self.seekHold.clearIfCurrent(holdID) {
+                self.syncSeekValue()
+            }
+        }
+    }
+
+    private func clearSeekHold() {
+        self.seekHold.clear()
+        self.isSeeking = false
+        self.syncSeekValue()
     }
 
     private func formatTime(_ seconds: TimeInterval) -> String {

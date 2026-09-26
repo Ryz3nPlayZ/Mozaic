@@ -6,7 +6,13 @@ Proposed
 
 ## Context
 
-Mozaic has no localization infrastructure. All ~300 user-facing strings are hardcoded English literals in SwiftUI views, models, and services. Arabic is the first target language, with potential for additional languages later.
+Mozaic localizes ~360 user-facing strings via String Catalogs and checked-in `.lproj` bundles. Arabic was the first target language; the app now ships UI translations for eighteen locales, with additional languages added incrementally.
+
+Supported UI locales: `ar`, `de`, `en`, `es`, `fr`, `id`, `it`, `ja`, `ko`, `nl`, `pl`, `pt`, `ru`, `sv`, `tr`, `uk`, `zh-Hans`, `zh-Hant`. The Settings → General → Language picker lists **System Default** first, then explicit languages in locale code order.
+
+Most locales are plain ISO 639-1 codes, but Chinese is identified by **script** rather than region, matching Apple's localization identifiers (`zh-Hans`, `zh-Hant`) rather than region codes such as `zh-CN`/`zh-TW`. A user whose preferred language is `zh-Hant-TW` or `zh-Hant-HK` resolves to `zh-Hant`, so one traditional bundle serves both. `zh-Hant` follows Taiwan usage, since CLDR expands the bare tag to `zh-Hant-TW` and YouTube's own `zh-Hant` responses use Taiwan vocabulary. Hong Kong (`zh-HK`) is a separate Apple localization and is not currently shipped; adding it later is purely additive.
+
+These same codes are valid InnerTube `hl` values — verified by probing `browse FEmusic_home` with each — so `ContentLanguage.apiLanguageCode` needs no separate mapping for Chinese.
 
 Requirements:
 1. **Minimal disruption** — Adding localization should not require architectural changes
@@ -21,9 +27,11 @@ The repo is SwiftPM-first, but it also includes `Mozaic.xcodeproj` and `MozaicUI
 
 ### String Catalogs (`.xcstrings`)
 
-Use Xcode String Catalogs (`Localizable.xcstrings`) as the single source of truth for all translatable strings. This is Apple's modern replacement for `.strings` / `.stringsdict` files, introduced in Xcode 15 and fully supported in SPM packages with `defaultLocalization` set.
+Use Xcode String Catalogs (`Localizable.xcstrings`) as the source of truth for all translatable strings. This is Apple's modern replacement for `.strings` / `.stringsdict` files, introduced in Xcode 15.
 
-The catalog lives at `Sources/Mozaic/Resources/Localizable.xcstrings` and is processed by the existing `.process("Resources")` rule in `Package.swift`.
+The catalog lives at `Sources/Mozaic/Resources/Localizable.xcstrings`. Because current SwiftPM/Xcode 26 builds can produce duplicate `.strings` outputs when processing both the catalog and checked-in `.lproj` resources, `Package.swift` excludes the catalog and processes generated `*.lproj` directories for SwiftPM/runtime resource bundles. The app packaging script (`Scripts/build-app.sh`) compiles the source catalog into both the packaged app resources and the Mozaic SwiftPM resource bundle so packaged builds still come from the catalog.
+
+When updating translations, regenerate the checked-in `Sources/Mozaic/Resources/*.lproj/Localizable.strings` files from `Localizable.xcstrings` so SwiftPM builds and packaged app builds stay in sync.
 
 ### String Wrapping Patterns
 
@@ -59,7 +67,8 @@ Enums that use `rawValue` as display text (`NavigationItem`, `SearchFilter`, `Li
 ### Negative
 - **SPM + xcstrings is relatively new** — Less community precedent than `.strings` files in SPM; Phase 0 validates this before committing
 - **Large initial diff** — Wrapping ~300 strings touches many files, but this is spread across multiple focused PRs
-- **Manual Arabic translations needed** — No automated translation pipeline; each string requires manual Arabic translation
+- **Manual translations needed** — No automated translation pipeline; each string requires manual translation per locale
+- **No CLI auto-extraction** — Auto-extraction (above) only runs in Xcode builds. The repo's day-to-day workflow is CLI-first (`swift build`), which compiles new `LocalizedStringKey`/`String(localized:)` literals fine but does **not** write the new keys back into `Localizable.xcstrings` — missing keys silently fall through to the literal English at runtime with no error. When adding strings via the CLI workflow, hand-add each new key to `Localizable.xcstrings` (with values for every supported locale) and regenerate or hand-update the checked-in `Sources/Mozaic/Resources/*.lproj/Localizable.strings` files in the same change, because those `.lproj` files are the runtime source for language overrides in SwiftPM builds. When adding a new locale, also register its `.lproj` in `Package.swift`, add a `SettingsManager.ContentLanguage` case, and extend localization tests.
 
 ### Neutral
 - SwiftUI's implicit `LocalizedStringKey` means many `Text("…")` calls already work — they just need the catalog to contain the key

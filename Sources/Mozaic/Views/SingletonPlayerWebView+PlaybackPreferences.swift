@@ -19,12 +19,9 @@ extension SingletonPlayerWebView {
 
     /// Re-asserts Mozaic's `nexttrack`/`previoustrack` media-session override immediately.
     ///
-    /// YouTube Music periodically re-registers its own handlers. In `nextPreviousTrack`
-    /// mode the page keeps ownership via a `requestAnimationFrame` re-apply loop — but
-    /// WebKit freezes `requestAnimationFrame` while the app is backgrounded, so the
-    /// override is lost and a media-key press falls through to YouTube (which jumps to its
-    /// own recommendation; queue-drift recovery then restarts the current song from 0).
-    /// Driving the re-apply from a native timer keeps the override alive in the background.
+    /// The document-start `setActionHandler` wrapper keeps YouTube from overwriting
+    /// Mozaic-owned next/previous handlers, so normal operation relies on bounded
+    /// event-driven refreshes instead of a steady animation-frame loop.
     func reassertMediaControlOverride() {
         guard self.mediaControlUsesNextPrev, let webView = self.webView else { return }
         webView.evaluateJavaScript(
@@ -33,24 +30,18 @@ extension SingletonPlayerWebView {
         )
     }
 
-    /// Starts a native timer that re-asserts the media-key override while the app is
-    /// backgrounded. Native run-loop timers keep firing in the background (active audio
-    /// playback prevents App Nap), unlike the page's frozen `requestAnimationFrame` loop.
+    /// Performs a bounded re-assertion when the app enters the background.
+    ///
+    /// YouTube handler writes are blocked by the document-start wrapper while Mozaic owns
+    /// next/previous, so no steady background timer is needed.
     func beginBackgroundMediaControlReassertion() {
         guard self.mediaControlUsesNextPrev else { return }
         self.reassertMediaControlOverride()
-        guard self.mediaControlReassertTimer == nil else { return }
-        let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] (_: Timer) in
-            MainActor.assumeIsolated {
-                self?.reassertMediaControlOverride()
-            }
-        }
-        timer.tolerance = 0.5
-        self.mediaControlReassertTimer = timer
+        self.mediaControlReassertTimer?.invalidate()
+        self.mediaControlReassertTimer = nil
     }
 
-    /// Stops the background re-assertion timer. The page's `requestAnimationFrame` loop
-    /// resumes ownership once the app is foreground again.
+    /// Clears any legacy background re-assertion timer.
     func endBackgroundMediaControlReassertion() {
         self.mediaControlReassertTimer?.invalidate()
         self.mediaControlReassertTimer = nil
@@ -64,18 +55,31 @@ extension SingletonPlayerWebView {
                     localStorage.setItem('mozaicUseNextPrev', '\(jsBoolean)');
                 } catch (e) {}
                 window.__mozaicUseNextPrev = \(jsBoolean);
-                // Wrap setActionHandler at document start so YouTube's seekforward/seekbackward
-                // registrations stay owned by the native remote command handlers. Without this,
-                // WebKit and MPRemoteCommandCenter can both handle the same 15s skip command.
+                // Wrap setActionHandler at document start so YouTube registrations cannot
+                // steal remote-command ownership. Seek handlers always stay native-owned;
+                // next/previous stay Mozaic-owned in nextPrev mode unless Mozaic is installing
+                // its own handlers under the temporary install flag.
                 try {
+                    if (typeof window.__mozaicInstallingMediaControlHandlers !== 'boolean') {
+                        window.__mozaicInstallingMediaControlHandlers = false;
+                    }
                     var ms = navigator.mediaSession;
                     if (ms && !ms.__mozaicSetActionHandlerWrapped) {
                         var orig = ms.setActionHandler.bind(ms);
                         ms.setActionHandler = function(type, handler) {
-                            if (type === 'seekforward' || type === 'seekbackward'
-                                    || (!window.__mozaicUseNextPrev
-                                        && (type === 'nexttrack' || type === 'previoustrack'))) {
+                            var isSeekSkip = type === 'seekforward' || type === 'seekbackward';
+                            var isNextPrevious = type === 'nexttrack' || type === 'previoustrack';
+                            if (isSeekSkip) {
                                 return orig(type, null);
+                            }
+                            if (isNextPrevious) {
+                                if (window.__mozaicUseNextPrev) {
+                                    if (!window.__mozaicInstallingMediaControlHandlers) {
+                                        return undefined;
+                                    }
+                                } else {
+                                    return orig(type, null);
+                                }
                             }
                             return orig(type, handler);
                         };
@@ -119,6 +123,10 @@ extension SingletonPlayerWebView {
     static var mediaControlOverrideScript: String {
         """
         (function() {
+            \(eventTimestampFunctionJS)
+            const observerEpoch = (window.performance && performance.timeOrigin)
+                ? performance.timeOrigin : Date.now();
+            const documentID = Number(window.__mozaicDocumentID || 0);
             if (typeof window.__mozaicUseNextPrev !== 'boolean') {
                 try {
                     window.__mozaicUseNextPrev =
@@ -128,7 +136,15 @@ extension SingletonPlayerWebView {
                 }
             }
 
-            var overrideFrameId = null;
+            function withMozaicMediaControlInstall(action) {
+                var previousFlag = window.__mozaicInstallingMediaControlHandlers === true;
+                window.__mozaicInstallingMediaControlHandlers = true;
+                try {
+                    action();
+                } finally {
+                    window.__mozaicInstallingMediaControlHandlers = previousFlag;
+                }
+            }
 
             function applyOverride() {
                 if (!window.__mozaicUseNextPrev) {
@@ -136,48 +152,47 @@ extension SingletonPlayerWebView {
                 }
                 try {
                     var ms = navigator.mediaSession;
-                    ms.setActionHandler('seekforward', null);
-                    ms.setActionHandler('seekbackward', null);
-                    ms.setActionHandler('nexttrack', function() {
-                        window.webkit.messageHandlers.singletonPlayer
-                            .postMessage({ type: 'REMOTE_NEXT' });
-                    });
-                    ms.setActionHandler('previoustrack', function() {
-                        window.webkit.messageHandlers.singletonPlayer
-                            .postMessage({ type: 'REMOTE_PREVIOUS' });
+                    withMozaicMediaControlInstall(function() {
+                        ms.setActionHandler('seekforward', null);
+                        ms.setActionHandler('seekbackward', null);
+                        ms.setActionHandler('nexttrack', function() {
+                            window.webkit.messageHandlers.singletonPlayer
+                                .postMessage({
+                                    type: 'REMOTE_NEXT',
+                                    documentGeneration: window.__mozaicDocumentGeneration,
+                                    commandIssuedAtMilliseconds: __mozaicEventTimestampMilliseconds(),
+                                    observerEpoch: observerEpoch,
+                                    documentID: documentID
+                                });
+                        });
+                        ms.setActionHandler('previoustrack', function() {
+                            window.webkit.messageHandlers.singletonPlayer
+                                .postMessage({
+                                    type: 'REMOTE_PREVIOUS',
+                                    documentGeneration: window.__mozaicDocumentGeneration,
+                                    commandIssuedAtMilliseconds: __mozaicEventTimestampMilliseconds(),
+                                    observerEpoch: observerEpoch,
+                                    documentID: documentID
+                                });
+                        });
                     });
                 } catch (e) {}
             }
 
-            function scheduleOverrideLoop() {
-                if (overrideFrameId !== null || !window.__mozaicUseNextPrev) {
-                    return;
-                }
-
-                overrideFrameId = requestAnimationFrame(function() {
-                    overrideFrameId = null;
-                    if (!window.__mozaicUseNextPrev) {
-                        return;
-                    }
-                    applyOverride();
-                    scheduleOverrideLoop();
-                });
-            }
-
             window.__mozaicRefreshMediaControlStyle = function() {
                 applyOverride();
-                scheduleOverrideLoop();
             };
 
             window.__mozaicRefreshMediaControlStyle();
 
-            // Re-apply on video events where YouTube re-registers handlers.
+            // Re-apply on bounded page lifecycle events where YouTube recreates the player.
             function attachVideoOverride() {
                 var v = document.querySelector('video');
                 if (!v || v.__mozaicOverrideAttached) return;
                 v.__mozaicOverrideAttached = true;
                 ['playing','loadedmetadata','loadeddata','canplay','seeked']
                     .forEach(function(e) { v.addEventListener(e, applyOverride); });
+                applyOverride();
             }
 
             attachVideoOverride();

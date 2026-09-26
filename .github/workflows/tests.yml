@@ -43,7 +43,7 @@ jobs:
         os: [macos-26, macos-15]
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Select Xcode version
         run: |
@@ -71,11 +71,10 @@ jobs:
         run: swift --version
 
       - name: Cache SPM dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm/spm-repositories
-            .build
           key: ${{ runner.os }}-${{ matrix.os }}-spm-${{ hashFiles('Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.os }}-spm-
@@ -88,7 +87,10 @@ jobs:
         # (Xcode 26 + Sequoia) during XCTest discovery. The unit suite is
         # entirely Swift Testing; the only XCTest target is the manual
         # ParserPerformanceTests, which is invoked separately via xcodebuild.
-        run: swift test -q --skip KasetUITests --disable-xctest
+        # Suites share process-wide app singletons, including the playback
+        # WebView. Serialize both runners so another suite cannot invalidate
+        # a test's document generation while its bridge events are queued.
+        run: swift test -q --skip MozaicUITests --disable-xctest --no-parallel
 
   macos_ui_tests:
     name: macOS UI Tests (${{ matrix.os }})
@@ -102,7 +104,7 @@ jobs:
         os: [macos-26, macos-15]
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Select Xcode version
         run: |
@@ -128,11 +130,10 @@ jobs:
         run: xcodebuild -version
 
       - name: Cache SPM dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm/spm-repositories
-            .build
           key: ${{ runner.os }}-${{ matrix.os }}-spm-ui-${{ hashFiles('Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.os }}-spm-ui-
@@ -175,5 +176,5 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
           name: macOS-UITestResults-${{ matrix.os }}
-          path: ./build/*.xcresult
+          path: ./build/Logs/Test/*.xcresult
           retention-days: 7

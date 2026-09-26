@@ -1,8 +1,8 @@
 ---
 name: dev-loop-packaging
-description: Use when you need a fresh packaged `.app` bundle, a fast build-package-relaunch loop, or a packaged runtime repro for Kaset instead of a compile-only verification.
+description: Use when you need a fresh packaged `.app` bundle, a fast build-package-relaunch loop, or a packaged runtime repro for Mozaic instead of a compile-only verification.
 metadata:
-  short-description: Package and relaunch Kaset
+  short-description: Package and relaunch Mozaic
 ---
 
 # Dev Loop Packaging
@@ -12,7 +12,7 @@ Use this skill when you need a fresh `.app` bundle, a fast build-package-relaunc
 ## Default Loop
 
 - Prefer `swift build` for the fastest compile verification.
-- Prefer `swift test --skip KasetUITests` for the default non-UI test pass.
+- Prefer `swift test --skip MozaicUITests` for the default non-UI test pass.
 - Escalate to packaging only when you need a runnable app bundle, login/WebView/runtime inspection, or bundle verification.
 
 ## Common Commands
@@ -28,8 +28,8 @@ Scripts/compile_and_run.sh --wait
 
 ## What The Scripts Do
 
-- `Scripts/build-app.sh` builds the app and assembles `.build/app/Kaset.app`.
-- `Scripts/compile_and_run.sh` kills existing Kaset processes, optionally runs tests and linting, packages the app, relaunches it, and checks that it stays running.
+- `Scripts/build-app.sh` builds the app and assembles `.build/app/Mozaic.app`.
+- `Scripts/compile_and_run.sh` kills existing Mozaic processes, optionally runs tests and linting, packages a debug app by default, relaunches it, and checks that it stays running. Pass `--release` for a release build.
 - `Scripts/compile_and_run.sh --test` runs the SwiftPM test target before packaging; it does not invoke the separate Xcode UI-test project.
 - `Scripts/build-app.sh` can also build for custom architectures via `ARCHES`.
 
@@ -37,4 +37,4 @@ Scripts/compile_and_run.sh --wait
 
 - `Scripts/build-app.sh`
 - `Scripts/compile_and_run.sh`
-- `.build/app/Kaset.app`
+- `.build/app/Mozaic.app`

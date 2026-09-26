@@ -6,6 +6,7 @@ struct HomeView: View {
     @Environment(PlayerService.self) private var playerService
     @Environment(FavoritesManager.self) private var favoritesManager
     @Environment(SongLikeStatusManager.self) private var likeStatusManager
+    @Environment(AuthService.self) private var authService
     @State private var navigationPath = NavigationPath()
     @State private var networkMonitor = NetworkMonitor.shared
 
@@ -34,10 +35,16 @@ struct HomeView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .localizedNavigationTitle("Home")
-            .navigationDestinations(client: self.viewModel.client)
+            .navigationDestinations(
+                client: self.viewModel.client,
+                playerBarNavigationAction: self.playerBarNavigationAction
+            )
+            .playerBarMusicNavigation(path: self.$navigationPath)
         }
+        .playerBarMusicNavigation(path: self.$navigationPath)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             PlayerBar()
+                .playerBarMusicNavigation(path: self.$navigationPath)
         }
         .onAppear {
             if self.viewModel.loadingState == .idle {
@@ -46,9 +53,14 @@ struct HomeView: View {
                 }
             }
         }
-        .refreshable {
-            await self.viewModel.refresh()
-        }
+        .popsNavigationStackOnSidebarReselect(path: self.$navigationPath, for: .home)
+    }
+
+    private var playerBarNavigationAction: PlayerBarNavigationAction {
+        PlayerBarNavigationAction(
+            openArtist: { self.navigationPath.append($0) },
+            openAlbum: { self.navigationPath.append($0) }
+        )
     }
 
     // MARK: - Views
@@ -57,7 +69,7 @@ struct HomeView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 32) {
                 // Favorites section (hidden when empty)
-                if self.favoritesManager.isVisible {
+                if self.authService.hasPersonalAccount, self.favoritesManager.isVisible {
                     FavoritesSection(
                         onNavigate: { destination in
                             if let playlist = destination as? Playlist {
@@ -80,6 +92,10 @@ struct HomeView: View {
                             await self.prefetchImagesAsync(for: section)
                         }
                 }
+
+                if self.viewModel.hasMoreSections || self.viewModel.loadingState == .loadingMore {
+                    self.loadMoreControl
+                }
             }
             // The ScrollView fills the detail column edge-to-edge so shelves
             // scroll under the floating glass sidebar; each shelf restores a
@@ -87,31 +103,45 @@ struct HomeView: View {
             // on the stack.
             .padding(.vertical, 20)
         }
+        .accessibilityIdentifier(AccessibilityID.Home.scrollView)
+        .pullToRefresh {
+            await self.viewModel.refresh()
+        }
+    }
+
+    private var loadMoreControl: some View {
+        LoadMoreFooter(
+            isLoading: self.viewModel.loadingState == .loadingMore,
+            title: "Load More",
+            loadingTitle: "Loading more...",
+            autoLoad: true,
+            autoLoadTrigger: self.viewModel.sections.count
+        ) {
+            await self.viewModel.loadMore()
+        }
     }
 
     private func sectionView(_ section: HomeSection) -> some View {
-        CarouselShelfSection(
+        HomeItemShelfSection(
             accessibilityLabel: section.title,
-            items: Array(section.items.enumerated()),
-            id: \.element.id,
-            itemAlignment: .top,
-            contentInset: DetailContentLayout.horizontalInset
-        ) {
-            Text(section.title)
-                .font(.title2)
-                .fontWeight(.semibold)
-        } itemContent: { index, item in
-            HomeSectionItemCard(
-                item: item,
-                rank: section.isChart ? index + 1 : nil,
-                playAction: self.playlistPlayAction(for: item)
-            ) {
+            items: section.items,
+            isChart: section.isChart,
+            contentInset: DetailContentLayout.horizontalInset,
+            action: { item, index in
                 self.playItem(item, in: section, at: index)
-            }
-            .contextMenu {
+            },
+            playlistPlayAction: { item in
+                self.playlistPlayAction(for: item)
+            },
+            header: {
+                Text(section.title)
+                    .font(.title2)
+                    .fontWeight(.semibold)
+            },
+            contextMenu: { item, index in
                 self.contextMenuItems(for: item, in: section, at: index)
             }
-        }
+        )
     }
 
     // MARK: - Context Menu
@@ -139,7 +169,7 @@ struct HomeView: View {
             Button {
                 Task { await self.playerService.play(song: song) }
             } label: {
-                Label("Play", systemImage: "play.fill")
+                Label(String(localized: "Play"), systemImage: "play.fill")
             }
 
             Divider()
@@ -170,7 +200,7 @@ struct HomeView: View {
 
             if let artist = song.artists.first(where: { $0.hasNavigableId }) {
                 NavigationLink(value: artist) {
-                    Label("Go to Artist", systemImage: "person")
+                    Label(String(localized: "Go to Artist"), systemImage: "person")
                 }
             }
 
@@ -184,7 +214,7 @@ struct HomeView: View {
                     author: Artist.inline(name: album.artistsDisplay, namespace: "album-artist")
                 )
                 NavigationLink(value: playlist) {
-                    Label("Go to Album", systemImage: "square.stack")
+                    Label(String(localized: "Go to Album"), systemImage: "square.stack")
                 }
             }
 
@@ -192,7 +222,7 @@ struct HomeView: View {
             Button {
                 self.playItem(item, in: HomeSection(id: "", title: "", items: []), at: 0)
             } label: {
-                Label("View Album", systemImage: "square.stack")
+                Label(String(localized: "View Album"), systemImage: "square.stack")
             }
 
             Divider()
@@ -205,7 +235,7 @@ struct HomeView: View {
                     playerService: self.playerService
                 )
             } label: {
-                Label("Play", systemImage: "play.fill")
+                Label(String(localized: "Play"), systemImage: "play.fill")
             }
 
             Button {
@@ -215,7 +245,7 @@ struct HomeView: View {
                     playerService: self.playerService
                 )
             } label: {
-                Label("Play Next", systemImage: "text.insert")
+                Label(String(localized: "Play Next"), systemImage: "text.insert")
             }
 
             Button {
@@ -225,7 +255,7 @@ struct HomeView: View {
                     playerService: self.playerService
                 )
             } label: {
-                Label("Add to Queue", systemImage: "text.append")
+                Label(String(localized: "Add to Queue"), systemImage: "text.append")
             }
 
             Divider()
@@ -240,7 +270,7 @@ struct HomeView: View {
             Button {
                 self.navigationPath.append(playlist)
             } label: {
-                Label("View Playlist", systemImage: "music.note.list")
+                Label(String(localized: "View Playlist"), systemImage: "music.note.list")
             }
 
             Divider()
@@ -255,7 +285,7 @@ struct HomeView: View {
             Button {
                 self.navigationPath.append(artist)
             } label: {
-                Label("View Artist", systemImage: "person")
+                Label(String(localized: "View Artist"), systemImage: "person")
             }
 
             Divider()
@@ -274,13 +304,13 @@ struct HomeView: View {
         // Early exit if task is cancelled
         guard !Task.isCancelled else { return }
 
-        let urls = section.items.prefix(10).compactMap { $0.thumbnailURL?.highQualityThumbnailURL }
+        let urls = section.items.prefix(6).compactMap { $0.thumbnailURL?.highQualityThumbnailURL }
         guard !urls.isEmpty else { return }
 
         await ImageCache.shared.prefetch(
             urls: urls,
             targetSize: Self.thumbnailDisplaySize,
-            maxConcurrent: 4
+            maxConcurrent: 2
         )
     }
 
@@ -320,5 +350,6 @@ struct HomeView: View {
     let client = YTMusicClient(authService: authService, webKitManager: .shared)
     HomeView(viewModel: HomeViewModel(client: client))
         .environment(PlayerService())
+        .environment(authService)
         .environment(FavoritesManager.shared)
 }

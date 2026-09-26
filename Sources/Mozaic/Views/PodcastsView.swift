@@ -38,10 +38,15 @@ struct PodcastsView: View {
             .navigationDestination(for: PodcastShow.self) { show in
                 PodcastShowView(show: show, client: self.viewModel.client)
             }
-            .navigationDestinations(client: self.viewModel.client)
+            .navigationDestinations(
+                client: self.viewModel.client,
+                playerBarNavigationAction: self.playerBarNavigationAction
+            )
+            .playerBarMusicNavigation(path: self.$navigationPath)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             PlayerBar()
+                .playerBarMusicNavigation(path: self.$navigationPath)
         }
         .onAppear {
             if self.viewModel.loadingState == .idle {
@@ -53,6 +58,14 @@ struct PodcastsView: View {
         .refreshable {
             await self.viewModel.refresh()
         }
+        .popsNavigationStackOnSidebarReselect(path: self.$navigationPath, for: .podcasts)
+    }
+
+    private var playerBarNavigationAction: PlayerBarNavigationAction {
+        PlayerBarNavigationAction(
+            openArtist: { self.navigationPath.append($0) },
+            openAlbum: { self.navigationPath.append($0) }
+        )
     }
 
     // MARK: - Views
@@ -62,6 +75,18 @@ struct PodcastsView: View {
             LazyVStack(alignment: .leading, spacing: 32) {
                 ForEach(self.viewModel.sections) { section in
                     self.sectionView(section)
+                }
+
+                if self.viewModel.hasMoreSections || self.viewModel.loadingState == .loadingMore {
+                    LoadMoreFooter(
+                        isLoading: self.viewModel.loadingState == .loadingMore,
+                        title: "Load More",
+                        loadingTitle: "Loading more...",
+                        autoLoad: true,
+                        autoLoadTrigger: self.viewModel.sections.count
+                    ) {
+                        await self.viewModel.loadMore()
+                    }
                 }
             }
             // Edge-to-edge so shelves slide under the glass sidebar; resting
@@ -128,10 +153,10 @@ private struct PodcastShowCard: View {
         Button(action: self.action) {
             VStack(alignment: .leading, spacing: 8) {
                 // Thumbnail
-                CachedAsyncImage(url: self.show.thumbnailURL) { image in
+                CachedAsyncImage(url: self.show.thumbnailURL, targetSize: CGSize(width: 160, height: 160)) { image in
                     image
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
+                        .scaledToFill()
                 }
                 .frame(width: 160, height: 160)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -171,10 +196,10 @@ private struct PodcastEpisodeCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 // Thumbnail with play indicator
                 ZStack(alignment: .bottomTrailing) {
-                    CachedAsyncImage(url: self.episode.thumbnailURL) { image in
+                    CachedAsyncImage(url: self.episode.thumbnailURL, targetSize: CGSize(width: 200, height: 112)) { image in
                         image
                             .resizable()
-                            .aspectRatio(contentMode: .fill)
+                            .scaledToFill()
                     }
                     .frame(width: 200, height: 112)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -206,7 +231,7 @@ private struct PodcastEpisodeCard: View {
                             .lineLimit(1)
                     }
                     if self.episode.showTitle != nil, self.episode.publishedDate != nil {
-                        Text("•")
+                        Text(String(localized: "•"))
                     }
                     if let date = episode.publishedDate {
                         Text(date)
@@ -233,9 +258,10 @@ private struct PodcastEpisodeCard: View {
 struct PodcastShowView: View {
     let show: PodcastShow
     let client: any YTMusicClientProtocol
+    @Environment(AuthService.self) private var authService
     @Environment(PlayerService.self) private var playerService
     @Environment(FavoritesManager.self) private var favoritesManager
-    @Environment(LibraryViewModel.self) private var libraryViewModel: LibraryViewModel?
+    @Environment(\.libraryViewModel) private var libraryViewModel: LibraryViewModel?
 
     @State private var episodes: [PodcastEpisode] = []
     @State private var continuationToken: String?
@@ -292,7 +318,11 @@ struct PodcastShowView: View {
             String(localized: "Subscription Error"),
             isPresented: Binding(
                 get: { self.subscriptionError != nil },
-                set: { if !$0 { self.subscriptionError = nil } }
+                set: {
+                    if !$0 {
+                        self.subscriptionError = nil
+                    }
+                }
             )
         ) {
             Button(String(localized: "OK")) { self.subscriptionError = nil }
@@ -304,10 +334,10 @@ struct PodcastShowView: View {
     private var headerView: some View {
         HStack(alignment: .top, spacing: 20) {
             // Artwork
-            CachedAsyncImage(url: self.show.thumbnailURL) { image in
+            CachedAsyncImage(url: self.show.thumbnailURL, targetSize: CGSize(width: 180, height: 180)) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             }
             .frame(width: 180, height: 180)
             .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -342,30 +372,32 @@ struct PodcastShowView: View {
                         Button {
                             self.playEpisodeInQueue(at: 0)
                         } label: {
-                            Label("Play Latest", systemImage: "play.fill")
+                            Label(String(localized: "Play Latest"), systemImage: "play.fill")
                                 .font(.headline)
                         }
                         .compatGlassProminentButton()
                     }
 
-                    // Add to Library button
-                    Button {
-                        Task {
-                            await self.toggleSubscription()
+                    if self.authService.hasPersonalAccount {
+                        // Add to Library button
+                        Button {
+                            Task {
+                                await self.toggleSubscription()
+                            }
+                        } label: {
+                            if self.isSubscribing {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Label(
+                                    self.isSubscribed ? String(localized: "In Library") : String(localized: "Add to Library"),
+                                    systemImage: self.isSubscribed ? "checkmark" : "plus"
+                                )
+                            }
                         }
-                    } label: {
-                        if self.isSubscribing {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Label(
-                                self.isSubscribed ? String(localized: "In Library") : String(localized: "Add to Library"),
-                                systemImage: self.isSubscribed ? "checkmark" : "plus"
-                            )
-                        }
+                        .buttonStyle(.bordered)
+                        .disabled(self.isSubscribing)
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(self.isSubscribing)
                 }
             }
         }
@@ -376,7 +408,7 @@ struct PodcastShowView: View {
         VStack(alignment: .leading, spacing: 16) {
             // Header with "Show All" button
             HStack {
-                Text("Episodes")
+                Text(String(localized: "Episodes"))
                     .font(.title2)
                     .fontWeight(.semibold)
 
@@ -386,7 +418,7 @@ struct PodcastShowView: View {
                     Button {
                         self.showAllEpisodes = true
                     } label: {
-                        Text("Show All")
+                        Text(String(localized: "Show All"))
                             .font(.subheadline)
                             .fontWeight(.medium)
                     }
@@ -435,23 +467,10 @@ struct PodcastShowView: View {
 
     /// Plays an episode and queues the remaining episodes from the show.
     private func playEpisodeInQueue(at index: Int) {
-        let songs = self.episodes.map { self.episodeToSong($0) }
+        let songs = self.episodes.map(\.playbackSong)
         Task {
             await self.playerService.playQueue(songs, startingAt: index)
         }
-    }
-
-    /// Converts a podcast episode to a Song for playback.
-    private func episodeToSong(_ episode: PodcastEpisode) -> Song {
-        Song(
-            id: episode.id,
-            title: episode.title,
-            artists: episode.showTitle.map { [Artist(id: "podcast", name: $0)] } ?? [],
-            album: nil,
-            duration: episode.durationSeconds.map { TimeInterval($0) },
-            thumbnailURL: episode.thumbnailURL,
-            videoId: episode.id
-        )
     }
 
     private func toggleSubscription() async {
@@ -498,10 +517,10 @@ struct PodcastEpisodeRow: View {
         Button(action: self.action) {
             HStack(alignment: .top, spacing: 12) {
                 // Thumbnail
-                CachedAsyncImage(url: self.episode.thumbnailURL) { image in
+                CachedAsyncImage(url: self.episode.thumbnailURL, targetSize: CGSize(width: 80, height: 80)) { image in
                     image
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
+                        .scaledToFill()
                 }
                 .frame(width: 80, height: 80)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -537,7 +556,7 @@ struct PodcastEpisodeRow: View {
                         }
                         Spacer()
                         if self.episode.isPlayed {
-                            Label("Played", systemImage: "checkmark.circle.fill")
+                            Label(String(localized: "Played"), systemImage: "checkmark.circle.fill")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -645,23 +664,10 @@ struct AllEpisodesView: View {
 
     /// Plays an episode and queues the remaining episodes.
     private func playEpisodeInQueue(at index: Int) {
-        let songs = self.episodes.map { self.episodeToSong($0) }
+        let songs = self.episodes.map(\.playbackSong)
         Task {
             await self.playerService.playQueue(songs, startingAt: index)
         }
-    }
-
-    /// Converts a podcast episode to a Song for playback.
-    private func episodeToSong(_ episode: PodcastEpisode) -> Song {
-        Song(
-            id: episode.id,
-            title: episode.title,
-            artists: episode.showTitle.map { [Artist(id: "podcast", name: $0)] } ?? [],
-            album: nil,
-            duration: episode.durationSeconds.map { TimeInterval($0) },
-            thumbnailURL: episode.thumbnailURL,
-            videoId: episode.id
-        )
     }
 }
 

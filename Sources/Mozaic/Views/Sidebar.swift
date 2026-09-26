@@ -9,80 +9,71 @@ struct Sidebar: View {
 
     @Binding var selection: NavigationItem?
     @Binding var pinnedSelection: SidebarPinnedItem?
+    let client: any YTMusicClientProtocol
+    var onReselectNavigationItem: ((NavigationItem) -> Void)?
+    var onReselectPinnedItem: ((SidebarPinnedItem) -> Void)?
+    @Environment(AuthService.self) private var authService
+    @Environment(PlayerService.self) private var playerService
     @Environment(SidebarPinnedItemsManager.self) private var sidebarPinnedItemsManager
     @Environment(PodcastsAvailabilityService.self) private var podcastsAvailability
+    @State private var isCreatingPlaylist = false
+    @State private var isHoveringPlaylistsHeader = false
 
     var body: some View {
-        List(selection: self.sidebarSelection) {
+        List {
             // Main navigation
             Section {
-                NavigationLink(value: SidebarSelection.navigation(.search)) {
-                    Label(NavigationItem.search.displayName, systemImage: NavigationItem.search.icon)
-                }
-                .accessibilityIdentifier(AccessibilityID.Sidebar.searchItem)
+                self.navigationRow(.search)
+                    .accessibilityIdentifier(AccessibilityID.Sidebar.searchItem)
 
-                NavigationLink(value: SidebarSelection.navigation(.home)) {
-                    Label(NavigationItem.home.displayName, systemImage: NavigationItem.home.icon)
-                }
-                .accessibilityIdentifier(AccessibilityID.Sidebar.homeItem)
+                self.navigationRow(.home)
+                    .accessibilityIdentifier(AccessibilityID.Sidebar.homeItem)
             }
 
             // Discover section
             Section(String(localized: "Discover")) {
-                NavigationLink(value: SidebarSelection.navigation(.explore)) {
-                    Label(NavigationItem.explore.displayName, systemImage: NavigationItem.explore.icon)
-                }
-                .accessibilityIdentifier(AccessibilityID.Sidebar.exploreItem)
+                self.navigationRow(.explore)
+                    .accessibilityIdentifier(AccessibilityID.Sidebar.exploreItem)
 
-                NavigationLink(value: SidebarSelection.navigation(.charts)) {
-                    Label(NavigationItem.charts.displayName, systemImage: NavigationItem.charts.icon)
-                }
-                .accessibilityIdentifier(AccessibilityID.Sidebar.chartsItem)
+                self.navigationRow(.charts)
+                    .accessibilityIdentifier(AccessibilityID.Sidebar.chartsItem)
 
-                NavigationLink(value: SidebarSelection.navigation(.moodsAndGenres)) {
-                    Label(NavigationItem.moodsAndGenres.displayName, systemImage: NavigationItem.moodsAndGenres.icon)
-                }
-                .accessibilityIdentifier(AccessibilityID.Sidebar.moodsAndGenresItem)
+                self.navigationRow(.moodsAndGenres)
+                    .accessibilityIdentifier(AccessibilityID.Sidebar.moodsAndGenresItem)
 
-                NavigationLink(value: SidebarSelection.navigation(.newReleases)) {
-                    Label(NavigationItem.newReleases.displayName, systemImage: NavigationItem.newReleases.icon)
-                }
-                .accessibilityIdentifier(AccessibilityID.Sidebar.newReleasesItem)
+                self.navigationRow(.newReleases)
+                    .accessibilityIdentifier(AccessibilityID.Sidebar.newReleasesItem)
 
                 if self.podcastsAvailability.availability != .unavailable {
-                    NavigationLink(value: SidebarSelection.navigation(.podcasts)) {
-                        Label(NavigationItem.podcasts.displayName, systemImage: NavigationItem.podcasts.icon)
-                    }
-                    .accessibilityIdentifier(AccessibilityID.Sidebar.podcastsItem)
+                    self.navigationRow(.podcasts)
+                        .accessibilityIdentifier(AccessibilityID.Sidebar.podcastsItem)
                 }
             }
 
-            // Collection section
-            Section(String(localized: "Collection")) {
-                NavigationLink(value: SidebarSelection.navigation(.library)) {
-                    Label(NavigationItem.library.displayName, systemImage: NavigationItem.library.icon)
-                }
-                .accessibilityIdentifier(AccessibilityID.Sidebar.libraryItem)
+            if self.hasPersonalAccount {
+                // Collection section
+                Section(String(localized: "Collection")) {
+                    self.navigationRow(.library)
+                        .accessibilityIdentifier(AccessibilityID.Sidebar.libraryItem)
 
-                NavigationLink(value: SidebarSelection.navigation(.likedMusic)) {
-                    Label(NavigationItem.likedMusic.displayName, systemImage: NavigationItem.likedMusic.icon)
-                }
-                .accessibilityIdentifier(AccessibilityID.Sidebar.likedMusicItem)
+                    self.navigationRow(.likedMusic)
+                        .accessibilityIdentifier(AccessibilityID.Sidebar.likedMusicItem)
 
-                NavigationLink(value: SidebarSelection.navigation(.history)) {
-                    Label(NavigationItem.history.displayName, systemImage: NavigationItem.history.icon)
+                    self.navigationRow(.history)
+                        .accessibilityIdentifier(AccessibilityID.Sidebar.historyItem)
                 }
-                .accessibilityIdentifier(AccessibilityID.Sidebar.historyItem)
             }
 
-            if self.sidebarPinnedItemsManager.isVisible {
-                Section(String(localized: "Playlists")) {
+            if self.hasPersonalAccount {
+                Section {
                     ForEach(self.sidebarPinnedItemsManager.items) { item in
                         self.sidebarPinnedRow(item)
                     }
                     .onMove { source, destination in
                         self.sidebarPinnedItemsManager.move(from: source, to: destination)
                     }
+                } header: {
+                    self.playlistsSectionHeader
                 }
             }
         }
@@ -94,6 +85,10 @@ struct Sidebar: View {
             SidebarFooterView()
         }
         .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 300)
+    }
+
+    private var hasPersonalAccount: Bool {
+        self.authService.hasPersonalAccount
     }
 
     private var currentSidebarSelection: SidebarSelection? {
@@ -108,62 +103,134 @@ struct Sidebar: View {
         return nil
     }
 
-    private var sidebarSelection: Binding<SidebarSelection?> {
-        Binding {
-            self.currentSidebarSelection
-        } set: { newValue in
-            guard self.currentSidebarSelection != newValue else { return }
-
-            switch newValue {
-            case let .navigation(item):
-                self.selection = item
-                self.pinnedSelection = nil
-            case let .pinned(item):
-                self.selection = nil
-                self.pinnedSelection = item
-            case nil:
-                self.selection = nil
-                self.pinnedSelection = nil
-            }
-
-            HapticService.navigation()
+    private func navigationRow(_ item: NavigationItem) -> some View {
+        MozaicSidebarRow(
+            title: item.displayName,
+            systemImage: item.icon,
+            isSelected: self.currentSidebarSelection == .navigation(item)
+        ) {
+            self.selectNavigationItem(item)
         }
     }
 
-    private func sidebarPinnedRow(_ item: SidebarPinnedItem) -> some View {
-        NavigationLink(value: SidebarSelection.pinned(item)) {
-            Label {
-                Text(item.title)
-                    .lineLimit(1)
-            } icon: {
-                Image(systemName: item.systemImage)
+    private func selectNavigationItem(_ item: NavigationItem) {
+        let newSelection = SidebarSelection.navigation(item)
+        if self.currentSidebarSelection == newSelection {
+            self.onReselectNavigationItem?(item)
+            HapticService.navigation()
+            return
+        }
+        self.selection = item
+        self.pinnedSelection = nil
+        HapticService.navigation()
+    }
+
+    private func selectPinnedItem(_ item: SidebarPinnedItem) {
+        let newSelection = SidebarSelection.pinned(item)
+        if self.currentSidebarSelection == newSelection {
+            self.onReselectPinnedItem?(item)
+            HapticService.navigation()
+            return
+        }
+        self.selection = nil
+        self.pinnedSelection = item
+        HapticService.navigation()
+    }
+
+    private var playlistsSectionHeader: some View {
+        HStack {
+            Text(String(localized: "Playlists"))
+
+            Spacer()
+
+            if self.isCreatingPlaylist {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(.trailing, 8)
+            } else {
+                Button {
+                    self.presentCreatePlaylistDialog()
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .opacity(self.isHoveringPlaylistsHeader ? 1 : 0)
+                .padding(.trailing, 8)
+                .help(String(localized: "Create Playlist"))
+                .accessibilityLabel(String(localized: "Create Playlist"))
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
+        }
+        .onHover { hovering in
+            withAnimation(AppAnimation.quick) {
+                self.isHoveringPlaylistsHeader = hovering
+            }
+        }
+    }
+
+    private func presentCreatePlaylistDialog() {
+        guard !self.isCreatingPlaylist else { return }
+        let owner = self.playerService.currentAccountMutationOwner
+
+        SongActionsHelper.presentCreatePlaylistDialog(
+            informativeText: "Create a new playlist.",
+            request: SongActionsHelper.PlaylistCreationRequest(
+                client: self.client,
+                videoIds: [],
+                whileValid: { self.playerService.acceptsAccountMutationOwner(owner) }
+            ),
+            onWillCreate: {
+                guard !self.isCreatingPlaylist else { return false }
+                self.isCreatingPlaylist = true
+                return true
+            },
+            completion: { result in
+                self.isCreatingPlaylist = false
+                guard self.playerService.acceptsAccountMutationOwner(owner) else { return }
+
+                switch result {
+                case let .success(playlist):
+                    let pinnedItem = SidebarPinnedItem.from(playlist)
+                    self.sidebarPinnedItemsManager.add(pinnedItem)
+                    self.selectPinnedItem(pinnedItem)
+                case let .failure(failure):
+                    SongActionsHelper.presentPlaylistCreationError(failure)
+                }
+            }
+        )
+    }
+
+    private func sidebarPinnedRow(_ item: SidebarPinnedItem) -> some View {
+        MozaicSidebarRow(
+            title: item.title,
+            systemImage: item.systemImage,
+            isSelected: self.currentSidebarSelection == .pinned(item)
+        ) {
+            self.selectPinnedItem(item)
         }
         .contextMenu {
             Button {
                 self.sidebarPinnedItemsManager.moveUp(contentId: item.contentId)
             } label: {
-                Label("Move Up", systemImage: "chevron.up")
+                Label(String(localized: "Move Up"), systemImage: "chevron.up")
             }
 
             Button {
                 self.sidebarPinnedItemsManager.moveDown(contentId: item.contentId)
             } label: {
-                Label("Move Down", systemImage: "chevron.down")
+                Label(String(localized: "Move Down"), systemImage: "chevron.down")
             }
 
             Button {
                 self.sidebarPinnedItemsManager.moveToTop(contentId: item.contentId)
             } label: {
-                Label("Move to Top", systemImage: "arrow.up.to.line")
+                Label(String(localized: "Move to Top"), systemImage: "arrow.up.to.line")
             }
 
             Button {
                 self.sidebarPinnedItemsManager.moveToEnd(contentId: item.contentId)
             } label: {
-                Label("Move to End", systemImage: "arrow.down.to.line")
+                Label(String(localized: "Move to End"), systemImage: "arrow.down.to.line")
             }
 
             Divider()
@@ -174,15 +241,19 @@ struct Sidebar: View {
                 }
                 self.sidebarPinnedItemsManager.remove(contentId: item.contentId)
             } label: {
-                Label("Remove from Sidebar", systemImage: "sidebar.left")
+                Label(String(localized: "Remove from Sidebar"), systemImage: "sidebar.left")
             }
         }
     }
 }
 
 #Preview {
-    Sidebar(selection: .constant(.home), pinnedSelection: .constant(nil))
+    let authService = AuthService()
+    let client = YTMusicClient(authService: authService, webKitManager: .shared)
+    Sidebar(selection: .constant(.home), pinnedSelection: .constant(nil), client: client)
         .frame(width: 220)
+        .environment(authService)
+        .environment(PlayerService())
         .environment(SidebarPinnedItemsManager(skipLoad: true))
         .environment(PodcastsAvailabilityService())
 }

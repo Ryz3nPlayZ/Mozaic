@@ -6,6 +6,7 @@ import Observation
 @Observable
 final class SettingsManager {
     static let shared = SettingsManager()
+    nonisolated static let defaultAmbientBackdropStyle: AmbientBackdropStyle = .soft
 
     // MARK: - Settings Keys
 
@@ -25,6 +26,11 @@ final class SettingsManager {
         static let romanizationEnabled = "settings.romanizationEnabled"
         static let contentLanguage = "settings.contentLanguage"
         static let keepMiniPlayerOnTop = "settings.keepMiniPlayerOnTop"
+        static let keepYouTubeVideoOnTop = "settings.keepYouTubeVideoOnTop"
+        static let smartShuffleEnabled = "settings.smartShuffleEnabled"
+        static let smartShuffleSuggestEveryN = "settings.smartShuffleSuggestEveryN"
+        static let smartShuffleBurst = "settings.smartShuffleBurst"
+        static let smartShuffleSuggestionsAhead = "settings.smartShuffleSuggestionsAhead"
         static let ambientBackdropEnabled = "settings.ambientBackdropEnabled"
         static let ambientBackdropStyle = "settings.ambientBackdropStyle"
         static let popOutVideoOnNavigateAway = "settings.popOutVideoOnNavigateAway"
@@ -83,12 +89,24 @@ final class SettingsManager {
     /// Available language options for app UI localization.
     enum ContentLanguage: String, CaseIterable, Identifiable {
         case system
-        case english
-        case korean
         case arabic
-        case turkish
-        case indonesian
+        case german
+        case english
+        case spanish
         case french
+        case indonesian
+        case italian
+        case japanese
+        case korean
+        case dutch
+        case polish
+        case portuguese
+        case russian
+        case swedish
+        case turkish
+        case ukrainian
+        case simplifiedChinese
+        case traditionalChinese
 
         var id: String {
             rawValue
@@ -97,12 +115,24 @@ final class SettingsManager {
         var displayName: String {
             switch self {
             case .system: String(localized: "System Default")
-            case .english: "English"
-            case .korean: "한국어"
             case .arabic: "العربية"
-            case .turkish: "Türkçe"
-            case .indonesian: "Bahasa Indonesia"
+            case .dutch: "Nederlands"
+            case .english: "English"
             case .french: "Français"
+            case .german: "Deutsch"
+            case .indonesian: "Bahasa Indonesia"
+            case .italian: "Italiano"
+            case .japanese: "日本語"
+            case .korean: "한국어"
+            case .polish: "Polski"
+            case .portuguese: "Português"
+            case .russian: "Русский"
+            case .spanish: "Español"
+            case .simplifiedChinese: "简体中文"
+            case .swedish: "Svenska"
+            case .traditionalChinese: "繁體中文"
+            case .turkish: "Türkçe"
+            case .ukrainian: "Українська"
             }
         }
 
@@ -110,12 +140,28 @@ final class SettingsManager {
         var languageCode: String? {
             switch self {
             case .system: nil
-            case .english: "en"
-            case .korean: "ko"
             case .arabic: "ar"
-            case .turkish: "tr"
-            case .indonesian: "id"
+            case .dutch: "nl"
+            case .english: "en"
             case .french: "fr"
+            case .german: "de"
+            case .indonesian: "id"
+            case .italian: "it"
+            case .japanese: "ja"
+            case .korean: "ko"
+            case .polish: "pl"
+            case .portuguese: "pt"
+            case .russian: "ru"
+            case .spanish: "es"
+            // Chinese is distinguished by script, not region, matching Apple's
+            // localization identifiers. Verified against the InnerTube API: these
+            // same codes are valid `hl` values and return correctly-scripted
+            // responses, so no separate API mapping is needed.
+            case .simplifiedChinese: "zh-Hans"
+            case .swedish: "sv"
+            case .traditionalChinese: "zh-Hant"
+            case .turkish: "tr"
+            case .ukrainian: "uk"
             }
         }
 
@@ -123,7 +169,25 @@ final class SettingsManager {
         /// Returns the explicit language code or derives one from the system locale,
         /// falling back to `"en"`.
         var apiLanguageCode: String {
-            self.languageCode ?? Locale.current.language.languageCode?.identifier ?? "en"
+            self.apiLanguageCode(for: Locale.current)
+        }
+
+        /// Resolves the API language code against an injectable system locale.
+        func apiLanguageCode(for systemLocale: Locale) -> String {
+            if let languageCode = self.languageCode {
+                return languageCode
+            }
+
+            let language = systemLocale.language
+            guard let languageCode = language.languageCode?.identifier else {
+                return "en"
+            }
+
+            return switch (languageCode, language.script?.identifier) {
+            case ("zh", "Hans"): "zh-Hans"
+            case ("zh", "Hant"): "zh-Hant"
+            default: languageCode
+            }
         }
 
         /// The locale matching this language selection.
@@ -215,6 +279,7 @@ final class SettingsManager {
             // Clear stale values when setting is disabled to prevent unexpected restoration
             if !self.rememberPlaybackSettings {
                 UserDefaults.standard.removeObject(forKey: "playerShuffleEnabled")
+                UserDefaults.standard.removeObject(forKey: "playerShuffleMode")
                 UserDefaults.standard.removeObject(forKey: "playerRepeatMode")
             }
         }
@@ -295,6 +360,72 @@ final class SettingsManager {
         }
     }
 
+    /// Whether the regular YouTube video window floats above standard windows.
+    var keepYouTubeVideoOnTop: Bool {
+        didSet {
+            UserDefaults.standard.set(self.keepYouTubeVideoOnTop, forKey: Keys.keepYouTubeVideoOnTop)
+        }
+    }
+
+    // MARK: - Smart Shuffle defaults & ranges (single source of truth)
+
+    /// Default cadence: insert a burst of suggestions every N originals.
+    static let smartShuffleSuggestEveryNDefault = 3
+    /// Valid range for the insert-every-N cadence.
+    static let smartShuffleSuggestEveryNRange = 1 ... 6
+    /// Default number of suggestions inserted at each slot.
+    static let smartShuffleBurstDefault = 1
+    /// Valid range for the per-insertion burst.
+    static let smartShuffleBurstRange = 1 ... 5
+    /// Default number of suggestions to keep queued ahead of the current track.
+    static let smartShuffleSuggestionsAheadDefault = 20
+    /// Valid range for how many suggestions to keep queued ahead.
+    static let smartShuffleSuggestionsAheadRange = 5 ... 100
+
+    private static func clamp(_ value: Int, to range: ClosedRange<Int>) -> Int {
+        min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    /// Whether Smart Shuffle (the third shuffle state) is available from the shuffle button.
+    var smartShuffleEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(self.smartShuffleEnabled, forKey: Keys.smartShuffleEnabled)
+        }
+    }
+
+    /// Smart Shuffle interleave cadence: insert a burst of suggestions every N songs (1...6).
+    var smartShuffleSuggestEveryN: Int {
+        didSet {
+            let clamped = Self.clamp(self.smartShuffleSuggestEveryN, to: Self.smartShuffleSuggestEveryNRange)
+            if clamped != self.smartShuffleSuggestEveryN {
+                self.smartShuffleSuggestEveryN = clamped
+            }
+            UserDefaults.standard.set(clamped, forKey: Keys.smartShuffleSuggestEveryN)
+        }
+    }
+
+    /// Smart Shuffle burst: how many suggestions to insert at each slot (1...5).
+    var smartShuffleBurst: Int {
+        didSet {
+            let clamped = Self.clamp(self.smartShuffleBurst, to: Self.smartShuffleBurstRange)
+            if clamped != self.smartShuffleBurst {
+                self.smartShuffleBurst = clamped
+            }
+            UserDefaults.standard.set(clamped, forKey: Keys.smartShuffleBurst)
+        }
+    }
+
+    /// Smart Shuffle: how many suggestions to keep queued ahead of the current track (5...100).
+    var smartShuffleSuggestionsAhead: Int {
+        didSet {
+            let clamped = Self.clamp(self.smartShuffleSuggestionsAhead, to: Self.smartShuffleSuggestionsAheadRange)
+            if clamped != self.smartShuffleSuggestionsAhead {
+                self.smartShuffleSuggestionsAhead = clamped
+            }
+            UserDefaults.standard.set(clamped, forKey: Keys.smartShuffleSuggestionsAhead)
+        }
+    }
+
     /// Whether the ambient color backdrop is shown on the YouTube watch page.
     /// Applies to regular YouTube videos only, not the Music experience.
     var ambientBackdropEnabled: Bool {
@@ -320,10 +451,23 @@ final class SettingsManager {
         }
     }
 
-    /// The style the YouTube watch page should actually render: the chosen
-    /// style when enabled, `.off` when the feature is disabled.
+    /// The style the YouTube watch page should request: the chosen style when
+    /// enabled, `.off` when the feature is disabled. Runtime energy/accessibility
+    /// downgrades are applied inside `AmbientVideoBackdrop`, which observes those
+    /// external states directly.
     var resolvedAmbientStyle: AmbientBackdropStyle {
-        self.ambientBackdropEnabled ? self.ambientBackdropStyle : .off
+        Self.resolveAmbientStyle(
+            enabled: self.ambientBackdropEnabled,
+            preferredStyle: self.ambientBackdropStyle
+        )
+    }
+
+    nonisolated static func resolveAmbientStyle(
+        enabled: Bool,
+        preferredStyle: AmbientBackdropStyle
+    ) -> AmbientBackdropStyle {
+        guard enabled, preferredStyle != .off else { return .off }
+        return preferredStyle
     }
 
     /// The language used for the app interface and API content.
@@ -349,6 +493,10 @@ final class SettingsManager {
 
     // MARK: - Initialization
 
+    static func loadKeepYouTubeVideoOnTop(from defaults: UserDefaults) -> Bool {
+        defaults.object(forKey: Keys.keepYouTubeVideoOnTop) as? Bool ?? false
+    }
+
     private init() {
         // Load persisted settings or use defaults
         self.showNowPlayingNotifications = UserDefaults.standard.object(forKey: Keys.showNowPlayingNotifications) as? Bool ?? true
@@ -369,6 +517,21 @@ final class SettingsManager {
         self.syncedLyricsEnabled = UserDefaults.standard.object(forKey: Keys.syncedLyricsEnabled) as? Bool ?? true
         self.romanizationEnabled = UserDefaults.standard.object(forKey: Keys.romanizationEnabled) as? Bool ?? true
         self.keepMiniPlayerOnTop = UserDefaults.standard.object(forKey: Keys.keepMiniPlayerOnTop) as? Bool ?? false
+        self.keepYouTubeVideoOnTop = Self.loadKeepYouTubeVideoOnTop(from: UserDefaults.standard)
+        self.smartShuffleEnabled = UserDefaults.standard.object(forKey: Keys.smartShuffleEnabled) as? Bool ?? true
+        // Property observers do not fire for assignments in init, so clamp persisted values here too.
+        self.smartShuffleSuggestEveryN = Self.clamp(
+            UserDefaults.standard.object(forKey: Keys.smartShuffleSuggestEveryN) as? Int ?? Self.smartShuffleSuggestEveryNDefault,
+            to: Self.smartShuffleSuggestEveryNRange
+        )
+        self.smartShuffleBurst = Self.clamp(
+            UserDefaults.standard.object(forKey: Keys.smartShuffleBurst) as? Int ?? Self.smartShuffleBurstDefault,
+            to: Self.smartShuffleBurstRange
+        )
+        self.smartShuffleSuggestionsAhead = Self.clamp(
+            UserDefaults.standard.object(forKey: Keys.smartShuffleSuggestionsAhead) as? Int ?? Self.smartShuffleSuggestionsAheadDefault,
+            to: Self.smartShuffleSuggestionsAheadRange
+        )
         self.ambientBackdropEnabled = UserDefaults.standard.object(forKey: Keys.ambientBackdropEnabled) as? Bool ?? true
         self.popOutVideoOnNavigateAway = UserDefaults.standard.object(forKey: Keys.popOutVideoOnNavigateAway) as? Bool ?? true
         #if DEBUG
@@ -397,7 +560,7 @@ final class SettingsManager {
         {
             self.ambientBackdropStyle = style
         } else {
-            self.ambientBackdropStyle = .live
+            self.ambientBackdropStyle = Self.defaultAmbientBackdropStyle
         }
 
         if let rawValue = UserDefaults.standard.string(forKey: Keys.defaultLaunchPage),

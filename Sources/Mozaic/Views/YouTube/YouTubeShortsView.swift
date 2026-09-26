@@ -8,6 +8,7 @@ import SwiftUI
 struct YouTubeShortsView: View {
     let viewModel: YouTubeShortsViewModel
 
+    @Environment(AuthService.self) private var authService
     @Environment(YouTubePlayerService.self) private var youtubePlayer
 
     /// The short currently snapped into view (drives autoplay).
@@ -78,7 +79,10 @@ struct YouTubeShortsView: View {
             }
             .scrollTargetLayout()
         }
-        .scrollTargetBehavior(.paging)
+        // Viewport-relative `.paging` accumulates the asymmetric navigation-bar
+        // and player-bar safe-area offset on every page. Align the explicit
+        // row targets instead so repeated wheel gestures cannot drift mid-page.
+        .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
         .scrollPosition(id: self.$currentShortId)
         .scrollIndicators(.hidden)
         .background(.black)
@@ -100,7 +104,7 @@ struct YouTubeShortsView: View {
             return
         }
         guard self.youtubePlayer.currentVideo?.videoId != short.videoId else { return }
-        self.youtubePlayer.play(video: short)
+        self.youtubePlayer.play(video: short, usesCookieFreeDataStore: self.authService.shouldUseCookieFreePlaybackDataStore)
         self.youtubePlayer.activeInlineVideoId = short.videoId
     }
 
@@ -118,28 +122,6 @@ struct YouTubeShortsView: View {
     }
 }
 
-// MARK: - ShortsScrollForwarder
-
-/// Transparent overlay that hands trackpad scrolls to the enclosing
-/// pager — the WKWebView under it would otherwise swallow them.
-private struct ShortsScrollForwarder: NSViewRepresentable {
-    final class ForwardingView: NSView {
-        override func scrollWheel(with event: NSEvent) {
-            if let scrollView = self.enclosingScrollView {
-                scrollView.scrollWheel(with: event)
-            } else {
-                self.nextResponder?.scrollWheel(with: event)
-            }
-        }
-    }
-
-    func makeNSView(context _: Context) -> ForwardingView {
-        ForwardingView()
-    }
-
-    func updateNSView(_: ForwardingView, context _: Context) {}
-}
-
 // MARK: - ShortPage
 
 /// One full-height page of the Shorts pager: the live 9:16 surface when
@@ -151,7 +133,7 @@ private struct ShortPage: View {
     var body: some View {
         Group {
             if self.isActive {
-                YouTubeWatchSurfaceView()
+                YouTubeWatchSurfaceView(expectedVideoId: self.short.videoId)
             } else {
                 CachedAsyncImage(
                     url: self.short.thumbnailURL,
@@ -159,7 +141,7 @@ private struct ShortPage: View {
                 ) { image in
                     image
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
+                        .scaledToFill()
                 } placeholder: {
                     Rectangle()
                         .fill(.black)
@@ -171,13 +153,9 @@ private struct ShortPage: View {
             }
         }
         .aspectRatio(9 / 16, contentMode: .fit)
-        .overlay {
-            // The video WebView consumes trackpad scrolls; forward them so
-            // the pager keeps paging while the cursor is over the short.
-            ShortsScrollForwarder()
-        }
         .overlay(alignment: .bottom) {
             self.infoOverlay
+                .allowsHitTesting(false)
         }
         .clipShape(.rect(cornerRadius: 12))
         .frame(maxWidth: .infinity, maxHeight: .infinity)

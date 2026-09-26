@@ -33,6 +33,25 @@ struct Song: Identifiable, Codable, Hashable {
     /// Whether this song carries an explicit-content badge (nil if unknown).
     var isExplicit: Bool?
 
+    /// This track's occurrence-specific identifier within a playlist, required to remove
+    /// the correct instance (the same song can appear more than once in a playlist).
+    /// Only populated when the song was parsed from a playlist's track list.
+    var playlistSetVideoId: String?
+
+    /// Video ID of this track's audio recording, when the row itself is a music video.
+    ///
+    /// Album rows are sometimes official music videos (`MUSIC_VIDEO_TYPE_OMV`). YouTube
+    /// Music still advertises the audio recording of the same track in the row's
+    /// credits menu, and this carries that ID. `nil` when the row is already an audio
+    /// recording or when no credits entry was present — use `preferredAudioVideoId`
+    /// to resolve either case.
+    var audioTrackVideoId: String?
+
+    /// The audio recording to prefer for this track, falling back to `videoId`.
+    var preferredAudioVideoId: String {
+        self.audioTrackVideoId ?? self.videoId
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id
         case title
@@ -48,6 +67,8 @@ struct Song: Identifiable, Codable, Hashable {
         case isInLibrary
         case feedbackTokens
         case isExplicit
+        case playlistSetVideoId
+        case audioTrackVideoId
     }
 
     /// Memberwise initializer with default values for mutable properties.
@@ -65,7 +86,9 @@ struct Song: Identifiable, Codable, Hashable {
         likeStatus: LikeStatus? = nil,
         isInLibrary: Bool? = nil,
         feedbackTokens: FeedbackTokens? = nil,
-        isExplicit: Bool? = nil
+        isExplicit: Bool? = nil,
+        playlistSetVideoId: String? = nil,
+        audioTrackVideoId: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -81,6 +104,8 @@ struct Song: Identifiable, Codable, Hashable {
         self.isInLibrary = isInLibrary
         self.feedbackTokens = feedbackTokens
         self.isExplicit = isExplicit
+        self.playlistSetVideoId = playlistSetVideoId
+        self.audioTrackVideoId = audioTrackVideoId
     }
 
     init(from decoder: any Decoder) throws {
@@ -99,6 +124,8 @@ struct Song: Identifiable, Codable, Hashable {
         self.isInLibrary = try container.decodeIfPresent(Bool.self, forKey: .isInLibrary)
         self.feedbackTokens = try container.decodeIfPresent(FeedbackTokens.self, forKey: .feedbackTokens)
         self.isExplicit = try container.decodeIfPresent(Bool.self, forKey: .isExplicit)
+        self.playlistSetVideoId = try container.decodeIfPresent(String.self, forKey: .playlistSetVideoId)
+        self.audioTrackVideoId = try container.decodeIfPresent(String.self, forKey: .audioTrackVideoId)
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -117,6 +144,29 @@ struct Song: Identifiable, Codable, Hashable {
         try container.encodeIfPresent(self.isInLibrary, forKey: .isInLibrary)
         try container.encodeIfPresent(self.feedbackTokens, forKey: .feedbackTokens)
         try container.encodeIfPresent(self.isExplicit, forKey: .isExplicit)
+        try container.encodeIfPresent(self.playlistSetVideoId, forKey: .playlistSetVideoId)
+        try container.encodeIfPresent(self.audioTrackVideoId, forKey: .audioTrackVideoId)
+    }
+
+    func replacingDisplayMetadata(title: String, artists: [Artist], thumbnailURL: URL?) -> Song {
+        Song(
+            id: self.id,
+            title: title,
+            artists: artists,
+            album: self.album,
+            duration: self.duration,
+            thumbnailURL: thumbnailURL,
+            videoId: self.videoId,
+            isPlayable: self.isPlayable,
+            hasVideo: self.hasVideo,
+            musicVideoType: self.musicVideoType,
+            likeStatus: self.likeStatus,
+            isInLibrary: self.isInLibrary,
+            feedbackTokens: self.feedbackTokens,
+            isExplicit: self.isExplicit,
+            playlistSetVideoId: self.playlistSetVideoId,
+            audioTrackVideoId: self.audioTrackVideoId
+        )
     }
 
     /// Display string for artists (comma-separated).

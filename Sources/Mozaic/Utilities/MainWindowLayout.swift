@@ -15,6 +15,8 @@ enum MainWindowLayout {
     static let minimumHeight: CGFloat = 600
     static let defaultWidth: CGFloat = 1100
     static let defaultHeight: CGFloat = 760
+    /// Shared top inset for the Music command bar and YouTube Ask panel.
+    static let aiTaskSurfaceTopPadding: CGFloat = 72
 
     static var minimumContentSize: NSSize {
         NSSize(width: minimumWidth, height: minimumHeight)
@@ -35,6 +37,13 @@ enum MainWindowLayout {
     static func configure(_ window: NSWindow) {
         guard self.isPrimaryWindow(window) else { return }
 
+        self.configureKnownPrimaryWindow(window)
+    }
+
+    /// Applies the primary-window contract when the caller already owns the
+    /// main SwiftUI scene and does not need title-based discovery.
+    @MainActor
+    static func configureKnownPrimaryWindow(_ window: NSWindow) {
         if window.frameAutosaveName.isEmpty {
             window.setFrameAutosaveName(self.autosaveName)
         }

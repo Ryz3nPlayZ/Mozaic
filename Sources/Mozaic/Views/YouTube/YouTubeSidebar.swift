@@ -9,14 +9,18 @@ import SwiftUI
 /// shared footer (source toggle + profile) at the bottom.
 struct YouTubeSidebar: View {
     @Binding var selection: YouTubeNavigationItem?
+    var onReselect: ((YouTubeNavigationItem) -> Void)?
+    @Environment(AuthService.self) private var authService
 
     var body: some View {
-        List(selection: self.listSelection) {
+        List {
             // Main navigation
             Section {
                 self.row(for: .search)
                 self.row(for: .home)
-                self.row(for: .subscriptions)
+                if self.hasPersonalAccount {
+                    self.row(for: .subscriptions)
+                }
             }
 
             // Discover section
@@ -25,12 +29,14 @@ struct YouTubeSidebar: View {
                 self.row(for: .shorts)
             }
 
-            // Collection section
-            Section(String(localized: "Collection")) {
-                self.row(for: .likedVideos)
-                self.row(for: .watchLater)
-                self.row(for: .playlists)
-                self.row(for: .history)
+            if self.hasPersonalAccount {
+                // Collection section
+                Section(String(localized: "Collection")) {
+                    self.row(for: .likedVideos)
+                    self.row(for: .watchLater)
+                    self.row(for: .playlists)
+                    self.row(for: .history)
+                }
             }
         }
         .listStyle(.sidebar)
@@ -42,22 +48,29 @@ struct YouTubeSidebar: View {
         .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 300)
     }
 
-    /// Selection binding that adds haptic feedback on change.
-    private var listSelection: Binding<YouTubeNavigationItem?> {
-        Binding {
-            self.selection
-        } set: { newValue in
-            guard self.selection != newValue else { return }
-            self.selection = newValue
-            HapticService.navigation()
-        }
+    private var hasPersonalAccount: Bool {
+        self.authService.hasPersonalAccount
     }
 
     private func row(for item: YouTubeNavigationItem) -> some View {
-        NavigationLink(value: item) {
-            Label(item.displayName, systemImage: item.icon)
+        MozaicSidebarRow(
+            title: item.displayName,
+            systemImage: item.icon,
+            isSelected: self.selection == item
+        ) {
+            self.select(item)
         }
         .accessibilityIdentifier(AccessibilityID.YouTubeSidebar.item(for: item))
+    }
+
+    private func select(_ item: YouTubeNavigationItem) {
+        if self.selection == item {
+            self.onReselect?(item)
+            HapticService.navigation()
+            return
+        }
+        self.selection = item
+        HapticService.navigation()
     }
 }
 
@@ -76,4 +89,5 @@ extension AccessibilityID {
 #Preview {
     YouTubeSidebar(selection: .constant(.home))
         .frame(width: 220)
+        .environment(AuthService())
 }
