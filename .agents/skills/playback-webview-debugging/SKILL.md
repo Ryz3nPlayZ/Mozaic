@@ -32,6 +32,10 @@ Use this skill when playback, auth recovery, queue sync, or hidden WebView state
 - `docs/playback.md`
 - `Sources/Mozaic/Views/MiniPlayerWebView.swift`
 - `Sources/Mozaic/Views/SingletonPlayerWebView+ObserverScript.swift`
+- `Sources/Mozaic/Views/SingletonPlayerWebView+NavigationState.swift`
+- `Sources/Mozaic/Views/SingletonPlayerWebView+QueueInjection.swift`
 - `Sources/Mozaic/Services/Player/PlayerService.swift`
+- `Sources/Mozaic/Services/Player/PlayerService+WebPlaybackIdentity.swift`
 - `Sources/Mozaic/Services/Player/PlayerService+WebQueueSync.swift`
+- `Sources/Mozaic/Services/Player/PlayerService+QueueNavigationRecovery.swift`
 - `Sources/Mozaic/Services/WebKit/WebKitManager.swift`

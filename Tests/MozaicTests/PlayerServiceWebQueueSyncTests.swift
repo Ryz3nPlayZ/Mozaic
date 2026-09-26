@@ -1,3 +1,5 @@
+// swiftlint:disable file_length
+
 import Foundation
 import Testing
 @testable import Mozaic
@@ -7,6 +9,7 @@ import Testing
 /// Web queue sync, next/previous stack, repeat-one, metadata drift, and radio-related PlayerService tests.
 @Suite(.serialized, .tags(.service))
 @MainActor
+// swiftlint:disable:next type_body_length
 struct PlayerServiceWebQueueSyncTests {
     var playerService: PlayerService
 
@@ -54,6 +57,278 @@ struct PlayerServiceWebQueueSyncTests {
         await self.playerService.previous()
         #expect(self.playerService.currentIndex == 0)
         #expect(self.playerService.pendingPlayVideoId == "v1")
+    }
+
+    @Test("Manual next without queue materializes radio queue through API")
+    func manualNextWithoutQueueMaterializesRadioQueueThroughAPI() async {
+        let mockClient = MockYTMusicClient()
+        let seed = Song(id: "seed", title: "Seed", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "seed-video")
+        let radioSongs = [
+            Song(id: "radio-1", title: "Radio 1", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "radio-video-1"),
+            Song(id: "radio-2", title: "Radio 2", artists: [], album: nil, duration: 220, thumbnailURL: nil, videoId: "radio-video-2"),
+        ]
+        mockClient.radioQueueSongs[seed.videoId] = radioSongs
+        self.playerService.setYTMusicClient(mockClient)
+        self.playerService.currentTrack = seed
+        self.playerService.pendingPlayVideoId = seed.videoId
+        self.playerService.state = .playing
+
+        await self.playerService.next()
+
+        #expect(mockClient.getRadioQueueCalled == true)
+        #expect(mockClient.getRadioQueueVideoIds == [seed.videoId])
+        #expect(self.playerService.queue.map(\.videoId) == ["seed-video", "radio-video-1", "radio-video-2"])
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.currentTrack?.videoId == "radio-video-1")
+        #expect(self.playerService.progress == 0)
+    }
+
+    @Test("Stale metadata after manual next cannot realign backward before intended confirmation")
+    func staleMetadataAfterManualNextCannotRealignBackwardBeforeIntendedConfirmation() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+            Song(id: "3", title: "Song 3", artists: [], album: nil, duration: 220, thumbnailURL: nil, videoId: "v3"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.state = .playing
+
+        await self.playerService.next()
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.currentTrack?.videoId == "v2")
+
+        // YouTube can emit stale metadata for the previous video while Mozaic's
+        // manual navigation load is still in flight. Multiple stale frames must
+        // not be allowed to realign the native queue back to the old song.
+        let recoveryGeneration = self.playerService.queueNavigationRecoveryGeneration
+        self.playerService.updateTrackMetadata(
+            title: "Song 1",
+            artist: "",
+            thumbnailUrl: "",
+            videoId: "v1"
+        )
+
+        self.playerService.updateTrackMetadata(
+            title: "Song 1",
+            artist: "",
+            thumbnailUrl: "",
+            videoId: "v1"
+        )
+
+        #expect(self.playerService.queueNavigationRecoveryVideoId == "v2")
+        #expect(self.playerService.queueNavigationRecoveryGeneration == recoveryGeneration + 1)
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.currentTrack?.videoId == "v2")
+        #expect(self.playerService.pendingPlayVideoId == "v2")
+        self.playerService.clearQueueNavigationRecovery()
+    }
+
+    @Test("Stale metadata after manual next confirmation cannot realign backward")
+    func staleMetadataAfterManualNextConfirmationCannotRealignBackward() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+            Song(id: "3", title: "Song 3", artists: [], album: nil, duration: 220, thumbnailURL: nil, videoId: "v3"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.state = .playing
+
+        await self.playerService.next()
+        #expect(self.playerService.currentIndex == 1)
+
+        self.playerService.updateTrackMetadata(
+            title: "Song 2",
+            artist: "",
+            thumbnailUrl: "",
+            videoId: "v2"
+        )
+        let recoveryGeneration = self.playerService.queueNavigationRecoveryGeneration
+
+        // Stale old-song metadata can still arrive after the intended video was
+        // briefly confirmed. It must not be treated as a legitimate native
+        // in-queue move back to the previous item.
+        self.playerService.updateTrackMetadata(
+            title: "Song 1",
+            artist: "",
+            thumbnailUrl: "",
+            videoId: "v1"
+        )
+        await Task.yield()
+        #expect(self.playerService.queueNavigationRecoveryTask != nil)
+        #expect(self.playerService.queueNavigationRecoveryVideoId == "v2")
+        self.playerService.updateTrackMetadata(
+            title: "Song 1",
+            artist: "",
+            thumbnailUrl: "",
+            videoId: "v1"
+        )
+
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.currentTrack?.videoId == "v2")
+        #expect(self.playerService.pendingPlayVideoId == "v2")
+        #expect(self.playerService.queueNavigationRecoveryVideoId == "v2")
+        #expect(self.playerService.queueNavigationRecoveryGeneration == recoveryGeneration + 1)
+        self.playerService.clearQueueNavigationRecovery()
+    }
+
+    @Test("Expired unconfirmed manual next protection allows later in-queue movement")
+    func expiredUnconfirmedManualNextProtectionAllowsLaterInQueueMovement() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+            Song(id: "3", title: "Song 3", artists: [], album: nil, duration: 220, thumbnailURL: nil, videoId: "v3"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.state = .playing
+
+        await self.playerService.next()
+        #expect(self.playerService.currentIndex == 1)
+        self.playerService.protectedQueueNavigationStartedAt = ContinuousClock.now - .seconds(25)
+
+        self.playerService.updateTrackMetadata(
+            title: "Song 3",
+            artist: "",
+            thumbnailUrl: "",
+            videoId: "v3"
+        )
+
+        #expect(self.playerService.currentIndex == 2)
+        #expect(self.playerService.currentTrack?.videoId == "v3")
+    }
+
+    @Test("Manual next ignores native injection marker and loads target deterministically")
+    func manualNextIgnoresNativeInjectionMarkerAndLoadsTargetDeterministically() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+            Song(id: "3", title: "Song 3", artists: [], album: nil, duration: 220, thumbnailURL: nil, videoId: "v3"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.state = .playing
+        self.playerService.injectedWebQueueVideoId = "v2"
+
+        await self.playerService.next()
+
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.pendingPlayVideoId == "v2")
+        #expect(self.playerService.injectedWebQueueVideoId == nil)
+        #expect(self.playerService.pendingWebQueueInjectionVideoId == nil)
+    }
+
+    @Test("Manual next resets progress before persisting target queue song")
+    func manualNextResetsProgressBeforePersistingTargetQueueSong() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.state = .playing
+        self.playerService.progress = 179
+        self.playerService.duration = 180
+        self.playerService.injectedWebQueueVideoId = "v2"
+
+        await self.playerService.next()
+
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.currentTrack?.videoId == "v2")
+        #expect(self.playerService.progress == 0)
+        #expect(self.playerService.duration == 200)
+    }
+
+    @Test("Manual next clears consumed injection marker for duplicate video IDs")
+    func manualNextClearsConsumedInjectionMarkerForDuplicateVideoIDs() async {
+        let duplicate = Song(id: "dup", title: "Duplicate", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v2")
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            duplicate,
+            duplicate,
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.state = .playing
+        self.playerService.injectedWebQueueVideoId = "v2"
+
+        await self.playerService.next()
+
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.injectedWebQueueVideoId == nil)
+        #expect(self.playerService.expectedQueueIndexAfterCurrentTrack() == 2)
+    }
+
+    @Test("Saving an empty queue clears web queue injection state")
+    func savingEmptyQueueClearsWebQueueInjectionState() {
+        self.playerService.injectedWebQueueVideoId = "stale"
+        self.playerService.pendingWebQueueInjectionVideoId = "stale"
+
+        self.playerService.saveQueueForPersistence()
+
+        #expect(self.playerService.injectedWebQueueVideoId == nil)
+        #expect(self.playerService.pendingWebQueueInjectionVideoId == nil)
+    }
+
+    @Test("Removing injected next song clears web queue injection state")
+    func removingInjectedNextSongClearsWebQueueInjectionState() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.state = .playing
+        self.playerService.injectedWebQueueVideoId = "v2"
+
+        self.playerService.removeFromQueue(videoIds: ["v2"])
+
+        #expect(self.playerService.queue.map(\.videoId) == ["v1"])
+        #expect(self.playerService.injectedWebQueueVideoId == nil)
+        #expect(self.playerService.pendingWebQueueInjectionVideoId == nil)
+    }
+
+    @Test("Web queue injection result is trusted only after successful current next confirmation")
+    func webQueueInjectionResultRequiresSuccessfulExpectedNextConfirmation() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+            Song(id: "3", title: "Song 3", artists: [], album: nil, duration: 220, thumbnailURL: nil, videoId: "v3"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+
+        self.playerService.webQueueInjectionGeneration = 1
+        self.playerService.pendingWebQueueInjectionVideoId = "v3"
+        self.playerService.handleWebQueueInjectionResult(
+            videoId: "v3",
+            attemptGeneration: 1,
+            success: true,
+            reason: nil
+        )
+        #expect(self.playerService.injectedWebQueueVideoId == nil)
+        #expect(self.playerService.pendingWebQueueInjectionVideoId == nil)
+
+        self.playerService.pendingWebQueueInjectionVideoId = "v2"
+        self.playerService.handleWebQueueInjectionResult(
+            videoId: "v2",
+            attemptGeneration: 2,
+            success: false,
+            reason: "timeout"
+        )
+        #expect(self.playerService.injectedWebQueueVideoId == nil)
+        #expect(self.playerService.pendingWebQueueInjectionVideoId == nil)
+
+        self.playerService.handleWebQueueInjectionResult(
+            videoId: "v2",
+            attemptGeneration: 2,
+            success: true,
+            reason: "stale"
+        )
+        #expect(self.playerService.injectedWebQueueVideoId == nil)
+
+        self.playerService.pendingWebQueueInjectionVideoId = "v2"
+        self.playerService.handleWebQueueInjectionResult(
+            videoId: "v2",
+            attemptGeneration: 3,
+            success: true,
+            reason: "queue-readback-confirmed"
+        )
+        #expect(self.playerService.injectedWebQueueVideoId == "v2")
+        #expect(self.playerService.pendingWebQueueInjectionVideoId == nil)
     }
 
     // MARK: - Next with Shuffle Tests
@@ -170,11 +445,16 @@ struct PlayerServiceWebQueueSyncTests {
         self.playerService.cycleRepeatMode()
         self.playerService.cycleRepeatMode()
         #expect(self.playerService.repeatMode == .one)
+        self.playerService.lastNonAdContentProgress = 179
+        self.playerService.lastNonAdContentVideoId = "v1"
 
         await self.playerService.handleTrackEnded(observedVideoId: "v1")
 
         #expect(self.playerService.currentIndex == 0)
         #expect(self.playerService.pendingPlayVideoId == "v1")
+        #expect(self.playerService.lastNonAdContentProgress == 0)
+        #expect(self.playerService.lastNonAdContentVideoId == nil)
+        #expect(self.playerService.shouldResumeAfterInterruption)
     }
 
     @Test("Repeat one recovers when title drifts before videoId is sent")
@@ -467,6 +747,8 @@ struct PlayerServiceWebQueueSyncTests {
         #expect(self.playerService.currentIndex == 2)
         #expect(self.playerService.currentTrack?.videoId == "v3")
         #expect(self.playerService.currentTrack?.title == "Song 3")
+        #expect(self.playerService.pendingPlayVideoId == "v3")
+        #expect(self.playerService.progress == 0)
     }
 
     @Test("Track end wraps to the first queue song when repeat all is enabled")
@@ -501,6 +783,23 @@ struct PlayerServiceWebQueueSyncTests {
         #expect(self.playerService.currentTrack?.title == "Song 1")
     }
 
+    @Test("Shuffled track end still wraps when repeat all already reports the first queue song")
+    func shuffledTrackEndWrapsToStartWhenRepeatAllReportsWrappedSong() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+        ]
+
+        await self.playerService.playQueue(songs, startingAt: 1)
+        self.playerService.shuffleMode = .on
+        self.playerService.cycleRepeatMode()
+        await self.playerService.handleTrackEnded(observedVideoId: "v1")
+
+        #expect(self.playerService.currentIndex == 0)
+        #expect(self.playerService.currentTrack?.videoId == "v1")
+        #expect(self.playerService.currentTrack?.title == "Song 1")
+    }
+
     @Test("Track end advances native queue before Web autoplay can take over")
     func trackEndAdvancesNativeQueueImmediately() async {
         let songs = [
@@ -515,6 +814,295 @@ struct PlayerServiceWebQueueSyncTests {
         #expect(self.playerService.currentIndex == 1)
         #expect(self.playerService.currentTrack?.videoId == "v2")
         #expect(self.playerService.currentTrack?.title == "Song 2")
+    }
+
+    @Test("Near-end metadata transition is not advanced again by a late ended callback")
+    func nearEndMetadataThenLateEndedDoesNotDoubleAdvance() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+            Song(id: "3", title: "Song 3", artists: [], album: nil, duration: 220, thumbnailURL: nil, videoId: "v3"),
+        ]
+
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.isMozaicInitiatedPlayback = false
+        self.playerService.songNearingEnd = true
+        let outgoingOccurrence = self.playerService.currentMusicPlaybackOccurrence
+        self.playerService.updateTrackMetadata(
+            title: "Song 2",
+            artist: "",
+            thumbnailUrl: "",
+            videoId: "v2",
+            playbackOccurrence: outgoingOccurrence
+        )
+        #expect(self.playerService.currentIndex == 1)
+        let incomingOccurrence = MusicPlaybackOccurrence.web(
+            documentGeneration: 7,
+            mediaGeneration: 2,
+            nativeGeneration: self.playerService.currentNativeMusicPlaybackGeneration,
+            videoId: "v2"
+        )
+        _ = self.playerService.bindWebMusicPlaybackOccurrence(
+            documentGeneration: 7,
+            mediaGeneration: 2,
+            nativeGeneration: incomingOccurrence.nativeGeneration,
+            videoId: "v2"
+        )
+
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "v1",
+            playbackOccurrence: outgoingOccurrence
+        )
+
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.currentTrack?.videoId == "v2")
+
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "v2",
+            playbackOccurrence: incomingOccurrence
+        )
+
+        #expect(self.playerService.currentIndex == 2)
+        #expect(self.playerService.currentTrack?.videoId == "v3")
+    }
+
+    @Test("Duplicate ended callback replays repeat one only once")
+    func duplicateEndedCallbackReplaysRepeatOneOnlyOnce() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+        ]
+
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.cycleRepeatMode()
+        self.playerService.cycleRepeatMode()
+        let endedOccurrence = self.playerService.currentMusicPlaybackOccurrence
+
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "v1",
+            playbackOccurrence: endedOccurrence
+        )
+        let replayOccurrence = self.playerService.currentMusicPlaybackOccurrence
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "v1",
+            playbackOccurrence: endedOccurrence
+        )
+
+        #expect(self.playerService.currentIndex == 0)
+        #expect(replayOccurrence != endedOccurrence)
+        #expect(self.playerService.currentMusicPlaybackOccurrence == replayOccurrence)
+    }
+
+    @Test("Duplicate ended callback does not skip a repeated video ID in repeat all")
+    func duplicateEndedCallbackDoesNotSkipRepeatedVideoIdInRepeatAll() async {
+        let songs = [
+            Song(id: "1a", title: "Song 1A", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "1b", title: "Song 1B", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+        ]
+
+        await self.playerService.playQueue(songs, startingAt: 0)
+        self.playerService.cycleRepeatMode()
+        let endedOccurrence = self.playerService.currentMusicPlaybackOccurrence
+
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "v1",
+            playbackOccurrence: endedOccurrence
+        )
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "v1",
+            playbackOccurrence: endedOccurrence
+        )
+
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.currentTrack?.title == "Song 1B")
+    }
+
+    @Test("Duplicate ended callback replays no-queue repeat one only once")
+    func duplicateEndedCallbackReplaysNoQueueRepeatOneOnlyOnce() async {
+        let song = Song(
+            id: "solo",
+            title: "Solo",
+            artists: [],
+            album: nil,
+            duration: 180,
+            thumbnailURL: nil,
+            videoId: "solo-video"
+        )
+        await self.playerService.play(song: song)
+        self.playerService.cycleRepeatMode()
+        self.playerService.cycleRepeatMode()
+        let endedOccurrence = self.playerService.currentMusicPlaybackOccurrence
+
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "solo-video",
+            playbackOccurrence: endedOccurrence
+        )
+        let replayOccurrence = self.playerService.currentMusicPlaybackOccurrence
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "solo-video",
+            playbackOccurrence: endedOccurrence
+        )
+
+        #expect(self.playerService.queue.isEmpty)
+        #expect(replayOccurrence != endedOccurrence)
+        #expect(self.playerService.currentMusicPlaybackOccurrence == replayOccurrence)
+        #expect(self.playerService.state != .ended)
+    }
+
+    @Test("A later observer occurrence can end after the previous occurrence was consumed")
+    func laterObserverOccurrenceCanEnd() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+            Song(id: "3", title: "Song 3", artists: [], album: nil, duration: 220, thumbnailURL: nil, videoId: "v3"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        let firstOccurrence = self.playerService.bindWebMusicPlaybackOccurrence(
+            documentGeneration: 7,
+            mediaGeneration: 1,
+            nativeGeneration: self.playerService.currentNativeMusicPlaybackGeneration,
+            videoId: "v1"
+        )
+
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "v1",
+            playbackOccurrence: firstOccurrence
+        )
+        let secondOccurrence = self.playerService.bindWebMusicPlaybackOccurrence(
+            documentGeneration: 7,
+            mediaGeneration: 2,
+            nativeGeneration: self.playerService.currentNativeMusicPlaybackGeneration,
+            videoId: "v2"
+        )
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "v2",
+            playbackOccurrence: secondOccurrence
+        )
+
+        #expect(self.playerService.currentIndex == 2)
+        #expect(self.playerService.currentTrack?.videoId == "v3")
+    }
+
+    @Test("Near-end state does not bind an incoming occurrence before metadata handoff")
+    func nearEndDefersIncomingOccurrenceBinding() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        let nativeGeneration = self.playerService.currentNativeMusicPlaybackGeneration
+        let outgoingOccurrence = self.playerService.bindWebMusicPlaybackOccurrence(
+            documentGeneration: 7,
+            mediaGeneration: 1,
+            nativeGeneration: nativeGeneration,
+            videoId: "v1"
+        )
+        self.playerService.songNearingEnd = true
+
+        let incomingOccurrence = self.playerService.bindWebMusicPlaybackOccurrence(
+            documentGeneration: 7,
+            mediaGeneration: 2,
+            nativeGeneration: nativeGeneration,
+            videoId: "v2"
+        )
+
+        #expect(incomingOccurrence == nil)
+        #expect(self.playerService.currentMusicPlaybackOccurrence == outgoingOccurrence)
+    }
+
+    @Test("Music occurrence identity can refine its video ID without becoming newer")
+    func occurrenceVideoIdentityCanRefine() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        let nativeGeneration = self.playerService.currentNativeMusicPlaybackGeneration
+        let provisional = self.playerService.bindWebMusicPlaybackOccurrence(
+            documentGeneration: 7,
+            mediaGeneration: 1,
+            nativeGeneration: nativeGeneration,
+            videoId: nil
+        )
+        let refined = self.playerService.bindWebMusicPlaybackOccurrence(
+            documentGeneration: 7,
+            mediaGeneration: 1,
+            nativeGeneration: nativeGeneration,
+            videoId: "v1"
+        )
+
+        #expect(provisional == refined)
+        #expect(self.playerService.currentMusicPlaybackOccurrence?.videoId == "v1")
+    }
+
+    @Test("A claimed native occurrence consumes its matching first Web occurrence")
+    func claimedNativeOccurrenceTransfersToMatchingWebOccurrence() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        let nativeOccurrence = self.playerService.currentMusicPlaybackOccurrence
+
+        #expect(self.playerService.claimTerminalMusicPlaybackOccurrence(nativeOccurrence))
+        let matchingWebOccurrence = self.playerService.bindWebMusicPlaybackOccurrence(
+            documentGeneration: 7,
+            mediaGeneration: 1,
+            nativeGeneration: nativeOccurrence?.nativeGeneration ?? 0,
+            videoId: "v1"
+        )
+
+        #expect(!self.playerService.claimTerminalMusicPlaybackOccurrence(matchingWebOccurrence))
+    }
+
+    @Test("A delayed Web occurrence cannot replace a newer native replay")
+    func delayedWebOccurrenceCannotReplaceNativeReplay() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        let endedNativeOccurrence = self.playerService.currentMusicPlaybackOccurrence
+        #expect(self.playerService.claimTerminalMusicPlaybackOccurrence(endedNativeOccurrence))
+
+        let replayOccurrence = self.playerService.beginNativeMusicPlaybackOccurrence(videoId: "v1")
+        let delayedWebOccurrence = MusicPlaybackOccurrence.web(
+            documentGeneration: 7,
+            mediaGeneration: 1,
+            nativeGeneration: endedNativeOccurrence?.nativeGeneration ?? 0,
+            videoId: "v1"
+        )
+
+        let boundOccurrence = self.playerService.bindWebMusicPlaybackOccurrence(
+            documentGeneration: delayedWebOccurrence.documentGeneration ?? 0,
+            mediaGeneration: delayedWebOccurrence.mediaGeneration,
+            nativeGeneration: delayedWebOccurrence.nativeGeneration,
+            videoId: delayedWebOccurrence.videoId
+        )
+
+        #expect(boundOccurrence == nil)
+        #expect(!self.playerService.claimTerminalMusicPlaybackOccurrence(delayedWebOccurrence))
+        #expect(self.playerService.currentMusicPlaybackOccurrence == replayOccurrence)
+    }
+
+    @Test("Manual seek-to-end and a late ended callback share one occurrence")
+    func manualSeekToEndThenLateEndedDoesNotDoubleAdvance() async {
+        let songs = [
+            Song(id: "1", title: "Song 1", artists: [], album: nil, duration: 180, thumbnailURL: nil, videoId: "v1"),
+            Song(id: "2", title: "Song 2", artists: [], album: nil, duration: 200, thumbnailURL: nil, videoId: "v2"),
+            Song(id: "3", title: "Song 3", artists: [], album: nil, duration: 220, thumbnailURL: nil, videoId: "v3"),
+        ]
+        await self.playerService.playQueue(songs, startingAt: 0)
+        let endedOccurrence = self.playerService.currentMusicPlaybackOccurrence
+
+        await self.playerService.seek(to: 180)
+        #expect(!self.playerService.claimTerminalMusicPlaybackOccurrence(endedOccurrence))
+        await self.playerService.handleTrackEnded(
+            observedVideoId: "v1",
+            playbackOccurrence: endedOccurrence
+        )
+
+        #expect(self.playerService.currentIndex == 1)
+        #expect(self.playerService.currentTrack?.videoId == "v2")
     }
 
     @Test("Stale track-ended events do not double-advance the queue")

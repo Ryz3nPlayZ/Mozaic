@@ -1,5 +1,7 @@
+// swiftlint:disable file_length
 import Foundation
 import os
+import YouTubeAskCore
 
 // MARK: - YouTubeClient
 
@@ -15,10 +17,14 @@ import os
 /// Unlike the music client, no API key is attached: the `key=` query
 /// parameter is no longer required by InnerTube (confirmed June 2026).
 @MainActor
-final class YouTubeClient: YouTubeClientProtocol {
+final class YouTubeClient: YouTubeClientProtocol { // swiftlint:disable:this type_body_length
     private let authService: AuthService
     private let webKitManager: WebKitManager
     private let session: URLSession
+    private let cache: APICache
+    let askTransport: YouTubeAskTransport
+    let askMessageIDGenerator: YouTubeAskMessageIDGenerator
+    private let askRequestProfile: YouTubeAskRequestProfile?
     private let logger = DiagnosticsLogger.api
 
     /// Provider for the current brand account ID (mirrors `YTMusicClient`).
@@ -31,6 +37,10 @@ final class YouTubeClient: YouTubeClientProtocol {
     /// account responses across sign-in/account changes.
     var accountCacheIdentityProvider: (() -> String?)?
 
+    /// Provider for a verified primary-account scope eligible for Ask Gemini.
+    /// `nil` covers signed-out, guest, unresolved, and brand-account states.
+    var askAccountBindingProvider: (() -> YouTubeAskAccountBinding?)?
+
     /// YouTube API base URL.
     private static let baseURL = "https://www.youtube.com/youtubei/v1"
 
@@ -39,48 +49,66 @@ final class YouTubeClient: YouTubeClientProtocol {
 
     /// Client version for WEB (live value observed June 2026; InnerTube
     /// accepts moderately stale versions).
-    private static let clientVersion = "2.20260611.01.00"
+    private static let clientVersion = YouTubeAskRequestProfile.productionClientVersion
 
     /// Cache-key prefix so YouTube entries never collide with music
     /// invalidation patterns ("browse:", "next:", …).
     private static let cachePrefix = "yt:"
 
     private var homeContinuation: String?
+    /// Advances whenever a new initial Home request starts, invalidating any
+    /// older initial-page or continuation cursor publication.
+    private var homePaginationEpoch: UInt64 = 0
     private var searchContinuation: String?
+    private var askSessionGeneration: UInt64 = 0
+    private var consumedAskBootstraps: Set<UUID> = []
+    private var consumedAskRevisions: Set<AskRevisionKey> = []
 
     var hasMoreHomeFeed: Bool {
         self.homeContinuation != nil
     }
 
+    func resetSessionStateForAccountSwitch() {
+        self.homePaginationEpoch &+= 1
+        self.homeContinuation = nil
+        self.searchContinuation = nil
+        self.askSessionGeneration &+= 1
+        self.consumedAskBootstraps = []
+        self.consumedAskRevisions = []
+    }
+
     init(
         authService: AuthService,
         webKitManager: WebKitManager = .shared,
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        askMessageIDGenerator: YouTubeAskMessageIDGenerator? = nil,
+        askFeatureEnabled: Bool = false,
+        cache: APICache = .shared
     ) {
         self.authService = authService
         self.webKitManager = webKitManager
 
-        if let session {
-            self.session = session
+        let resolvedSession: URLSession = if let session {
+            session
         } else {
-            let configuration = URLSessionConfiguration.default
-            configuration.httpAdditionalHeaders = [
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-                "Accept-Encoding": "gzip, deflate, br",
-            ]
-            configuration.httpMaximumConnectionsPerHost = 6
-            configuration.urlCache = URLCache.shared
-            configuration.requestCachePolicy = .useProtocolCachePolicy
-            configuration.timeoutIntervalForRequest = 15
-            configuration.timeoutIntervalForResource = 30
-            self.session = URLSession(configuration: configuration)
+            URLSession(configuration: APISessionConfiguration.make())
         }
+        self.session = resolvedSession
+        self.cache = cache
+        self.askTransport = YouTubeAskTransport(configuration: resolvedSession.configuration)
+        self.askMessageIDGenerator = askMessageIDGenerator ?? YouTubeAskMessageIDGenerator()
+        // Ask remains an explicit construction-time capability. The production
+        // app selects the fixed WEB profile; isolated clients and tests default off.
+        self.askRequestProfile = askFeatureEnabled ? .fixedProduction : nil
     }
 
     // MARK: - Home Feed
 
     func getHomeFeed() async throws -> YouTubeFeed {
         self.logger.info("Fetching YouTube home feed")
+        self.homePaginationEpoch &+= 1
+        let paginationEpoch = self.homePaginationEpoch
+        self.homeContinuation = nil
 
         let data = try await self.request(
             "browse",
@@ -88,20 +116,27 @@ final class YouTubeClient: YouTubeClientProtocol {
             ttl: APICache.TTL.home
         )
         let feed = YouTubeFeedParser.parse(data)
-        self.homeContinuation = feed.continuation
+        if paginationEpoch == self.homePaginationEpoch {
+            self.homeContinuation = feed.continuation
+        }
         self.logger.info("YouTube home feed loaded: \(feed.videos.count) videos, hasMore: \(feed.continuation != nil)")
         return feed
     }
 
-    func getHomeBundle() async throws -> YouTubeHomeBundle {
+    func getHomeBundle(forceRefresh: Bool) async throws -> YouTubeHomeBundle {
         self.logger.info("Fetching YouTube home bundle (feed + chips + shelves)")
+        self.homePaginationEpoch &+= 1
+        let paginationEpoch = self.homePaginationEpoch
+        self.homeContinuation = nil
 
-        let bundle = try await self.homeBundle()
+        let bundle = try await self.homeBundle(forceRefresh: forceRefresh)
         // The detached parse is not cancelled when the Home view model is
         // discarded (account switch). Don't mutate shared client state after
         // cancellation — the providers may already have moved to the new account.
         try Task.checkCancellation()
-        self.homeContinuation = bundle.feed.continuation
+        if paginationEpoch == self.homePaginationEpoch {
+            self.homeContinuation = bundle.feed.continuation
+        }
         self.logger.info(
             "YouTube home bundle: \(bundle.feed.videos.count) videos, \(bundle.chips.count) chips, \(bundle.shelves.count) shelves"
         )
@@ -114,31 +149,55 @@ final class YouTubeClient: YouTubeClientProtocol {
     /// raw bytes are cached only after a successful parse, with no main-actor
     /// deserialize and no redundant second parse. Home and Shorts share this so
     /// the response and its cache entry are reused.
-    private func homeBundle() async throws -> YouTubeHomeBundle {
+    private func homeBundle(forceRefresh: Bool) async throws -> YouTubeHomeBundle {
         let homeBody: [String: Any] = ["browseId": "FEwhat_to_watch"]
-        // Capture the cache key (current authenticated scope) and the cache
-        // generation BEFORE any network await. A sign-out mid-flight keeps the
-        // `pending` key unchanged, so the generation (bumped by invalidateAll)
-        // is what rejects a stale write.
-        let cacheKey = self.homeDataCacheKey(body: homeBody)
-        let cacheGeneration = APICache.shared.generation
+        // Capture cache generation and logical request order before auth awaits.
+        // The scoped key is resolved afterward from the actual auth result.
+        let cacheGeneration = self.cache.generation
+        let cacheWriteTicket = self.cache.prepareWrite(cacheGeneration: cacheGeneration)
+        defer {
+            if let cacheWriteTicket {
+                self.cache.finishWrite(cacheWriteTicket)
+            }
+        }
+        let homeAuth = try await self.buildRequestHeaders(authPolicy: .optional)
+        let cacheKey = self.homeDataCacheKey(body: homeBody, authenticated: homeAuth.authenticated)
 
-        if let cacheKey, let cached = try await self.cachedHomeData(key: cacheKey) {
-            return try await Self.parseHomeBundle(from: cached)
+        if !forceRefresh, let cacheKey, let cached = self.cachedHomeData(key: cacheKey) {
+            let bundle = try await Self.parseHomeBundle(from: cached)
+            try self.validateAuthIdentity(
+                authenticated: homeAuth.authenticated,
+                generation: homeAuth.authIdentityGeneration
+            )
+            return bundle
         }
 
-        let data = try await self.requestData("browse", body: homeBody)
+        let cacheWrite = cacheKey.flatMap { key in
+            cacheWriteTicket.flatMap { self.cache.beginWrite(for: key, ticket: $0) }
+        }
+
+        let data = try await self.requestData("browse", body: homeBody, requestAuth: homeAuth)
         // Parse off-main; this throws on a non-JSON 200, so we never cache bytes
         // that don't parse.
         let bundle = try await Self.parseHomeBundle(from: data)
+        try self.validateAuthIdentity(
+            authenticated: homeAuth.authenticated,
+            generation: homeAuth.authIdentityGeneration
+        )
+        try Task.checkCancellation()
 
         // Cache only if no account switch / sign-out happened during the fetch
         // (key AND generation unchanged).
         if let cacheKey,
-           cacheKey == self.homeDataCacheKey(body: homeBody),
-           cacheGeneration == APICache.shared.generation
+           cacheKey == self.homeDataCacheKey(body: homeBody, authenticated: homeAuth.authenticated),
+           let cacheWrite
         {
-            APICache.shared.setData(key: cacheKey, data: data, ttl: APICache.TTL.home)
+            self.cache.setDataIfCurrent(
+                key: cacheKey,
+                data: data,
+                ttl: APICache.TTL.home,
+                reservation: cacheWrite
+            )
         }
         return bundle
     }
@@ -155,9 +214,14 @@ final class YouTubeClient: YouTubeClientProtocol {
         guard let continuation = self.homeContinuation else {
             return nil
         }
+        let paginationEpoch = self.homePaginationEpoch
 
         let data = try await self.request("browse", body: ["continuation": continuation])
         let feed = YouTubeFeedParser.parseContinuation(data)
+        guard paginationEpoch == self.homePaginationEpoch else {
+            self.logger.info("Discarding stale YouTube home continuation after feed reload")
+            return nil
+        }
         self.homeContinuation = feed.continuation
         self.logger.info("YouTube home continuation: \(feed.videos.count) videos")
         return feed
@@ -188,7 +252,7 @@ final class YouTubeClient: YouTubeClientProtocol {
         return shelves
     }
 
-    func getHomeTopicFeed(continuation: String) async throws -> YouTubeFeed {
+    func getHomeTopicFeed(continuation: String, forceRefresh: Bool) async throws -> YouTubeFeed {
         // A chip browse uses the same `browse` continuation wire shape as
         // pagination, but returns a fresh topic-filtered grid (reload
         // semantics) with its own trailing continuation token. Cached (keyed on
@@ -198,7 +262,8 @@ final class YouTubeClient: YouTubeClientProtocol {
         let data = try await self.request(
             "browse",
             body: ["continuation": continuation],
-            ttl: APICache.TTL.home
+            ttl: APICache.TTL.home,
+            bypassCache: forceRefresh
         )
         return YouTubeFeedParser.parseContinuation(data)
     }
@@ -228,10 +293,16 @@ final class YouTubeClient: YouTubeClientProtocol {
             return nil
         }
 
-        let data = try await self.request("search", body: ["continuation": continuation])
-        let response = YouTubeSearchParser.parseContinuation(data)
-        self.searchContinuation = response.continuation
+        let response = try await self.getSearchContinuation(continuation: continuation)
+        if self.searchContinuation == continuation {
+            self.searchContinuation = response?.continuation
+        }
         return response
+    }
+
+    func getSearchContinuation(continuation: String) async throws -> YouTubeSearchResponse? {
+        let data = try await self.request("search", body: ["continuation": continuation])
+        return YouTubeSearchParser.parseContinuation(data)
     }
 
     // MARK: - Watch
@@ -241,6 +312,62 @@ final class YouTubeClient: YouTubeClientProtocol {
 
         let data = try await self.request("next", body: ["videoId": videoId])
         return WatchNextParser.parse(data)
+    }
+
+    func getWatchPage(videoId: String) async throws -> YouTubeWatchPage {
+        self.logger.info("Fetching YouTube watch page")
+
+        let accountBinding = self.currentAskAccountBinding()
+        let askGeneration = self.askSessionGeneration
+        let requestAuth = try await self.buildRequestHeaders(authPolicy: .optional)
+        let data = try await self.requestData(
+            "next",
+            body: ["videoId": videoId],
+            requestAuth: requestAuth
+        )
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw YTMusicError.parseError(message: "Watch response is not a JSON object")
+        }
+
+        let watchData = WatchNextParser.parse(json)
+        guard requestAuth.authenticated,
+              let authenticationGeneration = requestAuth.authIdentityGeneration,
+              let accountBinding,
+              askGeneration == self.askSessionGeneration,
+              accountBinding == self.currentAskAccountBinding()
+        else {
+            return YouTubeWatchPage(data: watchData, askBootstrap: nil)
+        }
+
+        let parsedBootstrap: YouTubeAskParsedBootstrap?
+        do {
+            parsedBootstrap = try await Task.detached(priority: .userInitiated) {
+                let envelope = try YouTubeAskWireDecoder.decode(data)
+                return try YouTubeAskParser.parseBootstrap(from: envelope)
+            }.value
+            try self.validateAskIdentity(
+                authenticationGeneration: authenticationGeneration,
+                accountBinding: accountBinding,
+                clientGeneration: askGeneration
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            self.logger.warning("Ask bootstrap rejected by strict parser")
+            return YouTubeWatchPage(data: watchData, askBootstrap: nil)
+        }
+
+        guard let parsedBootstrap else {
+            return YouTubeWatchPage(data: watchData, askBootstrap: nil)
+        }
+        let bootstrap = YouTubeAskBootstrap.production(
+            videoID: videoId,
+            parsed: parsedBootstrap,
+            authenticationGeneration: authenticationGeneration,
+            accountBinding: accountBinding,
+            clientGeneration: askGeneration
+        )
+        return YouTubeWatchPage(data: watchData, askBootstrap: bootstrap)
     }
 
     func getComments(continuation: String) async throws -> YouTubeCommentsPage {
@@ -312,14 +439,51 @@ final class YouTubeClient: YouTubeClientProtocol {
         return YouTubeFeedParser.parseContinuation(data)
     }
 
+    func getPrivateFeedContinuation(continuation: String) async throws -> YouTubeFeed {
+        let data = try await self.request("browse", body: ["continuation": continuation], authPolicy: .required)
+        return YouTubeFeedParser.parseContinuation(data)
+    }
+
     func getShorts() async throws -> [YouTubeVideo] {
         self.logger.info("Fetching YouTube Shorts")
 
-        // Shorts ride along in the home `FEwhat_to_watch` response. Share the
-        // same loader as getHomeBundle so loading one warms the other (no second
-        // 2 MB fetch/parse when navigating Home <-> Shorts).
-        let bundle = try await self.homeBundle()
-        return bundle.feed.shorts
+        let bundle = try await self.homeBundle(forceRefresh: false)
+        if !bundle.feed.shorts.isEmpty {
+            return bundle.feed.shorts
+        }
+
+        let destinationShorts = await self.publicDestinationShorts()
+        if !destinationShorts.isEmpty {
+            return destinationShorts
+        }
+
+        return try await self.searchShortsFallback()
+    }
+
+    private func publicDestinationShorts() async -> [YouTubeVideo] {
+        var collected: [YouTubeVideo] = []
+        var seen = Set<String>()
+        for destination in [YouTubeDestination.news, .sports, .gaming, .learning, .live] {
+            do {
+                let feed = try await self.getDestinationFeed(destination)
+                for short in feed.shorts where seen.insert(short.videoId).inserted {
+                    collected.append(short)
+                }
+                if collected.count >= 30 {
+                    break
+                }
+            } catch {
+                self.logger.debug("Shorts fallback destination failed: \(destination.rawValue, privacy: .public) — \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        return Array(collected.prefix(30))
+    }
+
+    private func searchShortsFallback() async throws -> [YouTubeVideo] {
+        let data = try await self.request("search", body: ["query": "#shorts"], ttl: APICache.TTL.search)
+        let feed = YouTubeFeedParser.parse(data)
+        var seen = Set<String>()
+        return feed.shorts.filter { seen.insert($0.videoId).inserted }
     }
 
     // MARK: - Subscriptions & Library
@@ -372,7 +536,7 @@ final class YouTubeClient: YouTubeClientProtocol {
 
         let body: [String: Any] = ["target": ["videoId": videoId]]
         _ = try await self.request(rating.endpoint, body: body, retry: false)
-        APICache.shared.invalidate(matching: Self.cachePrefix)
+        self.cache.invalidate(matching: Self.cachePrefix)
     }
 
     func setSubscribed(_ subscribed: Bool, channelId: String) async throws {
@@ -381,7 +545,7 @@ final class YouTubeClient: YouTubeClientProtocol {
         let endpoint = subscribed ? "subscription/subscribe" : "subscription/unsubscribe"
         let body: [String: Any] = ["channelIds": [channelId]]
         _ = try await self.request(endpoint, body: body, retry: false)
-        APICache.shared.invalidate(matching: Self.cachePrefix)
+        self.cache.invalidate(matching: Self.cachePrefix)
     }
 
     func addToWatchLater(videoId: String) async throws {
@@ -404,19 +568,117 @@ final class YouTubeClient: YouTubeClientProtocol {
             "actions": actions,
         ]
         _ = try await self.request("browse/edit_playlist", body: body, retry: false)
-        APICache.shared.invalidate(matching: Self.cachePrefix)
+        self.cache.invalidate(matching: Self.cachePrefix)
     }
 
     // MARK: - Request Core
 
+    private enum RequestAuthPolicy {
+        case optional
+        case required
+    }
+
+    private struct RequestAuthHeaders {
+        let headers: [String: String]
+        let authenticated: Bool
+        let authIdentityGeneration: UInt64?
+    }
+
+    private func authPolicy(forEndpoint endpoint: String, body: [String: Any]) -> RequestAuthPolicy {
+        if Self.authRequiredActionEndpoints.contains(endpoint) {
+            return .required
+        }
+
+        if endpoint == "guide" {
+            return .required
+        }
+
+        if endpoint == "browse", let browseId = body["browseId"] as? String {
+            if Self.authRequiredBrowseIds.contains(browseId)
+                || browseId == "VLWL"
+                || browseId == "VLLL"
+            {
+                return .required
+            }
+        }
+
+        return .optional
+    }
+
+    private func buildRequestHeaders(authPolicy: RequestAuthPolicy) async throws -> RequestAuthHeaders {
+        if self.authService.hasPersonalAccount {
+            let authIdentityGeneration = self.authService.accountIdentityGeneration
+            do {
+                let headers = try await self.buildAuthHeaders()
+                guard authIdentityGeneration == self.authService.accountIdentityGeneration,
+                      self.authService.hasPersonalAccount
+                else {
+                    throw CancellationError()
+                }
+                return RequestAuthHeaders(
+                    headers: headers,
+                    authenticated: true,
+                    authIdentityGeneration: authIdentityGeneration
+                )
+            } catch {
+                if error is CancellationError {
+                    throw error
+                }
+                try self.validateAuthIdentity(
+                    authenticated: true,
+                    generation: authIdentityGeneration
+                )
+                self.authService.sessionExpired(ifIdentityGenerationMatches: authIdentityGeneration)
+                throw YTMusicError.authExpired
+            }
+        } else if authPolicy == .required {
+            throw YTMusicError.notAuthenticated
+        }
+
+        return RequestAuthHeaders(
+            headers: Self.unauthenticatedHeaders,
+            authenticated: false,
+            authIdentityGeneration: nil
+        )
+    }
+
+    private static let unauthenticatedHeaders: [String: String] = [
+        "Origin": origin,
+        "Referer": origin,
+        "Content-Type": "application/json",
+    ]
+
+    private static let authRequiredBrowseIds: Set<String> = [
+        "FEsubscriptions",
+        "FElibrary",
+        "FEhistory",
+        "FEplaylist_aggregation",
+    ]
+
+    private static let authRequiredActionEndpoints: Set<String> = [
+        "like/like",
+        "like/dislike",
+        "like/removelike",
+        "subscription/subscribe",
+        "subscription/unsubscribe",
+        "browse/edit_playlist",
+        "comment/create_comment",
+        "comment/perform_comment_action",
+    ]
+
     /// Builds authentication headers with the YouTube (not music) origin.
     private func buildAuthHeaders() async throws -> [String: String] {
-        guard let cookieHeader = await webKitManager.cookieHeader(for: "youtube.com") else {
+        // Snapshot cookies once per request; deriving the cookie header and SAPISID from
+        // the same snapshot avoids repeated WebKit cookie-store enumerations during API fanout.
+        let authMaterial = await webKitManager.authMaterial(for: "youtube.com")
+        self.logger.debug("Building YouTube auth headers - total cookies: \(authMaterial.totalCookieCount), youtube.com cookies: \(authMaterial.domainCookieCount)")
+
+        guard let cookieHeader = authMaterial.cookieHeader else {
             self.logger.error("No cookies found for youtube.com domain")
             throw YTMusicError.notAuthenticated
         }
 
-        guard let sapisid = await webKitManager.getSAPISID() else {
+        guard let sapisid = authMaterial.sapisid else {
             self.logger.error("SAPISID cookie not found or expired")
             throw YTMusicError.authExpired
         }
@@ -443,12 +705,12 @@ final class YouTubeClient: YouTubeClientProtocol {
     }
 
     /// Builds the standard `WEB` client context payload.
-    private func buildContext() -> [String: Any] {
+    private func buildContext(authenticated: Bool) -> [String: Any] {
         var userDict: [String: Any] = [
             "lockedSafetyMode": false,
         ]
 
-        if let brandId = self.brandIdProvider?() {
+        if authenticated, let brandId = self.brandIdProvider?() {
             userDict["onBehalfOfUser"] = brandId
         }
 
@@ -464,60 +726,83 @@ final class YouTubeClient: YouTubeClientProtocol {
                 "osVersion": "10_15_7",
                 "platform": "DESKTOP",
                 "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-                "utcOffsetMinutes": TimeZone.current.secondsFromGMT() / 60,
+                "utcOffsetMinutes": InnerTubeSupport.utcOffsetMinutes(for: .current),
             ],
             "user": userDict,
         ]
     }
 
-    /// Makes an authenticated request with optional caching and retry.
+    /// Makes a request with optional authentication, caching, and retry.
     private func request(
         _ endpoint: String,
         body: [String: Any],
         ttl: TimeInterval? = nil,
         retry: Bool = true,
-        bypassCache: Bool = false
+        bypassCache: Bool = false,
+        authPolicy explicitAuthPolicy: RequestAuthPolicy? = nil
     ) async throws -> [String: Any] {
-        var fullBody = body
-        fullBody["context"] = self.buildContext()
-
-        let cacheKey = self.cacheKey(forEndpoint: Self.cachePrefix + endpoint, body: fullBody, ttl: ttl)
-        // Captured before the network await so a sign-out / account switch during
-        // the request rejects a stale write (e.g. an in-flight getHistory or
-        // topic-rail call whose `pending` scope key is unchanged across a nil->nil
-        // sign-out). `invalidateAll()` bumps the generation.
-        let cacheGeneration = APICache.shared.generation
-
-        // Validate the current auth session before serving any cached
-        // personalized YouTube response: if the cookies/SAPISID were cleared or
-        // the session expired while a cache entry is still warm, we must not keep
-        // rendering private cached data — fall through to reauth instead.
-        if let cacheKey {
-            _ = try await self.buildAuthHeaders()
-            // `bypassCache` forces a fresh network read even on a warm entry —
-            // used when refreshing watch history right after a video was watched,
-            // where the 2 min TTL entry would otherwise re-serve the pre-watch
-            // resume percent. The fresh response is still written below, so
-            // subsequent reads stay warm.
-            if !bypassCache, let cached = APICache.shared.get(key: cacheKey) {
-                self.logger.debug("Cache hit for \(Self.cachePrefix)\(endpoint)")
-                return cached
+        // Capture generation and logical request order before auth-header awaits
+        // so invalidations and later requests still reject stale writes.
+        let cacheGeneration = self.cache.generation
+        let cacheWriteTicket = ttl.flatMap { _ in
+            self.cache.prepareWrite(cacheGeneration: cacheGeneration)
+        }
+        defer {
+            if let cacheWriteTicket {
+                self.cache.finishWrite(cacheWriteTicket)
             }
+        }
+        let authPolicy = explicitAuthPolicy ?? self.authPolicy(forEndpoint: endpoint, body: body)
+        let requestAuth = try await self.buildRequestHeaders(authPolicy: authPolicy)
+
+        var fullBody = body
+        fullBody["context"] = self.buildContext(authenticated: requestAuth.authenticated)
+
+        let cacheKey = self.cacheKey(
+            forEndpoint: Self.cachePrefix + endpoint,
+            body: fullBody,
+            ttl: ttl,
+            authenticated: requestAuth.authenticated
+        )
+        if let cacheKey, !bypassCache, let cached = self.cache.get(key: cacheKey) {
+            self.logger.debug("Cache hit for \(Self.cachePrefix)\(endpoint)")
+            return cached
+        }
+
+        let cacheWrite = cacheKey.flatMap { key in
+            cacheWriteTicket.flatMap { self.cache.beginWrite(for: key, ticket: $0) }
         }
 
         let json: [String: Any] = if retry {
             try await RetryPolicy.default.execute { [self] in
-                try await self.performRequest(endpoint, fullBody: fullBody)
+                try await self.performRequest(
+                    endpoint,
+                    fullBody: fullBody,
+                    headers: requestAuth.headers,
+                    authenticated: requestAuth.authenticated,
+                    authIdentityGeneration: requestAuth.authIdentityGeneration
+                )
             }
         } else {
-            try await self.performRequest(endpoint, fullBody: fullBody)
+            try await self.performRequest(
+                endpoint,
+                fullBody: fullBody,
+                headers: requestAuth.headers,
+                authenticated: requestAuth.authenticated,
+                authIdentityGeneration: requestAuth.authIdentityGeneration
+            )
         }
 
         // Only cache if no account switch / sign-out happened during the request
         // (the cache generation is unchanged); otherwise this could write the
         // previous account's private data under a still-`pending` scope.
-        if let ttl, let cacheKey, cacheGeneration == APICache.shared.generation {
-            APICache.shared.set(key: cacheKey, data: json, ttl: ttl)
+        if let ttl, let cacheKey, let cacheWrite {
+            self.cache.setIfCurrent(
+                key: cacheKey,
+                data: json,
+                ttl: ttl,
+                reservation: cacheWrite
+            )
         }
 
         return json
@@ -539,11 +824,21 @@ final class YouTubeClient: YouTubeClientProtocol {
     /// pending entries are cleared the moment a real identity lands.
     private static let pendingAccountScope = "pending"
 
-    /// Derives the cache key for an endpoint+body, scoping to the resolved
-    /// account identity when available and to `pendingAccountScope` otherwise.
+    /// Derives the cache key for an endpoint+body. Authenticated entries are
+    /// scoped to the resolved account identity (or `pendingAccountScope` during
+    /// cold launch); signed-out entries use a distinct guest scope.
     /// Returns `nil` only when the call is not cacheable (`ttl == nil`).
-    private func cacheKey(forEndpoint endpoint: String, body: [String: Any], ttl: TimeInterval?) -> String? {
+    private func cacheKey(
+        forEndpoint endpoint: String,
+        body: [String: Any],
+        ttl: TimeInterval?,
+        authenticated: Bool
+    ) -> String? {
         guard ttl != nil else { return nil }
+        if !authenticated {
+            return APICache.stableCacheKey(endpoint: endpoint, body: body, brandId: "guest")
+        }
+
         let brandId = self.brandIdProvider?() ?? ""
         let scopeIdentity = self.accountCacheIdentityProvider?().flatMap { $0.isEmpty ? nil : $0 }
             ?? Self.pendingAccountScope
@@ -562,33 +857,60 @@ final class YouTubeClient: YouTubeClientProtocol {
     private func requestData(
         _ endpoint: String,
         body: [String: Any],
-        retry: Bool = true
+        retry: Bool = true,
+        requestAuth precomputedAuth: RequestAuthHeaders? = nil
     ) async throws -> Data {
+        let requestAuth: RequestAuthHeaders
+        if let precomputedAuth {
+            requestAuth = precomputedAuth
+        } else {
+            let authPolicy = self.authPolicy(forEndpoint: endpoint, body: body)
+            requestAuth = try await self.buildRequestHeaders(authPolicy: authPolicy)
+        }
+
         var fullBody = body
-        fullBody["context"] = self.buildContext()
+        fullBody["context"] = self.buildContext(authenticated: requestAuth.authenticated)
 
         if retry {
             return try await RetryPolicy.default.execute { [self] in
-                try await self.performRequestData(endpoint, fullBody: fullBody)
+                try await self.performRequestData(
+                    endpoint,
+                    fullBody: fullBody,
+                    headers: requestAuth.headers,
+                    authenticated: requestAuth.authenticated,
+                    authIdentityGeneration: requestAuth.authIdentityGeneration
+                )
             }
         }
-        return try await self.performRequestData(endpoint, fullBody: fullBody)
+        return try await self.performRequestData(
+            endpoint,
+            fullBody: fullBody,
+            headers: requestAuth.headers,
+            authenticated: requestAuth.authenticated,
+            authIdentityGeneration: requestAuth.authIdentityGeneration
+        )
     }
 
     /// Cache key for the raw home-bundle bytes.
-    private func homeDataCacheKey(body: [String: Any]) -> String? {
+    private func homeDataCacheKey(body: [String: Any], authenticated: Bool) -> String? {
         var fullBody = body
-        fullBody["context"] = self.buildContext()
-        return self.cacheKey(forEndpoint: Self.cachePrefix + "data:browse", body: fullBody, ttl: APICache.TTL.home)
+        fullBody["context"] = self.buildContext(authenticated: authenticated)
+        return self.cacheKey(
+            forEndpoint: Self.cachePrefix + "data:browse",
+            body: fullBody,
+            ttl: APICache.TTL.home,
+            authenticated: authenticated
+        )
     }
 
-    /// Returns cached raw home bytes for `key` if present, after validating the
-    /// auth session (a cleared/expired session must not serve private cached
-    /// data). `key` is captured by the caller before any network await so it
-    /// reflects the authenticated request scope, not a later signed-out one.
-    private func cachedHomeData(key: String) async throws -> Data? {
-        _ = try await self.buildAuthHeaders()
-        if let cached = APICache.shared.getData(key: key) {
+    /// Returns cached raw home bytes for an already-scoped `key`.
+    ///
+    /// The caller resolves optional auth before constructing this key, so guest
+    /// and authenticated Home responses live in separate cache scopes. The key
+    /// is captured before network awaits so stale account/sign-out completions
+    /// cannot write through a later scope.
+    private func cachedHomeData(key: String) -> Data? {
+        if let cached = self.cache.getData(key: key) {
             self.logger.debug("Cache hit (data) for \(Self.cachePrefix)browse")
             return cached
         }
@@ -598,8 +920,15 @@ final class YouTubeClient: YouTubeClientProtocol {
     /// Performs the actual network request.
     private func performRequest(
         _ endpoint: String,
-        fullBody: [String: Any]
+        fullBody: [String: Any],
+        headers: [String: String],
+        authenticated: Bool,
+        authIdentityGeneration: UInt64?
     ) async throws -> [String: Any] {
+        try self.validateAuthIdentity(
+            authenticated: authenticated,
+            generation: authIdentityGeneration
+        )
         var components = URLComponents(string: "\(Self.baseURL)/\(endpoint)")
         components?.queryItems = [
             URLQueryItem(name: "prettyPrint", value: "false"),
@@ -610,8 +939,8 @@ final class YouTubeClient: YouTubeClientProtocol {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.httpShouldHandleCookies = authenticated
 
-        let headers = try await self.buildAuthHeaders()
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
@@ -621,6 +950,10 @@ final class YouTubeClient: YouTubeClientProtocol {
         self.logger.debug("Making YouTube request to \(endpoint)")
 
         let result = try await Self.performNetworkRequest(request: request, session: self.session)
+        try self.validateAuthIdentity(
+            authenticated: authenticated,
+            generation: authIdentityGeneration
+        )
 
         switch result {
         case let .success(data):
@@ -630,8 +963,13 @@ final class YouTubeClient: YouTubeClientProtocol {
             return json
         case let .authError(statusCode):
             self.logger.error("YouTube auth error: HTTP \(statusCode)")
-            self.authService.sessionExpired()
-            throw YTMusicError.authExpired
+            if authenticated {
+                if let authIdentityGeneration {
+                    self.authService.sessionExpired(ifIdentityGenerationMatches: authIdentityGeneration)
+                }
+                throw YTMusicError.authExpired
+            }
+            throw YTMusicError.notAuthenticated
         case let .httpError(statusCode):
             self.logger.error("YouTube API error: HTTP \(statusCode)")
             throw YTMusicError.apiError(message: "HTTP \(statusCode)", code: statusCode)
@@ -644,8 +982,15 @@ final class YouTubeClient: YouTubeClientProtocol {
     /// deserialize) so the caller can parse off the main actor.
     private func performRequestData(
         _ endpoint: String,
-        fullBody: [String: Any]
+        fullBody: [String: Any],
+        headers: [String: String],
+        authenticated: Bool,
+        authIdentityGeneration: UInt64?
     ) async throws -> Data {
+        try self.validateAuthIdentity(
+            authenticated: authenticated,
+            generation: authIdentityGeneration
+        )
         var components = URLComponents(string: "\(Self.baseURL)/\(endpoint)")
         components?.queryItems = [
             URLQueryItem(name: "prettyPrint", value: "false"),
@@ -656,8 +1001,8 @@ final class YouTubeClient: YouTubeClientProtocol {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.httpShouldHandleCookies = authenticated
 
-        let headers = try await self.buildAuthHeaders()
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
@@ -667,19 +1012,194 @@ final class YouTubeClient: YouTubeClientProtocol {
         self.logger.debug("Making YouTube request (data) to \(endpoint)")
 
         let result = try await Self.performNetworkRequest(request: request, session: self.session)
+        try self.validateAuthIdentity(
+            authenticated: authenticated,
+            generation: authIdentityGeneration
+        )
 
         switch result {
         case let .success(data):
             return data
         case let .authError(statusCode):
             self.logger.error("YouTube auth error: HTTP \(statusCode)")
-            self.authService.sessionExpired()
-            throw YTMusicError.authExpired
+            if authenticated {
+                if let authIdentityGeneration {
+                    self.authService.sessionExpired(ifIdentityGenerationMatches: authIdentityGeneration)
+                }
+                throw YTMusicError.authExpired
+            }
+            throw YTMusicError.notAuthenticated
         case let .httpError(statusCode):
             self.logger.error("YouTube API error: HTTP \(statusCode)")
             throw YTMusicError.apiError(message: "HTTP \(statusCode)", code: statusCode)
         case let .networkError(error):
             throw YTMusicError.networkError(underlying: error)
+        }
+    }
+
+    // MARK: - Ask Request Identity
+
+    private struct AskRevisionKey: Hashable {
+        let conversationID: UUID
+        let revision: UInt64
+    }
+
+    struct AskRequestSnapshot: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+        let videoID: String
+        let authenticationGeneration: UInt64
+        let accountBinding: YouTubeAskAccountBinding
+        let clientGeneration: UInt64
+        let headers: [String: String]
+        let context: [String: Any]
+
+        var description: String {
+            "<redacted YouTube Ask request snapshot>"
+        }
+
+        var debugDescription: String {
+            self.description
+        }
+
+        var customMirror: Mirror {
+            Mirror(reflecting: self.description)
+        }
+    }
+
+    func makeAskRequestSnapshot(videoID: String) async throws -> AskRequestSnapshot {
+        guard self.authService.hasPersonalAccount,
+              let accountBinding = self.currentAskAccountBinding()
+        else {
+            throw YouTubeAskClientError.authenticationRequired
+        }
+        let requestAuth: RequestAuthHeaders
+        do {
+            requestAuth = try await self.buildRequestHeaders(authPolicy: .required)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw YouTubeAskClientError.authenticationRequired
+        }
+        guard requestAuth.authenticated,
+              let authenticationGeneration = requestAuth.authIdentityGeneration
+        else {
+            throw YouTubeAskClientError.authenticationRequired
+        }
+        let snapshot = AskRequestSnapshot(
+            videoID: videoID,
+            authenticationGeneration: authenticationGeneration,
+            accountBinding: accountBinding,
+            clientGeneration: self.askSessionGeneration,
+            headers: requestAuth.headers,
+            context: self.buildContext(authenticated: true)
+        )
+        try self.validateAskRequestSnapshot(snapshot)
+        return snapshot
+    }
+
+    func validateAskRequestSnapshot(_ snapshot: AskRequestSnapshot) throws {
+        try self.validateAskIdentity(
+            authenticationGeneration: snapshot.authenticationGeneration,
+            accountBinding: snapshot.accountBinding,
+            clientGeneration: snapshot.clientGeneration
+        )
+    }
+
+    func validateAskIdentity(
+        authenticationGeneration: UInt64,
+        accountBinding: YouTubeAskAccountBinding,
+        clientGeneration: UInt64
+    ) throws {
+        guard self.authService.hasPersonalAccount,
+              authenticationGeneration == self.authService.accountIdentityGeneration,
+              clientGeneration == self.askSessionGeneration,
+              accountBinding == self.currentAskAccountBinding()
+        else {
+            throw CancellationError()
+        }
+    }
+
+    func makeAskRequest(
+        endpoint: String,
+        bodyData: Data,
+        snapshot: AskRequestSnapshot,
+        clickTrackingContextData: Data? = nil
+    ) throws -> URLRequest {
+        guard endpoint == "get_panel",
+              var body = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
+        else {
+            throw YouTubeAskClientError.invalidResponse
+        }
+        var context = snapshot.context
+        if let clickTrackingContextData {
+            guard let clickTrackingContext = try JSONSerialization.jsonObject(
+                with: clickTrackingContextData
+            ) as? [String: Any],
+                let clickTracking = clickTrackingContext["clickTracking"] as? [String: Any]
+            else {
+                throw YouTubeAskClientError.invalidResponse
+            }
+            context["clickTracking"] = clickTracking
+        }
+        body["context"] = context
+
+        var components = URLComponents(string: "\(Self.baseURL)/\(endpoint)")
+        components?.queryItems = [
+            URLQueryItem(name: "prettyPrint", value: "false"),
+        ]
+        guard let url = components?.url else {
+            throw YouTubeAskClientError.invalidResponse
+        }
+
+        var request = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 30
+        )
+        request.httpMethod = "POST"
+        request.httpShouldHandleCookies = false
+        for (key, value) in snapshot.headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return request
+    }
+
+    func consumeAskBootstrap(conversationID: UUID) -> Bool {
+        self.consumedAskBootstraps.insert(conversationID).inserted
+    }
+
+    func consumeAskRevision(
+        conversationID: UUID,
+        revision: UInt64
+    ) -> Bool {
+        self.consumedAskRevisions.insert(AskRevisionKey(
+            conversationID: conversationID,
+            revision: revision
+        )).inserted
+    }
+
+    func handleAskAuthenticationFailure(snapshot: AskRequestSnapshot) {
+        self.authService.sessionExpired(
+            ifIdentityGenerationMatches: snapshot.authenticationGeneration
+        )
+    }
+
+    func nextAskClientMessageID() -> String {
+        self.askMessageIDGenerator.next()
+    }
+
+    private func currentAskAccountBinding() -> YouTubeAskAccountBinding? {
+        guard self.askRequestProfile != nil, self.authService.hasPersonalAccount else { return nil }
+        return self.askAccountBindingProvider?()
+    }
+
+    private func validateAuthIdentity(authenticated: Bool, generation: UInt64?) throws {
+        guard authenticated else { return }
+        guard let generation,
+              generation == self.authService.accountIdentityGeneration,
+              self.authService.hasPersonalAccount
+        else {
+            throw CancellationError()
         }
     }
 

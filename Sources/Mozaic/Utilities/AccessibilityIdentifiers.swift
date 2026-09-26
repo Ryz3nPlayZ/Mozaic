@@ -1,10 +1,14 @@
 import Foundation
 
+// MARK: - AccessibilityID
+
 /// Centralized accessibility identifiers for UI testing.
 /// Using an enum namespace prevents typos and enables autocomplete.
 enum AccessibilityID {
     static func isAuxiliaryPlayerWindowIdentifier(_ identifier: String?) -> Bool {
-        identifier == VideoWindow.container || identifier == MiniPlayer.container
+        identifier == VideoWindow.container
+            || identifier == MiniPlayer.container
+            || identifier == YouTubeContent.videoWindow
     }
 
     // MARK: - Sidebar
@@ -26,7 +30,6 @@ enum AccessibilityID {
     // MARK: - PlayerBar
 
     enum PlayerBar {
-        static let container = "playerBar"
         static let playPauseButton = "playerBar.playPause"
         static let previousButton = "playerBar.previous"
         static let nextButton = "playerBar.next"
@@ -39,6 +42,8 @@ enum AccessibilityID {
         static let miniPlayerButton = "playerBar.miniPlayer"
         static let videoButton = "playerBar.video"
         static let airplayButton = "playerBar.airplayButton"
+        static let mixTracksButton = "playerBar.mixTracks"
+        static let adIndicator = "playerBar.adIndicator"
         static let volumeSlider = "playerBar.volumeSlider"
         static let trackTitle = "playerBar.trackTitle"
         static let trackArtist = "playerBar.trackArtist"
@@ -167,20 +172,12 @@ enum AccessibilityID {
         }
     }
 
-    // MARK: - OnboardingView
-
-    enum Onboarding {
-        static let container = "onboardingView"
-        static let signInButton = "onboardingView.signInButton"
-    }
-
     // MARK: - Main Window
 
     enum MainWindow {
         static let container = "mainWindow"
         static let initializingView = "mainWindow.initializing"
         static let aiButton = "mainWindow.aiButton"
-        static let commandBar = "mainWindow.commandBar"
         static let commandBarOverlay = "mainWindow.commandBarOverlay"
         static let commandBarInput = "mainWindow.commandBarInput"
     }
@@ -218,4 +215,9 @@ enum AccessibilityID {
         static let container = "videoWindow"
         static let videoContent = "videoWindow.content"
     }
+}
+
+extension AccessibilityID.YouTubeContent {
+    static let videoWindow = "youtubeContent.videoWindow"
+    static let videoWindowFloatOnTop = "youtubeContent.videoWindow.floatOnTop"
 }

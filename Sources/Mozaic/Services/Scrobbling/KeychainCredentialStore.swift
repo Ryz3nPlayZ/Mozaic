@@ -57,7 +57,6 @@ final class KeychainCredentialStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: account,
             kSecAttrService as String: self.servicePrefix,
-            kSecUseDataProtectionKeychain as String: true,
         ]
 
         let updateAttributes: [String: Any] = [
@@ -91,7 +90,6 @@ final class KeychainCredentialStore {
             kSecAttrService as String: self.servicePrefix,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseDataProtectionKeychain as String: true,
         ]
 
         var result: AnyObject?
@@ -114,7 +112,6 @@ final class KeychainCredentialStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: account,
             kSecAttrService as String: self.servicePrefix,
-            kSecUseDataProtectionKeychain as String: true,
         ]
 
         SecItemDelete(query as CFDictionary)

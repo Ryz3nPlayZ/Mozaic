@@ -9,10 +9,12 @@ import SwiftUI
 /// this view owns it. Navigating away while playing hands the surface off
 /// to the floating window (`YouTubeVideoWindowController`).
 struct YouTubeWatchView: View {
-    private static let brandAccent = PackageResourceLookup.brandAccent
+    fileprivate static let brandAccent = PackageResourceLookup.brandAccent
 
     let video: YouTubeVideo
 
+    @Environment(AuthService.self) private var authService
+    @Environment(AccountService.self) private var accountService
     @Environment(YouTubePlayerService.self) private var youtubePlayer
     @State private var viewModel: YouTubeWatchViewModel
 
@@ -52,16 +54,32 @@ struct YouTubeWatchView: View {
         return self.youtubePlayer.storyboardSpec
     }
 
+    private var askAccountScope: YouTubeAskAccountScopeObservation {
+        YouTubeAskAccountScopeObservation(
+            authenticationGeneration: self.authService.accountIdentityGeneration,
+            hasPersonalAccount: self.authService.hasPersonalAccount,
+            accountScopeID: self.accountService.currentAccountScopeID,
+            isPrimaryAccount: self.accountService.currentAccount?.isPrimary,
+            verifiedIdentitySequence: self.accountService.verifiedIdentitySequence
+        )
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 self.videoSurface
 
-                // Below the video: title/metadata + comments down the left,
-                // the related rail down the right.
+                // Below the video: title/metadata + chapters/comments down the
+                // left, the related rail down the right.
                 HStack(alignment: .top, spacing: 24) {
                     VStack(alignment: .leading, spacing: 16) {
                         self.metadataSection
+
+                        if !self.viewModel.data.chapters.isEmpty {
+                            Divider()
+
+                            self.chaptersSection
+                        }
 
                         Divider()
 
@@ -76,6 +94,7 @@ struct YouTubeWatchView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 20)
         }
+        .disabled(self.viewModel.ask.isExpanded)
         // PROTOTYPE: full-bleed ambient color behind the page. `.ignoresSafeArea`
         // (inside the modifier) lets it bleed under the bottom player-bar inset,
         // so the bar's Liquid Glass capsule refracts the live color.
@@ -87,53 +106,47 @@ struct YouTubeWatchView: View {
             storyboardSpec: self.ambientStoryboardSpec
         )
         // The in-page metadata shows the title; keep the bar clean.
-        .navigationTitle("")
+        .navigationTitle(String(localized: ""))
         // Let the ambient reach under the nav bar, like the other accent pages.
         .toolbarBackgroundVisibility(.hidden, for: .automatic)
-        #if DEBUG
-            .toolbar {
-                self.ambientStylePicker
-            }
-        #endif
-            .task {
-                self.startOrAdoptPlayback()
-                await self.viewModel.load()
-                // Feed the related list to the player so the bar's next/previous
-                // buttons can skip between videos.
-                if self.youtubePlayer.currentVideo?.videoId == self.video.videoId {
-                    self.youtubePlayer.setUpNext(self.viewModel.data.related)
+        .toolbar {
+            if self.viewModel.ask.isAvailable {
+                ToolbarItem(placement: .primaryAction) {
+                    YouTubeAskToolbarButton(viewModel: self.viewModel.ask)
                 }
-            }
-            .onDisappear {
-                self.youtubePlayer.inlineSurfaceWillDisappear(videoId: self.video.videoId)
-            }
-    }
-
-    // MARK: - Ambient Style Picker (PROTOTYPE)
-
-    #if DEBUG
-        /// DEBUG-only toolbar control to switch ambient styles live on-device.
-        /// Binds to the same `SettingsManager` value as the Settings → YouTube
-        /// tab, so there is a single source of truth. The whole property is
-        /// compiled out of release builds (an empty `@ToolbarContentBuilder`
-        /// body would otherwise be invalid).
-        @ToolbarContentBuilder
-        private var ambientStylePicker: some ToolbarContent {
-            ToolbarItem(placement: .automatic) {
-                Menu {
-                    Picker("Ambient", selection: self.$settings.ambientBackdropStyle) {
-                        ForEach(AmbientBackdropStyle.allCases) { style in
-                            Text(style.debugLabel).tag(style)
-                        }
-                    }
-                    .pickerStyle(.inline)
-                } label: {
-                    Image(systemName: "paintpalette")
-                }
-                .help("Ambient backdrop style (developer)")
             }
         }
-    #endif
+        .overlay {
+            YouTubeAskFloatingOverlay(
+                viewModel: self.viewModel.ask,
+                playerOffsetMilliseconds: self.askPlayerOffsetMilliseconds
+            )
+        }
+        .youtubeAskAccessibilityAnnouncements(viewModel: self.viewModel.ask)
+        .task {
+            self.startOrAdoptPlayback()
+        }
+        .task(id: self.askAccountScope) {
+            let accountScope = self.askAccountScope
+            await self.viewModel.load(accountScope: accountScope)
+            YouTubeWatchPlaybackLifecycle.synchronizeLoadedData(
+                videoId: self.video.videoId,
+                player: self.youtubePlayer,
+                data: self.viewModel.data
+            )
+        }
+        .onDisappear {
+            self.viewModel.cancel()
+            self.youtubePlayer.inlineSurfaceWillDisappear(videoId: self.video.videoId)
+        }
+    }
+
+    private var askPlayerOffsetMilliseconds: Int64 {
+        guard self.youtubePlayer.currentVideo?.videoId == self.video.videoId else {
+            return 0
+        }
+        return YouTubeAskPlayerOffset.milliseconds(for: self.youtubePlayer.progress)
+    }
 
     // MARK: - Video Surface
 
@@ -196,7 +209,7 @@ struct YouTubeWatchView: View {
                 ) { image in
                     image
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
+                        .scaledToFill()
                 } placeholder: {
                     Rectangle().fill(.black)
                 }
@@ -218,15 +231,14 @@ struct YouTubeWatchView: View {
 
     /// Starts playback of this view's video, or adopts the surface if this
     /// video is already playing (e.g. docking back from the floating window).
-    private func startOrAdoptPlayback() {
-        if self.youtubePlayer.currentVideo?.videoId == self.video.videoId {
-            if self.youtubePlayer.surfaceLocation == .floating {
-                self.youtubePlayer.dockInline()
-            }
-        } else {
-            self.youtubePlayer.play(video: self.video)
-        }
-        self.youtubePlayer.activeInlineVideoId = self.video.videoId
+    private func startOrAdoptPlayback(startAt: Double? = nil) {
+        YouTubeWatchPlaybackLifecycle.presentSurface(
+            video: self.video,
+            player: self.youtubePlayer,
+            usesCookieFreeDataStore: self.authService.shouldUseCookieFreePlaybackDataStore,
+            startAt: startAt,
+            data: self.viewModel.data
+        )
     }
 
     // MARK: - Metadata
@@ -253,11 +265,11 @@ struct YouTubeWatchView: View {
                         HStack(spacing: 10) {
                             CachedAsyncImage(
                                 url: channel.thumbnailURL,
-                                targetSize: CGSize(width: 72, height: 72)
+                                targetSize: CGSize(width: 36, height: 36)
                             ) { image in
                                 image
                                     .resizable()
-                                    .aspectRatio(contentMode: .fill)
+                                    .scaledToFill()
                             } placeholder: {
                                 Circle().fill(.quaternary)
                             }
@@ -279,7 +291,9 @@ struct YouTubeWatchView: View {
                     }
                     .buttonStyle(.plain)
 
-                    self.subscribeButton
+                    if self.hasPersonalAccount {
+                        self.subscribeButton
+                    }
 
                     Spacer(minLength: 0)
                 }
@@ -312,6 +326,76 @@ struct YouTubeWatchView: View {
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier(AccessibilityID.YouTubeContent.subscribeButton)
+    }
+
+    // MARK: - Chapters
+
+    private var chaptersSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Chapters", comment: "Video chapters section header")
+                .font(.title3.bold())
+
+            CarouselShelf(
+                accessibilityLabel: String(localized: "Video chapters"),
+                pageFraction: 0.82,
+                showsControls: true,
+                controlVerticalAlignment: .center,
+                contentInset: 0
+            ) {
+                LazyHStack(alignment: .top, spacing: 10) {
+                    ForEach(self.viewModel.data.chapters) { chapter in
+                        Button {
+                            self.seekToChapter(chapter)
+                        } label: {
+                            ChapterCard(chapter: chapter, isActive: self.isActiveChapter(chapter))
+                        }
+                        .buttonStyle(.interactiveRow)
+                        .accessibilityLabel(
+                            String(localized: "Jump to chapter: \(chapter.title)")
+                        )
+                        .disabled(!self.canSeekToChapter(chapter))
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .accessibilityIdentifier(AccessibilityID.YouTubeContent.chaptersSection)
+    }
+
+    private func seekToChapter(_ chapter: YouTubeChapter) {
+        guard self.canSeekToChapter(chapter) else { return }
+        if self.youtubePlayer.currentVideo?.videoId != self.video.videoId {
+            self.startOrAdoptPlayback(startAt: chapter.startTime)
+            return
+        }
+        self.youtubePlayer.seek(to: chapter.startTime)
+    }
+
+    private func canSeekToChapter(_ chapter: YouTubeChapter) -> Bool {
+        if let chapterVideoId = chapter.videoId, chapterVideoId != self.video.videoId {
+            return false
+        }
+        guard self.youtubePlayer.currentVideo?.videoId == self.video.videoId else {
+            return true
+        }
+        return self.youtubePlayer.duration > 0
+            && !self.youtubePlayer.isPlaybackLoading
+            && !self.youtubePlayer.isShowingAd
+    }
+
+    private func isActiveChapter(_ chapter: YouTubeChapter) -> Bool {
+        guard self.youtubePlayer.currentVideo?.videoId == self.video.videoId else { return false }
+        let currentTime = self.youtubePlayer.progress
+        guard currentTime >= chapter.startTime else { return false }
+        if let endTime = chapter.endTime {
+            return currentTime < endTime
+        }
+        guard let index = self.viewModel.data.chapters.firstIndex(where: { $0.id == chapter.id }) else {
+            return false
+        }
+        let nextIndex = self.viewModel.data.chapters.index(after: index)
+        guard nextIndex < self.viewModel.data.chapters.endIndex else { return true }
+        return currentTime < self.viewModel.data.chapters[nextIndex].startTime
     }
 
     // MARK: - Related Column
@@ -369,7 +453,7 @@ struct YouTubeWatchView: View {
             } else {
                 LazyVStack(alignment: .leading, spacing: 16) {
                     ForEach(self.viewModel.comments) { comment in
-                        CommentThread(comment: comment, viewModel: self.viewModel)
+                        CommentThread(comment: comment, viewModel: self.viewModel, allowsActions: self.hasPersonalAccount)
                     }
                 }
             }
@@ -401,7 +485,7 @@ struct YouTubeWatchView: View {
     private var commentComposer: some View {
         HStack(spacing: 10) {
             TextField(
-                self.viewModel.canComment
+                self.hasPersonalAccount && self.viewModel.canComment
                     ? String(localized: "Add a comment…")
                     : String(localized: "Sign in to comment"),
                 text: self.$commentDraft
@@ -410,7 +494,7 @@ struct YouTubeWatchView: View {
             .padding(.horizontal, 12)
             .frame(height: 30)
             .background(.quaternary.opacity(0.5), in: Capsule())
-            .disabled(!self.viewModel.canComment)
+            .disabled(!self.hasPersonalAccount || !self.viewModel.canComment)
             .onSubmit {
                 self.submitComment()
             }
@@ -439,13 +523,18 @@ struct YouTubeWatchView: View {
             }
             .buttonStyle(.plain)
             .disabled(
-                !self.viewModel.canComment
+                !self.hasPersonalAccount
+                    || !self.viewModel.canComment
                     || self.viewModel.isPostingComment
                     || self.commentDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             )
             .accessibilityLabel(String(localized: "Post comment"))
             .accessibilityIdentifier(AccessibilityID.YouTubeContent.commentPostButton)
         }
+    }
+
+    private var hasPersonalAccount: Bool {
+        self.authService.hasPersonalAccount
     }
 
     /// Whether the composer holds postable text (drives the send accent).
@@ -470,6 +559,7 @@ struct YouTubeWatchView: View {
 private struct CommentThread: View {
     let comment: YouTubeComment
     let viewModel: YouTubeWatchViewModel
+    let allowsActions: Bool
 
     @State private var showsReplies = false
 
@@ -488,7 +578,8 @@ private struct CommentThread: View {
                     Task {
                         await self.viewModel.dislikeComment(self.comment)
                     }
-                }
+                },
+                allowsActions: self.allowsActions
             )
 
             if self.comment.repliesContinuation != nil {
@@ -534,7 +625,8 @@ private struct CommentThread: View {
                                     Task {
                                         await self.viewModel.dislikeComment(reply)
                                     }
-                                }
+                                },
+                                allowsActions: self.allowsActions
                             )
                         }
                     }
@@ -555,6 +647,7 @@ private struct CommentRow: View {
     let isDisliked: Bool
     let onLike: () -> Void
     let onDislike: () -> Void
+    let allowsActions: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -596,7 +689,7 @@ private struct CommentRow: View {
                         .foregroundStyle(self.isLiked ? AnyShapeStyle(.red) : AnyShapeStyle(.tertiary))
                     }
                     .buttonStyle(.plain)
-                    .disabled(self.comment.likeAction == nil)
+                    .disabled(!self.allowsActions || self.comment.likeAction == nil)
                     .accessibilityLabel(String(localized: "Like comment"))
 
                     Button(action: self.onDislike) {
@@ -605,7 +698,7 @@ private struct CommentRow: View {
                             .foregroundStyle(self.isDisliked ? AnyShapeStyle(.red) : AnyShapeStyle(.tertiary))
                     }
                     .buttonStyle(.plain)
-                    .disabled(self.comment.dislikeAction == nil)
+                    .disabled(!self.allowsActions || self.comment.dislikeAction == nil)
                     .accessibilityLabel(String(localized: "Dislike comment"))
                 }
                 .padding(.top, 2)
@@ -631,11 +724,11 @@ private struct CommentRow: View {
     private var avatar: some View {
         CachedAsyncImage(
             url: self.comment.authorAvatarURL,
-            targetSize: CGSize(width: 56, height: 56)
+            targetSize: CGSize(width: 28, height: 28)
         ) { image in
             image
                 .resizable()
-                .aspectRatio(contentMode: .fill)
+                .scaledToFill()
         } placeholder: {
             Circle()
                 .fill(.quaternary)
@@ -647,6 +740,68 @@ private struct CommentRow: View {
         }
         .frame(width: 28, height: 28)
         .clipShape(.circle)
+    }
+}
+
+// MARK: - ChapterCard
+
+private struct ChapterCard: View {
+    let chapter: YouTubeChapter
+    let isActive: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            self.thumbnail
+                .frame(width: 160, height: 90)
+                .clipShape(.rect(cornerRadius: 8))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(self.chapter.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+
+                Text(self.chapter.timeText ?? Self.formatTime(self.chapter.startTime))
+                    .font(.caption)
+                    .foregroundStyle(self.isActive ? YouTubeWatchView.brandAccent : .secondary)
+            }
+        }
+        .padding(8)
+        .frame(width: 176, alignment: .leading)
+        .background(self.isActive ? YouTubeWatchView.brandAccent.opacity(0.14) : Color.secondary.opacity(0.08), in: .rect(cornerRadius: 12))
+        .contentShape(.rect(cornerRadius: 10))
+    }
+
+    private var thumbnail: some View {
+        CachedAsyncImage(
+            url: self.chapter.thumbnailURL,
+            targetSize: CGSize(width: 192, height: 108)
+        ) { image in
+            image
+                .resizable()
+                .scaledToFill()
+        } placeholder: {
+            Rectangle()
+                .fill(.quaternary)
+                .overlay {
+                    Image(systemName: "text.append")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+        }
+    }
+
+    private static func formatTime(_ seconds: TimeInterval) -> String {
+        let totalSeconds = max(0, Int(seconds.rounded(.down)))
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%d:%02d", minutes, seconds)
     }
 }
 
@@ -694,6 +849,7 @@ private struct RelatedVideoRow: View {
 
 extension AccessibilityID.YouTubeContent {
     static let watchSurface = "youtubeContent.watchSurface"
+    static let chaptersSection = "youtubeContent.chaptersSection"
     static let commentsSection = "youtubeContent.commentsSection"
     static let commentField = "youtubeContent.commentField"
     static let commentPostButton = "youtubeContent.commentPostButton"

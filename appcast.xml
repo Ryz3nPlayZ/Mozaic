@@ -7,16 +7,16 @@
         <language>en</language>
 
         <item>
-            <title>Version 0.11.0</title>
-            <sparkle:releaseNotesLink>https://github.com/Ryz3nPlayZ/Mozaic/releases/tag/v0.11.0</sparkle:releaseNotesLink>
-            <pubDate>Mon, 08 Jun 2026 03:08:13 +0000</pubDate>
+            <title>Version 0.14.0</title>
+            <sparkle:releaseNotesLink>https://github.com/Ryz3nPlayZ/Mozaic/releases/tag/v0.14.0</sparkle:releaseNotesLink>
+            <pubDate>Fri, 28 Aug 2026 18:28:57 +0000</pubDate>
             <enclosure
-                url="https://github.com/Ryz3nPlayZ/Mozaic/releases/download/v0.11.0/mozaic-v0.11.0.dmg"
-                sparkle:version="20"
-                sparkle:shortVersionString="0.11.0"
-                length="11088925"
+                url="https://github.com/Ryz3nPlayZ/Mozaic/releases/download/v0.14.0/mozaic-v0.14.0.dmg"
+                sparkle:version="24"
+                sparkle:shortVersionString="0.14.0"
+                length="17798819"
                 type="application/octet-stream"
-                sparkle:edSignature="UP86NarTurXZztNd/cwPDuPQVcaX8J0qrRp5BylDz8Wk1l5e6SiOfDL+ZvG1xSA00jiQTg3yX1jzW/69f1MfDg=="/>
+                sparkle:edSignature="EN/jFpGzwEMFRwFTZy4iXhPnAKfnMJYUpBq0DR+ZfVZc5xQ93i/bOwv2jU3qv5/JRlezRTLjXnbfcPfxneTnDw=="/>
             <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
         </item>
 

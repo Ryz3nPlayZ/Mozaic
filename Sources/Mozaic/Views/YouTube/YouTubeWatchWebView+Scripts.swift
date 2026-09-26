@@ -1,20 +1,54 @@
+// swiftlint:disable file_length
+
 import Foundation
 
 // MARK: - Observer & Extraction Scripts
 
 extension YouTubeWatchWebView {
+    func markCurrentPlaybackOccurrenceEnded() {
+        guard let webView = self.webView else { return }
+        let generation = self.documentGeneration.currentGeneration
+        guard self.documentGeneration.accepts(generation: generation) else { return }
+        webView.evaluateJavaScript(
+            """
+            if (window.__mozaicDocumentGeneration === \(generation)) {
+                const video = document.querySelector('video');
+                if (video) { video.__mozaicEndedReported = true; }
+            }
+            """,
+            completionHandler: nil
+        )
+    }
+
     /// Observer script for youtube.com watch pages.
     ///
-    /// Posts `STATE_UPDATE` (1 Hz + media events) and `VIDEO_ENDED` to the
-    /// `youtubePlayer` bridge. Also enforces the Mozaic-managed volume target
-    /// the same way the music observer does.
+    /// Posts event-driven `STATE_UPDATE` and `VIDEO_ENDED` messages to the
+    /// `youtubePlayer` bridge. Progress updates are driven by media events, with
+    /// forced final updates on pause/seek/end, so paused pages do not keep a 1 Hz
+    /// bridge loop alive. Also enforces the Mozaic-managed volume target the same
+    /// way the music observer does.
     static var observerScript: String {
         """
         (function() {
             'use strict';
 
             const bridge = window.webkit.messageHandlers.youtubePlayer;
-            let lastVideoId = '';
+            const UPDATE_THROTTLE_MS = 1000;
+            const MAX_ATTACH_RETRIES = 20;
+            var mediaGeneration = 0;
+            var mediaVideoId = '';
+            var mediaSource = '';
+            var lastMediaCurrentTime = 0;
+            var mediaIdentityNeedsRefresh = false;
+            var lastUpdateTime = 0;
+            var trailingUpdateTimeoutId = null;
+            var attachRetryCount = 0;
+            var attachRetryTimeoutId = null;
+            var attachDebounceTimeoutId = null;
+            var videoObserver = null;
+            \(PlaybackAdDetectionScript.detection)
+            \(PlaybackAdDetectionScript.observation)
+            const refreshAdObserver = observeAdStateChanges(function() { sendUpdate(true); });
 
             function moviePlayer() {
                 return document.getElementById('movie_player');
@@ -43,41 +77,164 @@ extension YouTubeWatchWebView {
                 return document.title.replace(/ - YouTube$/, '');
             }
 
-            function isAdShowing() {
-                const player = moviePlayer();
-                return !!(player && player.classList && player.classList.contains('ad-showing'));
+            function clearTrailingUpdate() {
+                if (trailingUpdateTimeoutId) {
+                    clearTimeout(trailingUpdateTimeoutId);
+                    trailingUpdateTimeoutId = null;
+                }
             }
 
-            function sendUpdate() {
+            function sendUpdate(force) {
                 try {
                     const video = videoEl();
                     if (!video) { return; }
+                    bindVideoIdentity(video, false);
                     applyPendingSeek(video);
+
+                    if (force) {
+                        clearTrailingUpdate();
+                    } else {
+                        const now = Date.now();
+                        const elapsed = now - lastUpdateTime;
+                        if (elapsed < UPDATE_THROTTLE_MS) {
+                            if (!trailingUpdateTimeoutId && !video.paused && !video.ended) {
+                                trailingUpdateTimeoutId = setTimeout(function() {
+                                    trailingUpdateTimeoutId = null;
+                                    sendUpdate(true);
+                                }, UPDATE_THROTTLE_MS - elapsed);
+                            }
+                            return;
+                        }
+                    }
+                    lastUpdateTime = Date.now();
+
                     const videoId = currentVideoId();
-                    if (videoId !== '') { lastVideoId = videoId; }
+                    const hasReadyMedia = !!(video.currentSrc && video.readyState >= 1);
+                    const hasMediaError = !!video.error;
+                    const data = videoData();
+                    const isLive = !!(
+                        (data && data.isLive === true)
+                        || (hasReadyMedia && !isFinite(video.duration))
+                    );
+                    const pendingSeekApplied = window.__mozaicPendingSeekApplied === true;
+                    const pendingSeekFailed = window.__mozaicPendingSeekFailed === true;
+                    const pendingSeekTarget = window.__mozaicPendingSeekResultTarget;
+                    const pendingSeekVideoId = window.__mozaicPendingSeekResultVideoId || '';
+                    const pendingSeekAttempt = window.__mozaicPendingSeekAttempt;
+                    const nativePausePending = window.__mozaicNativePausePending === true;
                     bridge.postMessage({
                         type: 'STATE_UPDATE',
+                        documentGeneration: window.__mozaicDocumentGeneration,
+                        mediaGeneration: video.__mozaicMediaGeneration || mediaGeneration,
                         isPlaying: !video.paused && !video.ended,
                         progress: video.currentTime || 0,
                         duration: (video.duration && isFinite(video.duration)) ? video.duration : 0,
+                        hasReadyMedia: hasReadyMedia,
+                        hasMediaError: hasMediaError,
                         videoId: videoId,
+                        boundVideoId: video.__mozaicBoundVideoId || '',
                         title: currentTitle(),
-                        isAd: isAdShowing()
+                        isAd: isAdShowing(),
+                        isLive: isLive,
+                        pendingSeekApplied: pendingSeekApplied,
+                        pendingSeekFailed: pendingSeekFailed,
+                        pendingSeekTarget: pendingSeekTarget,
+                        pendingSeekVideoId: pendingSeekVideoId,
+                        pendingSeekAttempt: pendingSeekAttempt,
+                        nativePausePending: nativePausePending
+                        ,eventIssuedAtMilliseconds: (typeof performance !== 'undefined'
+                            && Number.isFinite(performance.timeOrigin)
+                            && typeof performance.now === 'function')
+                            ? performance.timeOrigin + performance.now()
+                            : Date.now()
                     });
+                    if (pendingSeekApplied) window.__mozaicPendingSeekApplied = false;
+                    if (pendingSeekFailed) window.__mozaicPendingSeekFailed = false;
+                    if (pendingSeekApplied || pendingSeekFailed) {
+                        window.__mozaicPendingSeekResultTarget = null;
+                        window.__mozaicPendingSeekResultVideoId = null;
+                    }
                 } catch (e) {
                     console.log('[MozaicYT] update error: ' + e);
                 }
             }
 
-            function sendEnded() {
+            function bindVideoIdentity(video, transitionEvidence) {
+                if (!video || video !== videoEl()) { return; }
+                const videoId = currentVideoId();
+                const resolvedVideoId = videoId
+                    || (!video.__mozaicBoundVideoId
+                        ? (window.__mozaicPendingSeekVideoId || '')
+                        : '');
+                const source = video.currentSrc || video.src || '';
+                const currentTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+                const hasBoundOccurrence = !!video.__mozaicMediaGeneration;
+                const isReplacementElement = !hasBoundOccurrence && mediaGeneration > 0;
+                const previousMediaVideoId = mediaVideoId;
+                const sourceChanged = hasBoundOccurrence && source !== mediaSource;
+                const mediaTimeReset = hasBoundOccurrence && currentTime + 2 < lastMediaCurrentTime;
+                const identityChanged = !!resolvedVideoId
+                    && !!mediaVideoId
+                    && resolvedVideoId !== mediaVideoId;
+                const identityBecameKnown = !!resolvedVideoId && !mediaVideoId;
+                const shouldBind = !hasBoundOccurrence
+                    || sourceChanged
+                    || mediaTimeReset
+                    || (identityChanged && transitionEvidence === true);
+
+                if (!shouldBind) {
+                    if (identityBecameKnown || (identityChanged && mediaIdentityNeedsRefresh)) {
+                        mediaVideoId = resolvedVideoId;
+                        video.__mozaicBoundVideoId = resolvedVideoId;
+                        mediaIdentityNeedsRefresh = false;
+                    }
+                    if (!identityChanged) lastMediaCurrentTime = currentTime;
+                    return;
+                }
+
+                mediaGeneration += 1;
+                mediaVideoId = resolvedVideoId;
+                mediaSource = source;
+                lastMediaCurrentTime = currentTime;
+                mediaIdentityNeedsRefresh = (isReplacementElement || sourceChanged || mediaTimeReset)
+                    && (!resolvedVideoId || resolvedVideoId === previousMediaVideoId);
+                video.__mozaicMediaGeneration = mediaGeneration;
+                video.__mozaicEndedReported = false;
+                video.__mozaicBoundVideoId = resolvedVideoId;
+                window.__mozaicPendingSeekInFlightAttempt = null;
+            }
+
+            function armEndedOccurrence(video) {
+                if (!video || video !== videoEl() || video.ended) { return; }
+                bindVideoIdentity(video, false);
+                if (video.__mozaicEndedReported === true) {
+                    mediaGeneration += 1;
+                    video.__mozaicMediaGeneration = mediaGeneration;
+                }
+                video.__mozaicEndedReported = false;
+            }
+
+            function sendEnded(video) {
+                if (video !== videoEl() || !video.ended || video.__mozaicEndedReported === true) {
+                    return;
+                }
+                video.__mozaicEndedReported = true;
                 bridge.postMessage({
                     type: 'VIDEO_ENDED',
-                    videoId: lastVideoId || currentVideoId()
+                    documentGeneration: window.__mozaicDocumentGeneration,
+                    mediaGeneration: video.__mozaicMediaGeneration || mediaGeneration,
+                    pendingSeekAttempt: window.__mozaicPendingSeekAttempt,
+                    eventIssuedAtMilliseconds: Date.now(),
+                    videoId: video.__mozaicBoundVideoId || currentVideoId(),
+                    isAd: isAdShowing()
                 });
             }
 
             function enforceVolume(video) {
-                if (window.__mozaicIsSettingVolume) { return; }
+                if (typeof window.__mozaicApplyTargetVolume === 'function') {
+                    window.__mozaicApplyTargetVolume(video);
+                    return;
+                }
                 const target = window.__mozaicTargetVolume;
                 // YouTube persists its own mute state across sessions; Mozaic
                 // owns audio, so unmute whenever our target volume is audible.
@@ -88,38 +245,107 @@ extension YouTubeWatchWebView {
                         try { player.unMute(); } catch (e) {}
                     }
                 }
+                if (typeof target === 'number' && target <= 0 && !video.muted) {
+                    video.muted = true;
+                    const player = moviePlayer();
+                    if (player && typeof player.mute === 'function') {
+                        try { player.mute(); } catch (e) {}
+                    }
+                }
                 if (typeof target === 'number' && Math.abs(video.volume - target) > 0.01) {
-                    window.__mozaicIsSettingVolume = true;
                     video.volume = target;
-                    setTimeout(function() { window.__mozaicIsSettingVolume = false; }, 50);
                 }
             }
 
             // Apply a pending resume-seek from a session-identity-switch reload.
             // The <video> is created by the player JS after navigation and may
-            // not be seekable immediately, so this is called from both attach()
-            // and the 1s sendUpdate tick and retries until metadata is ready.
-            // Scoped to this document: window.__mozaicPendingSeek is re-injected
-            // per page load, so it cannot leak into a later video.
+            // not be seekable immediately, so this is called from attach() and
+            // media readiness/progress events until metadata is ready. Scoped to
+            // this document: window.__mozaicPendingSeek is re-injected per page
+            // load, so it cannot leak into a later video.
             function applyPendingSeek(video) {
                 const target = window.__mozaicPendingSeek;
                 if (typeof target !== 'number') { return; }
-                // Don't seek (or consume the pending value) on a preroll-ad video
-                // element — wait for the real content player, or the content would
-                // start from 0 after the ad.
+                // An ad can expose the creative's video ID; never consume the
+                // requested content seek against advertisement media.
                 if (isAdShowing()) { return; }
-                if (video.readyState < 1) { return; }
+                if (video.readyState < 1 || !video.currentSrc) { return; }
+                const expectedVideoId = window.__mozaicPendingSeekVideoId;
+                const boundVideoId = video.__mozaicBoundVideoId || '';
+                if (expectedVideoId && boundVideoId !== expectedVideoId) {
+                    // Metadata can lead the physical media during SPA changes.
+                    // Keep the target armed until this element is actually bound
+                    // to the requested content occurrence.
+                    return;
+                }
+                if (!video.seekable || video.seekable.length === 0) { return; }
+                const seekAttempt = window.__mozaicPendingSeekAttempt || 0;
+                window.__mozaicPendingSeekAttempt = seekAttempt;
+                if (window.__mozaicPendingSeekInFlightAttempt === seekAttempt) { return; }
+                window.__mozaicPendingSeekInFlightAttempt = seekAttempt;
                 try {
-                    video.currentTime = target;
-                    // Re-assert once if the player clobbers currentTime back near 0.
-                    setTimeout(function() {
-                        if (typeof window.__mozaicPendingSeek === 'number' &&
-                            Math.abs(video.currentTime - target) > 1.5) {
-                            try { video.currentTime = target; } catch (e) {}
+                    const seekMediaGeneration = video.__mozaicMediaGeneration || 0;
+                    const seekSource = video.currentSrc;
+                    function stillOwnsSeekOperation() {
+                        return video === videoEl()
+                            && window.__mozaicPendingSeek === target
+                            && (window.__mozaicPendingSeekVideoId || '') === (expectedVideoId || '')
+                            && (video.__mozaicBoundVideoId || '') === (expectedVideoId || '')
+                            && (video.__mozaicMediaGeneration || 0) === seekMediaGeneration
+                            && video.currentSrc === seekSource
+                            && window.__mozaicPendingSeekAttempt === seekAttempt
+                            && window.__mozaicPendingSeekInFlightAttempt === seekAttempt;
+                    }
+                    const firstSeekable = video.seekable.start(0);
+                    const lastSeekable = video.seekable.end(video.seekable.length - 1);
+                    const hasFiniteDuration = video.duration && isFinite(video.duration);
+                    const resolvedTarget = hasFiniteDuration
+                        ? Math.min(Math.max(target, 0), video.duration)
+                        : Math.min(Math.max(target, firstSeekable), lastSeekable);
+                    window.__mozaicPendingSeekWaits = 0;
+                    video.currentTime = resolvedTarget;
+                    function reportSeekResult() {
+                        if (!stillOwnsSeekOperation()) return;
+                        if (Math.abs(video.currentTime - resolvedTarget) <= 1.5) {
+                            window.__mozaicPendingSeek = null;
+                            window.__mozaicPendingSeekVideoId = null;
+                            window.__mozaicPendingSeekWaits = 0;
+                            window.__mozaicPendingSeekApplied = true;
+                            window.__mozaicPendingSeekResultTarget = target;
+                            window.__mozaicPendingSeekResultVideoId = expectedVideoId
+                                || currentVideoId()
+                                || video.__mozaicBoundVideoId
+                                || '';
+                        } else {
+                            window.__mozaicPendingSeek = null;
+                            window.__mozaicPendingSeekVideoId = null;
+                            window.__mozaicPendingSeekWaits = 0;
+                            window.__mozaicPendingSeekFailed = true;
+                            window.__mozaicPendingSeekResultTarget = target;
+                            window.__mozaicPendingSeekResultVideoId = expectedVideoId
+                                || currentVideoId()
+                                || video.__mozaicBoundVideoId
+                                || '';
                         }
-                        window.__mozaicPendingSeek = null;
+                        window.__mozaicPendingSeekInFlightAttempt = null;
+                        sendUpdate(true);
+                    }
+                    // Re-assert once if the player clobbers currentTime back near 0,
+                    // then wait again before reporting success.
+                    setTimeout(function() {
+                        if (!stillOwnsSeekOperation()) return;
+                        if (Math.abs(video.currentTime - resolvedTarget) > 1.5) {
+                            try { video.currentTime = resolvedTarget; } catch (e) {}
+                            setTimeout(reportSeekResult, 400);
+                            return;
+                        }
+                        reportSeekResult();
                     }, 400);
-                } catch (e) {}
+                } catch (e) {
+                    if (window.__mozaicPendingSeekInFlightAttempt === seekAttempt) {
+                        window.__mozaicPendingSeekInFlightAttempt = null;
+                    }
+                }
             }
 
             function disableAutonav() {
@@ -132,31 +358,151 @@ extension YouTubeWatchWebView {
                 } catch (e) {}
             }
 
-            function attach() {
-                const video = videoEl();
-                if (!video) { return; }
-                if (video.__mozaicAttached) { return; }
-                video.__mozaicAttached = true;
+            function eventVideo(event) {
+                return (event && event.currentTarget) || videoEl();
+            }
 
-                ['play', 'playing', 'pause', 'seeked', 'loadedmetadata'].forEach(function(evt) {
-                    video.addEventListener(evt, sendUpdate);
+            function handlePlaybackStarted(event) {
+                const video = eventVideo(event);
+                if (!video) return;
+                bindVideoIdentity(video, false);
+                armEndedOccurrence(video);
+                enforceVolume(video);
+                sendUpdate(true);
+            }
+
+            function handlePlaybackStopped(event) {
+                const video = eventVideo(event);
+                if (!video) return;
+                if (event && event.type === 'pause') {
+                    window.__mozaicNativePausePending = false;
+                }
+                if (event && (event.type === 'loadedmetadata' || event.type === 'canplay')) {
+                    bindVideoIdentity(video, true);
+                } else {
+                    bindVideoIdentity(video, false);
+                }
+                if (event && (event.type === 'seeked' || event.type === 'loadedmetadata'
+                    || event.type === 'canplay')) {
+                    armEndedOccurrence(video);
+                }
+                sendUpdate(true);
+            }
+
+            function handleTimelineUpdate(event) {
+                const video = eventVideo(event);
+                if (!video) return;
+                bindVideoIdentity(video, false);
+                applyPendingSeek(video);
+                if (!video.paused && !video.ended) {
+                    sendUpdate(false);
+                }
+            }
+
+            function handleEnded(event) {
+                const endedVideo = event.currentTarget;
+                sendUpdate(true);
+                sendEnded(endedVideo);
+            }
+
+            function attach() {
+                refreshAdObserver();
+                disableAutonav();
+                const video = videoEl();
+                if (!video) { return false; }
+                const videoId = currentVideoId();
+                if (video.__mozaicAttached) {
+                    applyPendingSeek(video);
+                    if (videoId && video.__mozaicAttachedVideoId !== videoId) {
+                        video.__mozaicAttachedVideoId = videoId;
+                        bindVideoIdentity(video, true);
+                        armEndedOccurrence(video);
+                        sendUpdate(true);
+                    }
+                    return true;
+                }
+                video.__mozaicAttached = true;
+                video.__mozaicAttachedVideoId = videoId || '';
+                video.__mozaicEndedReported = false;
+                bindVideoIdentity(video, video.readyState >= 1);
+                armEndedOccurrence(video);
+                attachRetryCount = 0;
+
+                ['play', 'playing'].forEach(function(evt) {
+                    video.addEventListener(evt, handlePlaybackStarted);
                 });
-                video.addEventListener('ended', sendEnded);
+                ['pause', 'seeked', 'loadedmetadata', 'durationchange', 'canplay', 'waiting', 'error'].forEach(function(evt) {
+                    video.addEventListener(evt, handlePlaybackStopped);
+                });
+                video.addEventListener('timeupdate', handleTimelineUpdate);
+                video.addEventListener('ended', handleEnded);
                 video.addEventListener('volumechange', function() {
                     enforceVolume(video);
                 });
 
-                disableAutonav();
                 enforceVolume(video);
                 applyPendingSeek(video);
-                sendUpdate();
+                sendUpdate(true);
+                return true;
             }
 
-            // Re-attach periodically: YouTube swaps <video> elements across
-            // SPA navigations and ad transitions.
-            setInterval(attach, 2000);
-            setInterval(sendUpdate, 1000);
-            attach();
+            function scheduleAttach() {
+                if (attachDebounceTimeoutId) { return; }
+                attachDebounceTimeoutId = setTimeout(function() {
+                    attachDebounceTimeoutId = null;
+                    attach();
+                }, 100);
+            }
+
+            function installVideoObserver() {
+                if (videoObserver || typeof MutationObserver !== 'function') { return false; }
+                const root = document.documentElement || document.body;
+                if (!root) { return false; }
+                videoObserver = new MutationObserver(scheduleAttach);
+                videoObserver.observe(root, { childList: true, subtree: true });
+                return true;
+            }
+
+            function attachWithBoundedRetry() {
+                if (attach()) { return; }
+                if (!installVideoObserver() && attachRetryCount < MAX_ATTACH_RETRIES && !attachRetryTimeoutId) {
+                    attachRetryCount += 1;
+                    attachRetryTimeoutId = setTimeout(function() {
+                        attachRetryTimeoutId = null;
+                        attachWithBoundedRetry();
+                    }, 500);
+                }
+            }
+
+            installVideoObserver();
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', attachWithBoundedRetry);
+            } else {
+                attachWithBoundedRetry();
+            }
+        })();
+        """
+    }
+
+    /// Stops the chrome-hiding extraction and drops its style elements.
+    ///
+    /// Consent, CAPTCHA and sign-in interstitials are deliberately allowed to
+    /// commit in this WebView so the user can clear them, but the
+    /// document-start blackout hides every element — and a `visibility:
+    /// hidden` element cannot be hit-tested, so the form is both invisible and
+    /// unclickable. Revealing the page is the only way out of that dead end.
+    static var revealInterstitialScript: String {
+        """
+        (function() {
+            try {
+                if (typeof window.__mozaicStopYTExtraction === 'function') {
+                    window.__mozaicStopYTExtraction();
+                }
+            } catch (e) {}
+            ['mozaic-yt-blackout', 'mozaic-yt-video-style'].forEach(function(id) {
+                const style = document.getElementById(id);
+                if (style && style.parentNode) { style.parentNode.removeChild(style); }
+            });
         })();
         """
     }
@@ -186,15 +532,18 @@ extension YouTubeWatchWebView {
     /// Same ancestor-chain visibility approach as the music video mode
     /// (`SingletonPlayerWebView+VideoMode`), targeting the watch-page DOM.
     /// Defines `window.__mozaicExtractVideo()` and runs it; `didFinish` calls
-    /// it again for cached/fast loads.
+    /// it again for cached/fast loads. Enforcement uses bounded RAF bursts plus
+    /// a DOM observer so steady state does not keep a per-frame loop alive.
     static var extractionScript: String {
         """
         (function() {
             'use strict';
 
             const styleId = 'mozaic-yt-video-style';
+            const MAX_ENFORCEMENT_FRAMES = 12;
+            const MUTATION_ENFORCEMENT_FRAMES = 6;
 
-            window.__mozaicExtractVideo = function() {
+            function ensureStyle() {
                 let style = document.getElementById(styleId);
                 if (!style) {
                     style = document.createElement('style');
@@ -268,31 +617,141 @@ extension YouTubeWatchWebView {
                         visibility: visible !important;
                     }
                 `;
+            }
 
-                const markAncestors = function() {
-                    const video = document.querySelector('#movie_player video') || document.querySelector('video');
-                    if (!video) { return; }
+            function extractionState() {
+                if (!window.__mozaicYTExtraction) {
+                    window.__mozaicYTExtraction = {
+                        active: false,
+                        observer: null,
+                        markedObserver: null,
+                        markedElements: [],
+                        rafScheduled: false,
+                        rafHandle: null,
+                        remainingFrames: 0
+                    };
+                }
+                return window.__mozaicYTExtraction;
+            }
 
-                    document.querySelectorAll('.mozaic-visible').forEach(function(el) {
+            function clearMarkers() {
+                document.querySelectorAll('.mozaic-visible').forEach(function(el) {
+                    el.classList.remove('mozaic-visible');
+                });
+            }
+
+            function stopExtraction() {
+                const state = extractionState();
+                state.active = false;
+                window.__mozaicYTVideoActive = false;
+                state.remainingFrames = 0;
+                if (state.observer) {
+                    state.observer.disconnect();
+                    state.observer = null;
+                }
+                if (state.markedObserver) {
+                    state.markedObserver.disconnect();
+                    state.markedObserver = null;
+                }
+                state.markedElements = [];
+                if (state.rafHandle !== null && typeof cancelAnimationFrame === 'function') {
+                    cancelAnimationFrame(state.rafHandle);
+                }
+                state.rafScheduled = false;
+                state.rafHandle = null;
+                clearMarkers();
+            }
+
+            function markAncestors() {
+                const state = extractionState();
+                if (!window.__mozaicYTVideoActive) { return false; }
+                const video = document.querySelector('#movie_player video') || document.querySelector('video');
+                if (!video) { return false; }
+
+                const visibleChain = [];
+                let current = video;
+                while (current && current !== document.documentElement) {
+                    visibleChain.push(current);
+                    current = current.parentElement;
+                }
+
+                document.querySelectorAll('.mozaic-visible').forEach(function(el) {
+                    if (visibleChain.indexOf(el) === -1) {
                         el.classList.remove('mozaic-visible');
+                    }
+                });
+                visibleChain.forEach(function(el) {
+                    el.classList.add('mozaic-visible');
+                });
+                state.markedElements = visibleChain;
+                reobserveMarkedElements();
+                return true;
+            }
+
+            function reobserveMarkedElements() {
+                const state = extractionState();
+                if (!state.markedObserver) { return; }
+                state.markedObserver.disconnect();
+                state.markedElements.forEach(function(el) {
+                    state.markedObserver.observe(el, {
+                        attributes: true,
+                        attributeFilter: ['class', 'style', 'hidden']
                     });
+                });
+            }
 
-                    let current = video;
-                    while (current && current !== document.documentElement) {
-                        current.classList.add('mozaic-visible');
-                        current = current.parentElement;
+            function runEnforcementFrame() {
+                const state = extractionState();
+                state.rafScheduled = false;
+                state.rafHandle = null;
+                if (!state.active || !window.__mozaicYTVideoActive) { return; }
+                markAncestors();
+                state.remainingFrames -= 1;
+                if (state.remainingFrames > 0) {
+                    scheduleEnforcement(0);
+                }
+            }
+
+            function scheduleEnforcement(frameCount) {
+                const state = extractionState();
+                if (!state.active || !window.__mozaicYTVideoActive) { return; }
+                state.remainingFrames = Math.max(state.remainingFrames, frameCount);
+                if (state.rafScheduled) { return; }
+                state.rafScheduled = true;
+                state.rafHandle = requestAnimationFrame(runEnforcementFrame);
+            }
+
+            function installObserver() {
+                const state = extractionState();
+                if (state.observer || typeof MutationObserver !== 'function') { return; }
+                const root = document.documentElement || document.body;
+                if (!root) { return; }
+                state.observer = new MutationObserver(function() {
+                    if (state.active && window.__mozaicYTVideoActive) {
+                        scheduleEnforcement(MUTATION_ENFORCEMENT_FRAMES);
                     }
-                };
-
-                const enforce = function() {
-                    markAncestors();
-                    if (window.__mozaicYTVideoActive) {
-                        requestAnimationFrame(enforce);
+                });
+                state.observer.observe(root, { childList: true, subtree: true });
+                state.markedObserver = new MutationObserver(function() {
+                    if (state.active && window.__mozaicYTVideoActive) {
+                        scheduleEnforcement(1);
                     }
-                };
+                });
+                reobserveMarkedElements();
+            }
 
+            window.__mozaicStopYTExtraction = stopExtraction;
+
+            window.__mozaicExtractVideo = function() {
+                if (window.__mozaicYTExtraction && window.__mozaicYTExtraction.active) {
+                    stopExtraction();
+                }
+                ensureStyle();
+                const state = extractionState();
+                state.active = true;
                 window.__mozaicYTVideoActive = true;
-                requestAnimationFrame(enforce);
+                installObserver();
+                scheduleEnforcement(MAX_ENFORCEMENT_FRAMES);
                 return { success: true };
             };
 
@@ -312,7 +771,15 @@ extension YouTubeWatchWebView {
             (function() {
                 const video = document.querySelector('#movie_player video') || document.querySelector('video');
                 if (!video) { return 'no-video'; }
-                if (video.paused) { video.play(); return 'playing'; } else { video.pause(); return 'paused'; }
+                if (video.paused) {
+                    window.__mozaicNativePausePending = false;
+                    video.play();
+                    return 'playing';
+                } else {
+                    window.__mozaicNativePausePending = true;
+                    video.pause();
+                    return 'paused';
+                }
             })();
             """,
             completionHandler: nil
@@ -324,6 +791,7 @@ extension YouTubeWatchWebView {
         self.webView?.evaluateJavaScript(
             """
             (function() {
+                window.__mozaicNativePausePending = false;
                 const video = document.querySelector('#movie_player video') || document.querySelector('video');
                 if (video && video.paused) { video.play(); }
             })();
@@ -337,6 +805,7 @@ extension YouTubeWatchWebView {
         self.webView?.evaluateJavaScript(
             """
             (function() {
+                window.__mozaicNativePausePending = true;
                 const video = document.querySelector('#movie_player video') || document.querySelector('video');
                 if (video && !video.paused) { video.pause(); }
             })();
@@ -383,25 +852,7 @@ extension YouTubeWatchWebView {
 
     /// Fetches the caption tracks the player offers.
     func availableCaptionTracks() async -> [YouTubeCaptionTrack] {
-        let script = """
-        (function() {
-            try {
-                const player = document.getElementById('movie_player');
-                if (!player || typeof player.getOption !== 'function') { return '[]'; }
-                if (typeof player.loadModule === 'function') {
-                    try { player.loadModule('captions'); } catch (e) {}
-                }
-                const tracks = player.getOption('captions', 'tracklist') || [];
-                return JSON.stringify(tracks.map(function(track) {
-                    return {
-                        code: track.languageCode || '',
-                        name: track.displayName || track.languageName || track.languageCode || ''
-                    };
-                }));
-            } catch (e) { return '[]'; }
-        })();
-        """
-        guard let json = await self.evaluateForString(script),
+        guard let json = await self.evaluateForString(Self.availableCaptionTracksScript),
               let data = json.data(using: .utf8),
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: String]]
         else {
@@ -417,28 +868,117 @@ extension YouTubeWatchWebView {
         }
     }
 
-    /// Activates a caption track by language code, or turns captions off (nil).
+    /// Activates a caption track by preferred caption identifier (`vssId` when available, else language code), or turns captions off (nil).
     func setCaptionTrack(languageCode: String?) {
-        let script = if let languageCode {
-            """
+        self.webView?.evaluateJavaScript(Self.setCaptionTrackScript(languageCode: languageCode), completionHandler: nil)
+    }
+
+    static var availableCaptionTracksScript: String {
+        """
+        (function() {
+            try {
+                const player = document.getElementById('movie_player');
+                if (!player) { return '[]'; }
+                if (typeof player.loadModule === 'function') {
+                    try { player.loadModule('captions'); } catch (e) {}
+                }
+
+                function textFrom(value) {
+                    if (!value) { return ''; }
+                    if (typeof value === 'string') { return value; }
+                    if (value.simpleText) { return value.simpleText; }
+                    if (Array.isArray(value.runs)) {
+                        return value.runs.map(function(run) { return run.text || ''; }).join('');
+                    }
+                    return '';
+                }
+
+                function playerResponse() {
+                    if (typeof player.getPlayerResponse === 'function') {
+                        try {
+                            const response = player.getPlayerResponse();
+                            if (response) { return response; }
+                        } catch (e) {}
+                    }
+                    return window.ytInitialPlayerResponse || null;
+                }
+
+                function responseCaptionTracks() {
+                    const response = playerResponse();
+                    const renderer = response && response.captions && response.captions.playerCaptionsTracklistRenderer;
+                    return (renderer && renderer.captionTracks) || [];
+                }
+
+                let tracks = [];
+                if (typeof player.getOption === 'function') {
+                    try { tracks = player.getOption('captions', 'tracklist') || []; } catch (e) { tracks = []; }
+                }
+                if (!tracks.length) { tracks = responseCaptionTracks(); }
+
+                const seen = new Set();
+                return JSON.stringify(tracks.map(function(track) {
+                    const code = track.vssId || track.languageCode || '';
+                    const name = textFrom(track.displayName) || textFrom(track.name) || track.languageName || code;
+                    return { code: code, name: name };
+                }).filter(function(track) {
+                    if (!track.code || !track.name || seen.has(track.code)) { return false; }
+                    seen.add(track.code);
+                    return true;
+                }));
+            } catch (e) { return '[]'; }
+        })();
+        """
+    }
+
+    static func setCaptionTrackScript(languageCode: String?) -> String {
+        if let languageCode {
+            let codeLiteral = Self.jsStringLiteral(languageCode)
+            return """
             (function() {
                 const player = document.getElementById('movie_player');
                 if (!player) { return; }
+                const requested = \(codeLiteral);
+
+                function playerResponse() {
+                    if (typeof player.getPlayerResponse === 'function') {
+                        try {
+                            const response = player.getPlayerResponse();
+                            if (response) { return response; }
+                        } catch (e) {}
+                    }
+                    return window.ytInitialPlayerResponse || null;
+                }
+
+                function responseCaptionTracks() {
+                    const response = playerResponse();
+                    const renderer = response && response.captions && response.captions.playerCaptionsTracklistRenderer;
+                    return (renderer && renderer.captionTracks) || [];
+                }
+
+                let tracks = [];
+                if (typeof player.getOption === 'function') {
+                    try { tracks = player.getOption('captions', 'tracklist') || []; } catch (e) { tracks = []; }
+                }
+                if (!tracks.length) { tracks = responseCaptionTracks(); }
+                const selected = tracks.find(function(track) {
+                    return track && (track.vssId === requested || track.languageCode === requested);
+                }) || (requested.indexOf('.') !== -1 ? { vssId: requested } : { languageCode: requested });
+
                 try { player.loadModule('captions'); } catch (e) {}
-                try { player.setOption('captions', 'track', {languageCode: '\(languageCode)'}); } catch (e) {}
-            })();
-            """
-        } else {
-            """
-            (function() {
-                const player = document.getElementById('movie_player');
-                if (!player) { return; }
-                try { player.setOption('captions', 'track', {}); } catch (e) {}
-                try { player.unloadModule('captions'); } catch (e) {}
+                try { player.setOption('captions', 'track', selected); } catch (e) {
+                    try { player.setOption('captions', 'track', { languageCode: requested }); } catch (e2) {}
+                }
             })();
             """
         }
-        self.webView?.evaluateJavaScript(script, completionHandler: nil)
+        return """
+        (function() {
+            const player = document.getElementById('movie_player');
+            if (!player) { return; }
+            try { player.setOption('captions', 'track', {}); } catch (e) {}
+            try { player.unloadModule('captions'); } catch (e) {}
+        })();
+        """
     }
 
     /// The storyboard spec string for the current video, read from the player
@@ -492,7 +1032,7 @@ extension YouTubeWatchWebView {
                 const player = document.getElementById('movie_player');
                 if (!player || typeof player.getOption !== 'function') { return ''; }
                 const track = player.getOption('captions', 'track');
-                return (track && track.languageCode) || '';
+                return (track && (track.vssId || track.languageCode)) || '';
             } catch (e) { return ''; }
         })();
         """
@@ -550,8 +1090,10 @@ extension YouTubeWatchWebView {
     }
 
     /// Shows the system AirPlay picker for the watch page's video element.
-    func showAirPlayPicker() {
-        self.webView?.evaluateJavaScript(
+    func showAirPlayPicker(at screenPoint: CGPoint? = nil) {
+        guard let webView = self.webView else { return }
+        AirPlayPickerAnchor.preparePicker(in: webView, at: screenPoint)
+        webView.evaluateJavaScript(
             """
             (function() {
                 const video = document.querySelector('#movie_player video') || document.querySelector('video');
@@ -571,20 +1113,29 @@ extension YouTubeWatchWebView {
             """
             (function() {
                 window.__mozaicTargetVolume = \(clamped);
-                window.__mozaicIsSettingVolume = true;
+                if (typeof window.__mozaicApplyTargetVolumeToAllMedia === 'function') {
+                    window.__mozaicApplyTargetVolumeToAllMedia();
+                    return;
+                }
                 const video = document.querySelector('#movie_player video') || document.querySelector('video');
                 if (video) {
-                    video.volume = \(clamped);
-                    if (\(clamped) > 0 && video.muted) { video.muted = false; }
+                    if (\(clamped) <= 0) {
+                        video.muted = true;
+                        video.volume = 0;
+                    } else {
+                        video.volume = \(clamped);
+                        video.muted = false;
+                    }
                 }
                 const player = document.getElementById('movie_player');
                 if (player && typeof player.setVolume === 'function') {
                     player.setVolume(\(Int((clamped * 100).rounded())));
                 }
-                if (player && \(clamped) > 0 && typeof player.unMute === 'function') {
+                if (player && \(clamped) <= 0 && typeof player.mute === 'function') {
+                    try { player.mute(); } catch (e) {}
+                } else if (player && typeof player.unMute === 'function') {
                     try { player.unMute(); } catch (e) {}
                 }
-                setTimeout(function() { window.__mozaicIsSettingVolume = false; }, 100);
             })();
             """,
             completionHandler: nil

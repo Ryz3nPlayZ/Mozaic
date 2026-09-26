@@ -193,18 +193,9 @@ struct WhatsNewProviderTests {
         #expect(result == nil)
     }
 
-    @Test("Falls back to minor release version")
-    func minorReleaseFallback() {
+    @Test("Does not fall back to a different static app version")
+    func noStaticVersionFallback() {
         let store = WhatsNewVersionStore(defaults: self.defaults)
-        let result = WhatsNewProvider.staticWhatsNew(for: "1.0.2", store: store)
-        #expect(result != nil)
-        #expect(result?.version == "1.0.0")
-    }
-
-    @Test("Returns nil when minor release already presented")
-    func minorReleaseAlreadyPresented() {
-        let store = WhatsNewVersionStore(defaults: self.defaults)
-        store.markPresented("1.0.0")
         let result = WhatsNewProvider.staticWhatsNew(for: "1.0.2", store: store)
         #expect(result == nil)
     }
@@ -228,13 +219,33 @@ struct WhatsNewProviderTests {
         }
     }
 
+    @Test("Static fallback copy is not legacy onboarding or account-only copy")
+    func staticFallbackCopyIsNotLegacyOnboardingCopy() {
+        let disallowedTerms = [
+            "welcome",
+            "your library",
+            "liked songs",
+            "playlists",
+        ]
+
+        for entry in WhatsNewProvider.fallbackCollection {
+            let copy = ([entry.title] + entry.features.flatMap { [$0.title, $0.subtitle] })
+                .joined(separator: " ")
+                .lowercased()
+
+            for term in disallowedTerms {
+                #expect(!copy.contains(term), "Static fallback copy should not contain legacy onboarding/account-only term: \(term)")
+            }
+        }
+    }
+
     @Test("Can bypass presented-version gating for manual reopen")
     func bypassesPresentedVersionGating() async {
         let store = WhatsNewVersionStore(defaults: self.defaults)
         let session = MockURLProtocol.makeMockSession()
         store.markPresented("1.0.0")
 
-        MockURLProtocol.requestHandler = { request in
+        MockURLProtocol.setRequestHandler(for: session) { request in
             guard let url = request.url else {
                 throw URLError(.badURL)
             }
@@ -268,7 +279,7 @@ struct WhatsNewProviderTests {
             return (response, data)
         }
         defer {
-            MockURLProtocol.reset()
+            MockURLProtocol.reset(session: session)
         }
 
         let result = await WhatsNewProvider.fetchWhatsNew(
@@ -282,11 +293,216 @@ struct WhatsNewProviderTests {
         #expect(result?.releaseNotes == "Release notes")
     }
 
+    @Test("Does not substitute the latest release when exact notes are unavailable")
+    func doesNotSubstituteLatestRelease() async {
+        let session = MockURLProtocol.makeMockSession()
+
+        MockURLProtocol.setRequestHandler(for: session) { request in
+            guard let url = request.url else {
+                throw URLError(.badURL)
+            }
+
+            let body: [String: Any]
+            let statusCode: Int
+
+            switch url.path {
+            case "/repos/Ryz3nPlayZ/Mozaic/releases/latest":
+                body = [
+                    "tag_name": "v0.13.0",
+                    "name": "What's New in Mozaic 0.13.0",
+                    "body": "Latest release notes",
+                    "html_url": "https://github.com/Ryz3nPlayZ/Mozaic/releases/tag/v0.13.0",
+                ]
+                statusCode = 200
+            default:
+                body = [:]
+                statusCode = 404
+            }
+
+            let data = try JSONSerialization.data(withJSONObject: body)
+            guard let response = HTTPURLResponse(
+                url: url,
+                statusCode: statusCode,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            ) else {
+                throw URLError(.badServerResponse)
+            }
+
+            return (response, data)
+        }
+        defer {
+            MockURLProtocol.reset(session: session)
+        }
+
+        let result = await WhatsNewProvider.fetchWhatsNew(
+            for: "0.12.0",
+            store: WhatsNewVersionStore(defaults: self.defaults),
+            respectingPresentedVersions: false,
+            session: session
+        )
+
+        #expect(result == nil)
+    }
+
+    @Test("Does not substitute minor-release notes for a different patch version")
+    func doesNotSubstituteMinorRelease() async {
+        let session = MockURLProtocol.makeMockSession()
+
+        MockURLProtocol.setRequestHandler(for: session) { request in
+            guard let url = request.url else {
+                throw URLError(.badURL)
+            }
+
+            let body: [String: Any]
+            let statusCode: Int
+
+            if url.path == "/repos/Ryz3nPlayZ/Mozaic/releases/tags/v0.12.0" {
+                body = [
+                    "tag_name": "v0.12.0",
+                    "name": "What's New in Mozaic 0.12.0",
+                    "body": "Minor release notes",
+                    "html_url": "https://github.com/Ryz3nPlayZ/Mozaic/releases/tag/v0.12.0",
+                ]
+                statusCode = 200
+            } else {
+                body = [:]
+                statusCode = 404
+            }
+
+            let data = try JSONSerialization.data(withJSONObject: body)
+            guard let response = HTTPURLResponse(
+                url: url,
+                statusCode: statusCode,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            ) else {
+                throw URLError(.badServerResponse)
+            }
+
+            return (response, data)
+        }
+        defer {
+            MockURLProtocol.reset(session: session)
+        }
+
+        let result = await WhatsNewProvider.fetchWhatsNew(
+            for: "0.12.3",
+            store: WhatsNewVersionStore(defaults: self.defaults),
+            respectingPresentedVersions: false,
+            session: session
+        )
+
+        #expect(result == nil)
+    }
+
+    @Test("Rejects a release whose tag does not match the requested app version")
+    func rejectsMismatchedReleaseTag() async {
+        let session = MockURLProtocol.makeMockSession()
+
+        MockURLProtocol.setRequestHandler(for: session) { request in
+            guard let url = request.url else {
+                throw URLError(.badURL)
+            }
+
+            let body: [String: Any]
+            let statusCode: Int
+
+            if url.path == "/repos/Ryz3nPlayZ/Mozaic/releases/tags/v0.12.0" {
+                body = [
+                    "tag_name": "v0.13.0",
+                    "name": "What's New in Mozaic 0.13.0",
+                    "body": "Mismatched release notes",
+                    "html_url": "https://github.com/Ryz3nPlayZ/Mozaic/releases/tag/v0.13.0",
+                ]
+                statusCode = 200
+            } else {
+                body = [:]
+                statusCode = 404
+            }
+
+            let data = try JSONSerialization.data(withJSONObject: body)
+            guard let response = HTTPURLResponse(
+                url: url,
+                statusCode: statusCode,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            ) else {
+                throw URLError(.badServerResponse)
+            }
+
+            return (response, data)
+        }
+        defer {
+            MockURLProtocol.reset(session: session)
+        }
+
+        let result = await WhatsNewProvider.fetchWhatsNew(
+            for: "0.12.0",
+            store: WhatsNewVersionStore(defaults: self.defaults),
+            respectingPresentedVersions: false,
+            session: session
+        )
+
+        #expect(result == nil)
+    }
+
+    @Test("Fetches an exact short-form release tag")
+    func fetchesExactShortFormTag() async {
+        let session = MockURLProtocol.makeMockSession()
+
+        MockURLProtocol.setRequestHandler(for: session) { request in
+            guard let url = request.url else {
+                throw URLError(.badURL)
+            }
+
+            let body: [String: Any]
+            let statusCode: Int
+
+            if url.path == "/repos/Ryz3nPlayZ/Mozaic/releases/tags/v2.5" {
+                body = [
+                    "tag_name": "v2.5",
+                    "name": "What's New in Mozaic 2.5",
+                    "body": "Short-form release notes",
+                    "html_url": "https://github.com/Ryz3nPlayZ/Mozaic/releases/tag/v2.5",
+                ]
+                statusCode = 200
+            } else {
+                body = [:]
+                statusCode = 404
+            }
+
+            let data = try JSONSerialization.data(withJSONObject: body)
+            guard let response = HTTPURLResponse(
+                url: url,
+                statusCode: statusCode,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            ) else {
+                throw URLError(.badServerResponse)
+            }
+
+            return (response, data)
+        }
+        defer {
+            MockURLProtocol.reset(session: session)
+        }
+
+        let result = await WhatsNewProvider.fetchWhatsNew(
+            for: "2.5",
+            store: WhatsNewVersionStore(defaults: self.defaults),
+            session: session
+        )
+
+        #expect(result?.version == "2.5")
+        #expect(result?.releaseNotes == "Short-form release notes")
+    }
+
     @Test("Fetches the exact prerelease tag")
     func fetchesExactPrereleaseTag() async {
         let session = MockURLProtocol.makeMockSession()
 
-        MockURLProtocol.requestHandler = { request in
+        MockURLProtocol.setRequestHandler(for: session) { request in
             guard let url = request.url else {
                 throw URLError(.badURL)
             }
@@ -320,7 +536,7 @@ struct WhatsNewProviderTests {
             return (response, data)
         }
         defer {
-            MockURLProtocol.reset()
+            MockURLProtocol.reset(session: session)
         }
 
         let result = await WhatsNewProvider.fetchWhatsNew(
@@ -337,7 +553,7 @@ struct WhatsNewProviderTests {
     func extractsWhatsNewSectionFromCRLFReleaseNotes() async {
         let session = MockURLProtocol.makeMockSession()
 
-        MockURLProtocol.requestHandler = { request in
+        MockURLProtocol.setRequestHandler(for: session) { request in
             guard let url = request.url else {
                 throw URLError(.badURL)
             }
@@ -371,7 +587,7 @@ struct WhatsNewProviderTests {
             return (response, data)
         }
         defer {
-            MockURLProtocol.reset()
+            MockURLProtocol.reset(session: session)
         }
 
         let result = await WhatsNewProvider.fetchWhatsNew(
@@ -387,7 +603,7 @@ struct WhatsNewProviderTests {
     func preservesContentInsideWhatsNewSection() async {
         let session = MockURLProtocol.makeMockSession()
 
-        MockURLProtocol.requestHandler = { request in
+        MockURLProtocol.setRequestHandler(for: session) { request in
             guard let url = request.url else {
                 throw URLError(.badURL)
             }
@@ -440,7 +656,7 @@ struct WhatsNewProviderTests {
             return (response, data)
         }
         defer {
-            MockURLProtocol.reset()
+            MockURLProtocol.reset(session: session)
         }
 
         let result = await WhatsNewProvider.fetchWhatsNew(
@@ -463,7 +679,7 @@ struct WhatsNewProviderTests {
     func stripsHiddenWrapperSectionsWithoutWhatsNewHeading() async {
         let session = MockURLProtocol.makeMockSession()
 
-        MockURLProtocol.requestHandler = { request in
+        MockURLProtocol.setRequestHandler(for: session) { request in
             guard let url = request.url else {
                 throw URLError(.badURL)
             }
@@ -507,7 +723,7 @@ struct WhatsNewProviderTests {
             return (response, data)
         }
         defer {
-            MockURLProtocol.reset()
+            MockURLProtocol.reset(session: session)
         }
 
         let result = await WhatsNewProvider.fetchWhatsNew(

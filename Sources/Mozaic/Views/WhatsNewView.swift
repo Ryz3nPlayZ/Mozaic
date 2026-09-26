@@ -135,7 +135,7 @@ struct WhatsNewView: View {
                 Button {
                     NSWorkspace.shared.open(url)
                 } label: {
-                    Label("Learn more", systemImage: "arrow.up.right")
+                    Label(String(localized: "Learn more"), systemImage: "arrow.up.right")
                         .font(.subheadline.weight(.semibold))
                 }
                 .buttonStyle(.plain)
@@ -147,7 +147,7 @@ struct WhatsNewView: View {
             Button {
                 self.onDismiss()
             } label: {
-                Text("Continue")
+                Text(String(localized: "Continue"))
                     .font(.headline)
                     .frame(minWidth: 160)
             }
@@ -256,7 +256,9 @@ private struct MarkdownContentView: View {
                     codeLines.append(lines[i])
                     i += 1
                 }
-                if i < lines.count { i += 1 } // skip closing ```
+                if i < lines.count {
+                    i += 1
+                } // skip closing ```
                 let code = codeLines.joined(separator: "\n")
                 result.append(AnyView(Self.codeBlock(code)))
             } else {

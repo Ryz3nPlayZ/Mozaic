@@ -5,10 +5,22 @@ import SwiftUI
 /// Detail view for an artist showing their songs and albums.
 struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
     let artist: Artist
+    var playerBarNavigationAction: PlayerBarNavigationAction = .disabled
     @State var viewModel: ArtistDetailViewModel
     @Environment(PlayerService.self) private var playerService
+    @Environment(AuthService.self) private var authService
     @Environment(FavoritesManager.self) private var favoritesManager
     @Environment(SongLikeStatusManager.self) private var likeStatusManager
+
+    init(
+        artist: Artist,
+        viewModel: ArtistDetailViewModel,
+        playerBarNavigationAction: PlayerBarNavigationAction = .disabled
+    ) {
+        self.artist = artist
+        self.playerBarNavigationAction = playerBarNavigationAction
+        _viewModel = State(initialValue: viewModel)
+    }
 
     var body: some View {
         Group {
@@ -35,6 +47,8 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if case .error = self.viewModel.loadingState {} else {
                 PlayerBar()
+                    .environment(\.playerBarNavigationAction, self.playerBarNavigationAction)
+                    .environment(\.playerBarCurrentArtistID, self.artist.id)
             }
         }
         .task {
@@ -124,10 +138,10 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
     private func headerView(_ detail: ArtistDetail) -> some View {
         HStack(alignment: .top, spacing: 20) {
             // Thumbnail
-            CachedAsyncImage(url: detail.thumbnailURL?.highQualityThumbnailURL) { image in
+            CachedAsyncImage(url: detail.thumbnailURL?.highQualityThumbnailURL, targetSize: CGSize(width: 180, height: 180)) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             } placeholder: {
                 Rectangle()
                     .fill(.quaternary)
@@ -172,11 +186,12 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
                     if detail.profileKind == .artist {
                         // Shuffle button - shuffles all artist's songs (fetches if needed)
                         Button {
+                            let intent = self.playerService.beginMusicPlaybackIntent()
                             Task {
-                                await self.shuffleAllSongs()
+                                await self.shuffleAllSongs(intent: intent)
                             }
                         } label: {
-                            Label("Shuffle", systemImage: "shuffle")
+                            Label(String(localized: "Shuffle"), systemImage: "shuffle")
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.large)
@@ -191,14 +206,14 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
                         Button {
                             self.playMix(playlistId: mixPlaylistId, startVideoId: nil)
                         } label: {
-                            Label("Mix", systemImage: "play.circle")
+                            Label(String(localized: "Mix"), systemImage: "play.circle")
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.large)
                     }
 
                     // Subscribe button
-                    if detail.channelId != nil {
+                    if detail.channelId != nil, self.hasPersonalAccount {
                         self.subscribeButton(detail)
                     }
                 }
@@ -291,7 +306,7 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
                         songsBrowseId: detail.songsBrowseId,
                         songsParams: detail.songsParams
                     )) {
-                        Text("See all")
+                        Text(String(localized: "See all"))
                             .font(.subheadline)
                     }
                     .buttonStyle(.plain)
@@ -316,13 +331,7 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
     private func topSongRow(_ song: Song, index: Int) -> some View {
         HoverObservingRow { isHovered in
             Button {
-                // Fetch all songs and play as queue starting from the selected song
-                Task {
-                    let allSongs = await self.viewModel.getAllSongs()
-                    // Find the index of the selected song in the full list
-                    let startIndex = allSongs.firstIndex(where: { $0.videoId == song.videoId }) ?? index
-                    await self.playerService.playQueue(allSongs, startingAt: startIndex)
-                }
+                self.playTopSong(song, displayedIndex: index)
             } label: {
                 HStack(spacing: 12) {
                     // Thumbnail
@@ -355,12 +364,12 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
                             .lineLimit(1)
                             .frame(width: 150, alignment: .leading)
                     } else {
-                        Text("")
+                        Text(String(localized: ""))
                             .frame(width: 150, alignment: .leading)
                     }
 
                     // Favorite toggle
-                    LikeButton(song: song, isRowHovered: isHovered)
+                    LikeButton(song: song, isRowHovered: isHovered, allowsActions: self.hasPersonalAccount)
 
                     // Duration
                     Text(song.durationDisplay)
@@ -376,33 +385,37 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
         }
         .contextMenu {
             Button {
-                Task {
-                    let allSongs = await self.viewModel.getAllSongs()
-                    let startIndex = allSongs.firstIndex(where: { $0.videoId == song.videoId }) ?? index
-                    await self.playerService.playQueue(allSongs, startingAt: startIndex)
-                }
+                self.playTopSong(song, displayedIndex: index)
             } label: {
-                Label("Play", systemImage: "play.fill")
+                Label(String(localized: "Play"), systemImage: "play.fill")
             }
 
-            Divider()
+            if self.authService.hasPersonalAccount {
+                Divider()
 
-            FavoritesContextMenu.menuItem(for: song, manager: self.favoritesManager)
+                FavoritesContextMenu.menuItem(for: song, manager: self.favoritesManager)
 
-            Divider()
+                Divider()
 
-            LikeDislikeContextMenu(song: song, likeStatusManager: self.likeStatusManager)
+                LikeDislikeContextMenu(song: song, likeStatusManager: self.likeStatusManager)
+            }
 
             Divider()
 
             StartRadioContextMenu.menuItem(for: song, playerService: self.playerService)
 
-            Divider()
+            if self.authService.hasPersonalAccount {
+                Divider()
 
-            Button {
-                SongActionsHelper.addToLibrary(song, playerService: self.playerService)
-            } label: {
-                Label("Add to Library", systemImage: "plus.circle")
+                Button {
+                    SongActionsHelper.addToLibrary(song, playerService: self.playerService)
+                } label: {
+                    Label(String(localized: "Add to Library"), systemImage: "plus.circle")
+                }
+
+                Divider()
+
+                AddToPlaylistContextMenu(song: song, client: self.viewModel.client)
             }
 
             Divider()
@@ -412,10 +425,6 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
             Divider()
 
             AddToQueueContextMenu(song: song, playerService: self.playerService)
-
-            Divider()
-
-            AddToPlaylistContextMenu(song: song, client: self.viewModel.client)
 
             // Go to Album - show if album has valid browse ID
             if let album = song.album, album.hasNavigableId {
@@ -430,9 +439,36 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
                     author: Artist.inline(name: album.artistsDisplay, namespace: "album-artist")
                 )
                 NavigationLink(value: playlist) {
-                    Label("Go to Album", systemImage: "square.stack")
+                    Label(String(localized: "Go to Album"), systemImage: "square.stack")
                 }
             }
+        }
+    }
+
+    private func playTopSong(_ song: Song, displayedIndex: Int) {
+        let intent = self.playerService.beginMusicPlaybackIntent()
+        let exactOrdinal = self.viewModel.displayedSongs
+            .prefix(displayedIndex)
+            .count(where: { $0.id == song.id && $0.videoId == song.videoId })
+        let videoOrdinal = self.viewModel.displayedSongs
+            .prefix(displayedIndex)
+            .count(where: { $0.videoId == song.videoId })
+        Task {
+            let allSongs = await self.viewModel.getAllSongs()
+            guard self.playerService.acceptsMusicPlaybackIntent(intent) else { return }
+            let exactMatches = allSongs.indices.filter {
+                allSongs[$0].id == song.id && allSongs[$0].videoId == song.videoId
+            }
+            let videoMatches = allSongs.indices.filter { allSongs[$0].videoId == song.videoId }
+            let startIndex = exactMatches[safe: exactOrdinal]
+                ?? videoMatches[safe: videoOrdinal]
+                ?? (allSongs.indices.contains(displayedIndex) ? displayedIndex : 0)
+            await self.playerService.playQueue(
+                allSongs,
+                startingAt: startIndex,
+                deferringSmartShuffleFill: false,
+                intent: intent
+            )
         }
     }
 
@@ -499,10 +535,10 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
     private func albumCard(_ album: Album) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             // Thumbnail
-            CachedAsyncImage(url: album.thumbnailURL?.highQualityThumbnailURL) { image in
+            CachedAsyncImage(url: album.thumbnailURL?.highQualityThumbnailURL, targetSize: CGSize(width: 140, height: 140)) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             } placeholder: {
                 Rectangle()
                     .fill(.quaternary)
@@ -534,10 +570,10 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
 
     private func playlistCard(_ playlist: Playlist) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            CachedAsyncImage(url: playlist.thumbnailURL?.highQualityThumbnailURL) { image in
+            CachedAsyncImage(url: playlist.thumbnailURL?.highQualityThumbnailURL, targetSize: CGSize(width: 140, height: 140)) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             } placeholder: {
                 Rectangle()
                     .fill(.quaternary)
@@ -573,10 +609,10 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
 
     private func artistCard(_ artist: Artist) -> some View {
         VStack(alignment: .center, spacing: 8) {
-            CachedAsyncImage(url: artist.thumbnailURL?.highQualityThumbnailURL) { image in
+            CachedAsyncImage(url: artist.thumbnailURL?.highQualityThumbnailURL, targetSize: CGSize(width: 140, height: 140)) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             } placeholder: {
                 Rectangle()
                     .fill(.quaternary)
@@ -609,24 +645,42 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
     // MARK: - Actions
 
     private func playMix(playlistId: String, startVideoId: String?) {
+        let intent = self.playerService.beginMusicPlaybackIntent()
         Task {
-            await self.playerService.playWithMix(playlistId: playlistId, startVideoId: startVideoId)
+            await self.playerService.playWithMix(
+                playlistId: playlistId,
+                startVideoId: startVideoId,
+                intent: intent
+            )
         }
     }
 
     private func playAll(_ songs: [Song]) {
         guard !songs.isEmpty else { return }
+        let intent = self.playerService.beginMusicPlaybackIntent()
         Task {
-            await self.playerService.playQueue(songs, startingAt: 0)
+            await self.playerService.playQueue(
+                songs,
+                startingAt: 0,
+                deferringSmartShuffleFill: false,
+                intent: intent
+            )
         }
     }
 
     /// Fetches all artist songs and plays them shuffled.
-    private func shuffleAllSongs() async {
+    private func shuffleAllSongs(intent: MusicPlaybackIntent) async {
         let allSongs = await self.viewModel.getAllSongs()
-        guard !allSongs.isEmpty else { return }
+        guard !allSongs.isEmpty,
+              self.playerService.acceptsMusicPlaybackIntent(intent)
+        else { return }
         let shuffledSongs = allSongs.shuffled()
-        await self.playerService.playQueue(shuffledSongs, startingAt: 0)
+        await self.playerService.playQueue(
+            shuffledSongs,
+            startingAt: 0,
+            deferringSmartShuffleFill: false,
+            intent: intent
+        )
     }
 
     // MARK: - Episodes Section (Latest episodes / live radios)
@@ -640,8 +694,9 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
             self.sectionHeader(title: "Latest episodes", shelfKind: .episodes)
         } itemContent: { episode in
             Button {
+                let intent = self.playerService.beginMusicPlaybackIntent()
                 Task {
-                    await self.playerService.playEpisode(episode)
+                    await self.playerService.playEpisode(episode, intent: intent)
                 }
             } label: {
                 self.episodeCard(episode)
@@ -653,10 +708,10 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
     private func episodeCard(_ episode: ArtistEpisode) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .topLeading) {
-                CachedAsyncImage(url: episode.thumbnailURL?.highQualityThumbnailURL) { image in
+                CachedAsyncImage(url: episode.thumbnailURL?.highQualityThumbnailURL, targetSize: CGSize(width: 220, height: 124)) { image in
                     image
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
+                        .scaledToFill()
                 } placeholder: {
                     Rectangle()
                         .fill(.quaternary)
@@ -730,10 +785,10 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
         } itemContent: { playlist in
             NavigationLink(value: playlist) {
                 VStack(alignment: .leading, spacing: 8) {
-                    CachedAsyncImage(url: playlist.thumbnailURL?.highQualityThumbnailURL) { image in
+                    CachedAsyncImage(url: playlist.thumbnailURL?.highQualityThumbnailURL, targetSize: CGSize(width: 140, height: 140)) { image in
                         image
                             .resizable()
-                            .aspectRatio(contentMode: .fill)
+                            .scaledToFill()
                     } placeholder: {
                         Rectangle()
                             .fill(.quaternary)
@@ -776,10 +831,10 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
 
     private func podcastCard(_ show: PodcastShow) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            CachedAsyncImage(url: show.thumbnailURL?.highQualityThumbnailURL) { image in
+            CachedAsyncImage(url: show.thumbnailURL?.highQualityThumbnailURL, targetSize: CGSize(width: 140, height: 140)) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             } placeholder: {
                 Rectangle()
                     .fill(.quaternary)
@@ -819,10 +874,10 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
 
     private func relatedArtistCard(_ artist: Artist) -> some View {
         VStack(alignment: .center, spacing: 8) {
-            CachedAsyncImage(url: artist.thumbnailURL?.highQualityThumbnailURL) { image in
+            CachedAsyncImage(url: artist.thumbnailURL?.highQualityThumbnailURL, targetSize: CGSize(width: 120, height: 120)) { image in
                 image
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .scaledToFill()
             } placeholder: {
                 Rectangle()
                     .fill(.quaternary)
@@ -850,6 +905,10 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
             || lowercasedTitle.hasPrefix("ep")
             ? .singles
             : .albums
+    }
+
+    private var hasPersonalAccount: Bool {
+        self.authService.hasPersonalAccount
     }
 
     // MARK: - Section Header with Optional See-all
@@ -889,7 +948,7 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
                 trackCount: nil,
                 author: Artist.inline(name: artistName, namespace: "playlist-author")
             )) {
-                Text("See all").font(.subheadline)
+                Text(String(localized: "See all")).font(.subheadline)
             }
             .buttonStyle(.plain)
             .foregroundStyle(Color.accentColor)
@@ -899,7 +958,7 @@ struct ArtistDetailView: View { // swiftlint:disable:this type_body_length
                 sectionTitle: sectionTitle,
                 endpoint: more
             )) {
-                Text("See all").font(.subheadline)
+                Text(String(localized: "See all")).font(.subheadline)
             }
             .buttonStyle(.plain)
             .foregroundStyle(Color.accentColor)

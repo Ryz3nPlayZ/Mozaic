@@ -51,10 +51,16 @@ struct HistoryView: View {
                     .disabled(self.isRefreshing)
                 }
             }
-            .navigationDestinations(client: self.viewModel.client)
+            .navigationDestinations(
+                client: self.viewModel.client,
+                playerBarNavigationAction: self.playerBarNavigationAction
+            )
+            .playerBarMusicNavigation(path: self.$navigationPath)
         }
+        .playerBarMusicNavigation(path: self.$navigationPath)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             PlayerBar()
+                .playerBarMusicNavigation(path: self.$navigationPath)
         }
         .task {
             if self.viewModel.loadingState == .idle {
@@ -71,6 +77,14 @@ struct HistoryView: View {
         .refreshable {
             await self.performRefresh()
         }
+        .popsNavigationStackOnSidebarReselect(path: self.$navigationPath, for: .history)
+    }
+
+    private var playerBarNavigationAction: PlayerBarNavigationAction {
+        PlayerBarNavigationAction(
+            openArtist: { self.navigationPath.append($0) },
+            openAlbum: { self.navigationPath.append($0) }
+        )
     }
 
     /// Refreshes with visual feedback: spinning icon → data swap.
@@ -133,7 +147,9 @@ struct HistoryView: View {
                         .padding(.bottom, 8)
 
                     let songs = section.items.compactMap { item -> Song? in
-                        if case let .song(song) = item { return song }
+                        if case let .song(song) = item {
+                            return song
+                        }
                         return nil
                     }
 
@@ -144,6 +160,18 @@ struct HistoryView: View {
                             Divider()
                                 .padding(.leading, 72)
                         }
+                    }
+                }
+
+                if self.viewModel.hasMoreSections || self.viewModel.loadingState == .loadingMore {
+                    LoadMoreFooter(
+                        isLoading: self.viewModel.loadingState == .loadingMore || self.viewModel.isRefreshingHistory,
+                        title: "Load More History",
+                        loadingTitle: "Loading more history...",
+                        autoLoad: true,
+                        autoLoadTrigger: self.viewModel.sections.count
+                    ) {
+                        await self.viewModel.loadMore()
                     }
                 }
             }

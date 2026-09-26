@@ -98,9 +98,11 @@ enum SongMetadataParser {
         else { return artists }
 
         for run in runs {
-            guard let text = run["text"] as? String,
-                  text != " • ", text != " & ", text != ", ", text != " · "
-            else { continue }
+            guard let text = run["text"] as? String else { continue }
+            if text == " • " || text == " · " {
+                break
+            }
+            guard text != " & ", text != ", " else { continue }
 
             let artistId: String = if let navEndpoint = run["navigationEndpoint"] as? [String: Any],
                                       let browseEndpoint = navEndpoint["browseEndpoint"] as? [String: Any],
@@ -181,10 +183,14 @@ enum SongMetadataParser {
 
         switch iconType {
         case "LIBRARY_ADD", "BOOKMARK_BORDER":
-            if let token { result.feedbackTokens = FeedbackTokens(add: token, remove: nil) }
+            if let token {
+                result.feedbackTokens = FeedbackTokens(add: token, remove: nil)
+            }
         case "LIBRARY_REMOVE", "BOOKMARK":
             result.isInLibrary = true
-            if let token { result.feedbackTokens = FeedbackTokens(add: nil, remove: token) }
+            if let token {
+                result.feedbackTokens = FeedbackTokens(add: nil, remove: token)
+            }
         default:
             break
         }

@@ -9,6 +9,9 @@ import Foundation
 /// (songs, albums, artists). Enables dependency injection and mocking.
 @MainActor
 protocol YouTubeClientProtocol: Sendable {
+    /// Clears client-held pagination/session state when auth/account mode changes.
+    func resetSessionStateForAccountSwitch()
+
     // MARK: Home feed
 
     /// Fetches the recommended home feed (`FEwhat_to_watch`).
@@ -18,7 +21,8 @@ protocol YouTubeClientProtocol: Sendable {
     /// single `FEwhat_to_watch` request, parsed off the main actor. Preferred
     /// over calling `getHomeFeed`/`getHomeChips`/`getHomeShelves` separately:
     /// the ~2 MB response is fetched and walked once instead of three times.
-    func getHomeBundle() async throws -> YouTubeHomeBundle
+    /// A forced refresh bypasses and replaces the scoped Home cache.
+    func getHomeBundle(forceRefresh: Bool) async throws -> YouTubeHomeBundle
 
     /// Fetches the next page of the home feed, or `nil` when exhausted.
     func getHomeFeedContinuation() async throws -> YouTubeFeed?
@@ -36,7 +40,7 @@ protocol YouTubeClientProtocol: Sendable {
 
     /// Browses a home filter chip's continuation token into a personalized,
     /// topic-filtered feed for a home rail.
-    func getHomeTopicFeed(continuation: String) async throws -> YouTubeFeed
+    func getHomeTopicFeed(continuation: String, forceRefresh: Bool) async throws -> YouTubeFeed
 
     // MARK: Search
 
@@ -46,10 +50,38 @@ protocol YouTubeClientProtocol: Sendable {
     /// Fetches the next page of the current search, or `nil` when exhausted.
     func getSearchContinuation() async throws -> YouTubeSearchResponse?
 
+    /// Fetches the next page for an explicit search continuation token.
+    func getSearchContinuation(continuation: String) async throws -> YouTubeSearchResponse?
+
     // MARK: Watch
 
     /// Fetches watch-page companion data (metadata + related videos).
     func getWatchNext(videoId: String) async throws -> WatchNextData
+
+    /// Fetches normal watch data and an optional Ask Gemini bootstrap from one
+    /// shared `next` response.
+    func getWatchPage(videoId: String) async throws -> YouTubeWatchPage
+
+    /// Lazily materializes an Ask panel, or promotes direct bootstrap chips into
+    /// a conversation without generating an answer.
+    func loadAskConversation(
+        from bootstrap: YouTubeAskBootstrap
+    ) async throws -> YouTubeAskConversation
+
+    /// Submits exactly one server-issued suggestion in the current conversation.
+    func continueAskConversation(
+        _ conversation: YouTubeAskConversation,
+        selecting suggestionID: YouTubeAskSuggestion.ID
+    ) async throws -> YouTubeAskConversation
+
+    /// Submits one validated free-text prompt using the current watch-scoped
+    /// server command. A validated composer command may be reused only after
+    /// each successful response advances the bound conversation revision.
+    func continueAskConversation(
+        _ conversation: YouTubeAskConversation,
+        submitting userInputText: String,
+        playerOffsetMilliseconds: Int64
+    ) async throws -> YouTubeAskConversation
 
     /// Fetches a page of comments by continuation token.
     func getComments(continuation: String) async throws -> YouTubeCommentsPage
@@ -74,8 +106,11 @@ protocol YouTubeClientProtocol: Sendable {
     /// Fetches Shorts for the dedicated Shorts surface.
     func getShorts() async throws -> [YouTubeVideo]
 
-    /// Fetches the next page of any browse feed by continuation token.
+    /// Fetches the next page of any public browse feed by continuation token.
     func getFeedContinuation(continuation: String) async throws -> YouTubeFeed
+
+    /// Fetches the next page of an account-scoped browse feed by continuation token.
+    func getPrivateFeedContinuation(continuation: String) async throws -> YouTubeFeed
 
     // MARK: Subscriptions & Library
 

@@ -4,6 +4,7 @@ import SwiftUI
 struct TopSongsView: View {
     @State var viewModel: TopSongsViewModel
     @Environment(PlayerService.self) private var playerService
+    @Environment(AuthService.self) private var authService
     @Environment(FavoritesManager.self) private var favoritesManager
     @Environment(SongLikeStatusManager.self) private var likeStatusManager
 
@@ -114,7 +115,7 @@ struct TopSongsView: View {
                     }
 
                     // Favorite toggle
-                    LikeButton(song: song, isRowHovered: isHovered)
+                    LikeButton(song: song, isRowHovered: isHovered, allowsActions: self.authService.hasPersonalAccount)
 
                     // Duration
                     Text(song.durationDisplay)
@@ -132,27 +133,31 @@ struct TopSongsView: View {
             Button {
                 self.playSongInQueue(startingAt: index)
             } label: {
-                Label("Play", systemImage: "play.fill")
+                Label(String(localized: "Play"), systemImage: "play.fill")
             }
 
             Divider()
 
             FavoritesContextMenu.menuItem(for: song, manager: self.favoritesManager)
 
-            Divider()
+            if self.authService.hasPersonalAccount {
+                Divider()
 
-            LikeDislikeContextMenu(song: song, likeStatusManager: self.likeStatusManager)
+                LikeDislikeContextMenu(song: song, likeStatusManager: self.likeStatusManager)
+            }
 
             Divider()
 
             StartRadioContextMenu.menuItem(for: song, playerService: self.playerService)
 
-            Divider()
+            if self.authService.hasPersonalAccount {
+                Divider()
 
-            Button {
-                SongActionsHelper.addToLibrary(song, playerService: self.playerService)
-            } label: {
-                Label("Add to Library", systemImage: "plus.circle")
+                Button {
+                    SongActionsHelper.addToLibrary(song, playerService: self.playerService)
+                } label: {
+                    Label(String(localized: "Add to Library"), systemImage: "plus.circle")
+                }
             }
 
             Divider()
@@ -165,14 +170,16 @@ struct TopSongsView: View {
 
             Divider()
 
-            AddToPlaylistContextMenu(song: song, client: self.viewModel.client)
+            if self.authService.hasPersonalAccount {
+                AddToPlaylistContextMenu(song: song, client: self.viewModel.client)
+            }
 
             Divider()
 
             // Go to Artist - show first artist with valid ID
             if let artist = song.artists.first(where: { $0.hasNavigableId }) {
                 NavigationLink(value: artist) {
-                    Label("Go to Artist", systemImage: "person")
+                    Label(String(localized: "Go to Artist"), systemImage: "person")
                 }
             }
 
@@ -187,7 +194,7 @@ struct TopSongsView: View {
                     author: Artist.inline(name: album.artistsDisplay, namespace: "album-artist")
                 )
                 NavigationLink(value: playlist) {
-                    Label("Go to Album", systemImage: "square.stack")
+                    Label(String(localized: "Go to Album"), systemImage: "square.stack")
                 }
             }
         }
@@ -225,5 +232,6 @@ struct TopSongsView: View {
     let client = YTMusicClient(authService: authService, webKitManager: .shared)
     TopSongsView(viewModel: TopSongsViewModel(destination: destination, client: client))
         .environment(PlayerService())
+        .environment(authService)
         .environment(FavoritesManager.shared)
 }

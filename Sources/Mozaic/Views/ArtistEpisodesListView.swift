@@ -64,10 +64,10 @@ struct ArtistEpisodesListView: View {
             Task { await self.playerService.playEpisode(episode) }
         } label: {
             HStack(alignment: .top, spacing: 12) {
-                CachedAsyncImage(url: episode.thumbnailURL?.highQualityThumbnailURL) { image in
+                CachedAsyncImage(url: episode.thumbnailURL?.highQualityThumbnailURL, targetSize: CGSize(width: 160, height: 90)) { image in
                     image
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
+                        .scaledToFill()
                 } placeholder: {
                     Rectangle()
                         .fill(.quaternary)

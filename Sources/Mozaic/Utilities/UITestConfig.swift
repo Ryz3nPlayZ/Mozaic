@@ -8,7 +8,7 @@ enum UITestConfig {
     /// When present, app runs in UI test mode with mock services.
     static let uiTestModeArgument = "-UITestMode"
 
-    /// When present, skip onboarding and assume logged in.
+    /// When present, skip auth and assume logged in.
     static let skipAuthArgument = "-SkipAuth"
 
     // MARK: - Environment Keys
@@ -45,6 +45,9 @@ enum UITestConfig {
 
     /// When true, force logged-out state in UI tests.
     static let mockLoggedOutKey = "MOCK_LOGGED_OUT"
+
+    /// When true, expose synthetic Ask Gemini eligibility on watch pages.
+    static let mockAskGeminiEnabledKey = "MOCK_ASK_GEMINI_ENABLED"
 
     /// When true, the mock client returns HTTP 404 from `getPodcasts()`
     /// to simulate a region where YouTube Music does not offer the

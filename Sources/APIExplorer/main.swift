@@ -11,29 +11,53 @@
 //
 //  Commands:
 //    browse <browseId> [params]    - Explore a browse endpoint
-//    action <endpoint> <body>      - Explore an action endpoint (body as JSON)
-//    continuation <token> [ep]     - Explore a continuation (ep: browse or next)
+//    action <endpoint> <body>      - Explore a JSON action endpoint (body as JSON)
+//    wire-action <endpoint> <body> - Safely inspect JSON, streaming, or opaque responses
+//    discover <endpoint> <body>    - Inspect and follow read-only navigation, with values redacted
+//    ask-video-audit <videoId>     - Audit YouTube Ask Gemini / YouChat API surfaces
+//    ask-video-parity <videoId>    - Compare read-only Ask request profiles
+//    ask-video-live-test <videoId> - Replay server-issued summary/follow-up suggestions
+//    ask-video-free-text-test <videoId>
+//                                  - Guarded one-shot free-text validation
+//    search-audit <query>          - Audit live YouTube Music search shapes and filters
+//    continuation <token> [ep]     - Explore a continuation (ep: browse, search, or next)
+//    analyze-file <path>           - Safely summarize a saved JSON response
 //    list                          - List all known endpoints
 //    auth                          - Check authentication status
 //    help                          - Show this help message
 //
 //  Options:
-//    -v, --verbose                 - Show full raw JSON response (not truncated)
-//    -o, --output <file>           - Save raw JSON response to a file
+//    -v, --verbose                 - Show raw JSON or expand audits; discover/queue-probe stay redacted
+//    -o, --output <file>           - Save mode-0600 output; discover/queue-probe stay redacted
+//    --client-version <version>    - Override the resolved InnerTube client version
+//    --confirm-live-ai             - Required acknowledgement for live AI requests
+//    --prompt-file <path|->         - Read a private free-text prompt from a mode-0600 file or stdin
+//    --fresh-chats N               - Run 1-3 independent summary chats
+//    --follow-up                   - Replay one server-issued follow-up suggestion
 //    --youtube, --yt               - Target regular YouTube (www.youtube.com, WEB client)
 //                                    instead of YouTube Music
+//    --ios-music, --android-music  - Use a mobile Music request profile with discover
+//    --mobile-web-key             - Add the resolved web API key to mobile discovery
+//    --mobile-cookie-only         - Omit the authorization header for mobile comparison
+//    --mobile-token-file <path>   - Read a mobile OAuth access token from a private file
+//    --no-auth, --guest            - Force unauthenticated requests even if Mozaic cookies exist
+//    --follow <index>              - Follow a discover navigation entry; repeat for deeper pages
 //
 //  Examples:
 //    swift run api-explorer browse FEmusic_home
 //    swift run api-explorer browse FEmusic_charts
 //    swift run api-explorer browse FEmusic_liked_playlists   # Requires auth
 //    swift run api-explorer action search '{"query":"never gonna give you up"}'
+//    swift run api-explorer ask-video-parity <VIDEO_ID>
+//    swift run api-explorer ask-video-live-test <VIDEO_ID> --confirm-live-ai --follow-up
+//    swift run api-explorer ask-video-free-text-test <VIDEO_ID> --confirm-live-ai --prompt-file -
 //    swift run api-explorer continuation <token> next        # Mix queue continuation
 //    swift run api-explorer auth
 //    swift run api-explorer list
 //
 
 import CommonCrypto
+import Darwin
 import Dispatch
 import Foundation
 
@@ -50,6 +74,8 @@ let origin = "https://music.youtube.com"
 /// instead of YouTube Music (music.youtube.com, WEB_REMIX client). Set via --youtube.
 nonisolated(unsafe) var youtubeMode = false
 nonisolated(unsafe) var cachedClientVersion: String?
+nonisolated(unsafe) var clientVersionWasForced = false
+nonisolated(unsafe) var forceUnauthenticatedRequests = false
 
 // Active request configuration. Defaults to YouTube Music (the constants
 // above); --youtube switches everything to regular YouTube.
@@ -73,67 +99,301 @@ func activateYouTubeMode() {
 
 /// Global auth user index (0 = primary account, 1+ = brand accounts)
 nonisolated(unsafe) var globalAuthUserIndex = 0
+nonisolated(unsafe) var authUserOptionWasSpecified = false
 
 /// Global brand account ID (21-digit number from myaccount.google.com/brandaccounts)
 nonisolated(unsafe) var globalBrandAccountId: String?
 
-// MARK: - Cookie Management
+/// Language code sent as the InnerTube `hl` client parameter.
+///
+/// Overridable with `--hl` so response localization can be probed directly —
+/// InnerTube accepts both Apple's script identifiers (`zh-Hans`/`zh-Hant`) and
+/// common region aliases (`zh-CN`/`zh-TW`), so either form can be compared
+/// against real responses.
+nonisolated(unsafe) var globalHl = "en"
 
-/// Reads cookies from Mozaic app's backup file in Application Support.
-/// This allows the standalone tool to make authenticated API requests.
-func loadCookiesFromAppBackup() -> [HTTPCookie]? {
-    guard let appSupport = FileManager.default.urls(
-        for: .applicationSupportDirectory,
-        in: .userDomainMask
-    ).first
-    else {
-        return nil
+private func effectivePort(for url: URL) -> Int? {
+    if let port = url.port {
+        return port
+    }
+    switch url.scheme?.lowercased() {
+    case "https": return 443
+    case "http": return 80
+    default: return nil
+    }
+}
+
+// MARK: - BoundedResponseDataDelegate
+
+private final class BoundedResponseDataDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let scheme: String?
+    private let host: String?
+    private let port: Int?
+    private let maximumBytes: Int
+    private let lock = NSLock()
+
+    private var continuation: CheckedContinuation<(Data, URLResponse), any Error>?
+    private var session: URLSession?
+    private var task: URLSessionDataTask?
+    private var response: URLResponse?
+    private var responseData = Data()
+    private var isFinished = false
+    private var cancellationRequested = false
+
+    init(originURL: URL, maximumBytes: Int) {
+        self.scheme = originURL.scheme?.lowercased()
+        self.host = originURL.host?.lowercased()
+        self.port = effectivePort(for: originURL)
+        self.maximumBytes = maximumBytes
     }
 
-    let cookieFile =
+    func load(
+        configuration: URLSessionConfiguration,
+        request: URLRequest
+    ) async throws -> (Data, URLResponse) {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let session = URLSession(
+                    configuration: configuration,
+                    delegate: self,
+                    delegateQueue: nil
+                )
+                let task = session.dataTask(with: request)
+
+                self.lock.lock()
+                if self.cancellationRequested {
+                    self.isFinished = true
+                    self.lock.unlock()
+                    session.invalidateAndCancel()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                self.continuation = continuation
+                self.session = session
+                self.task = task
+                self.lock.unlock()
+
+                task.resume()
+            }
+        } onCancel: {
+            self.cancel()
+        }
+    }
+
+    func urlSession(
+        _: URLSession,
+        task _: URLSessionTask,
+        willPerformHTTPRedirection _: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let url = request.url,
+              url.scheme?.lowercased() == self.scheme,
+              url.host?.lowercased() == self.host,
+              effectivePort(for: url) == self.port
+        else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(
+        _: URLSession,
+        dataTask _: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        let exceedsLimit = response.expectedContentLength > 0
+            && response.expectedContentLength > Int64(self.maximumBytes)
+        guard !exceedsLimit else {
+            completionHandler(.cancel)
+            self.finish(
+                .failure(ResponseSizeLimitError(maximumBytes: self.maximumBytes)),
+                cancelSession: true
+            )
+            return
+        }
+
+        self.lock.lock()
+        if !self.isFinished {
+            self.response = response
+            if response.expectedContentLength > 0 {
+                self.responseData.reserveCapacity(
+                    min(Int(response.expectedContentLength), self.maximumBytes)
+                )
+            }
+        }
+        self.lock.unlock()
+        completionHandler(.allow)
+    }
+
+    func urlSession(
+        _: URLSession,
+        dataTask _: URLSessionDataTask,
+        didReceive data: Data
+    ) {
+        var exceedsLimit = false
+        self.lock.lock()
+        if !self.isFinished {
+            if data.count > self.maximumBytes - self.responseData.count {
+                exceedsLimit = true
+            } else {
+                self.responseData.append(data)
+            }
+        }
+        self.lock.unlock()
+
+        if exceedsLimit {
+            self.finish(
+                .failure(ResponseSizeLimitError(maximumBytes: self.maximumBytes)),
+                cancelSession: true
+            )
+        }
+    }
+
+    func urlSession(
+        _: URLSession,
+        task _: URLSessionTask,
+        didCompleteWithError error: (any Error)?
+    ) {
+        if let error {
+            self.finish(.failure(error), cancelSession: true)
+            return
+        }
+
+        self.lock.lock()
+        let response = self.response
+        let data = self.responseData
+        self.lock.unlock()
+
+        guard let response else {
+            self.finish(
+                .failure(NSError(
+                    domain: "APIExplorer",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Response completed without metadata"]
+                )),
+                cancelSession: true
+            )
+            return
+        }
+        self.finish(.success((data, response)), cancelSession: false)
+    }
+
+    private func cancel() {
+        self.lock.lock()
+        self.cancellationRequested = true
+        let shouldFinish = self.continuation != nil && !self.isFinished
+        self.lock.unlock()
+        if shouldFinish {
+            self.finish(.failure(CancellationError()), cancelSession: true)
+        }
+    }
+
+    private func finish(
+        _ result: Result<(Data, URLResponse), any Error>,
+        cancelSession: Bool
+    ) {
+        self.lock.lock()
+        guard !self.isFinished else {
+            self.lock.unlock()
+            return
+        }
+        self.isFinished = true
+        let continuation = self.continuation
+        let session = self.session
+        self.continuation = nil
+        self.session = nil
+        self.task = nil
+        self.lock.unlock()
+
+        if cancelSession {
+            session?.invalidateAndCancel()
+        } else {
+            session?.finishTasksAndInvalidate()
+        }
+        continuation?.resume(with: result)
+    }
+}
+
+// MARK: - Cookie Management
+
+/// Locates the authoritative cookie archive without reading its contents.
+func selectedCookieBackupFile(
+    appSupport: URL? = FileManager.default.urls(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask
+    ).first,
+    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+) -> URL? {
+    guard let appSupport else { return nil }
+
+    let legacyCookieFile =
         appSupport
             .appendingPathComponent("Mozaic", isDirectory: true)
             .appendingPathComponent("cookies.dat")
 
-    guard FileManager.default.fileExists(atPath: cookieFile.path) else {
+    let containerCookieFile = homeDirectory
+        .appendingPathComponent("Library/Containers/com.zemuliu.Mozaic/Data", isDirectory: true)
+        .appendingPathComponent("Library/Application Support/Mozaic", isDirectory: true)
+        .appendingPathComponent("cookies.dat")
+
+    // Once the sandboxed app has created its Application Support directory, its
+    // container export is authoritative. Never resurrect the legacy host archive
+    // after logout, account switching, expiry, corruption, or a cleared export.
+    if FileManager.default.fileExists(atPath: containerCookieFile.path) {
+        return containerCookieFile
+    }
+    if FileManager.default.fileExists(atPath: containerCookieFile.deletingLastPathComponent().path) {
         return nil
     }
+    return FileManager.default.fileExists(atPath: legacyCookieFile.path) ? legacyCookieFile : nil
+}
 
-    guard let data = try? Data(contentsOf: cookieFile) else {
-        print("⚠️ Cookie file exists but failed to read: \(cookieFile.path)")
-        return nil
-    }
+/// Reads cookies from Mozaic app's backup file in Application Support.
+/// This allows the standalone tool to make authenticated API requests.
+func loadCookiesFromAppBackup(from cookieFile: URL? = selectedCookieBackupFile()) -> [HTTPCookie]? {
+    guard !forceUnauthenticatedRequests, let cookieFile else { return nil }
 
-    guard let cookieDataArray = try? NSKeyedUnarchiver.unarchivedObject(
-        ofClasses: [NSArray.self, NSData.self],
-        from: data
-    ) as? [Data]
-    else {
-        print(
-            "⚠️ Cookie file exists but failed to unarchive. File may be corrupted or use a different format."
-        )
-        print("   Path: \(cookieFile.path)")
-        print("   Size: \(data.count) bytes")
-        return nil
-    }
-
-    let cookies = cookieDataArray.compactMap { cookieData -> HTTPCookie? in
-        guard let stringProperties = try? NSKeyedUnarchiver.unarchivedObject(
-            ofClasses: [NSDictionary.self, NSString.self, NSDate.self, NSNumber.self],
-            from: cookieData
-        ) as? [String: Any]
-        else {
+    func decodeCookies(at cookieFile: URL) -> [HTTPCookie]? {
+        guard let data = try? Data(contentsOf: cookieFile) else {
+            print("⚠️ Cookie file exists but failed to read: \(cookieFile.path)")
             return nil
         }
 
-        var convertedProperties: [HTTPCookiePropertyKey: Any] = [:]
-        for (key, value) in stringProperties {
-            convertedProperties[HTTPCookiePropertyKey(key)] = value
+        guard let cookieDataArray = try? NSKeyedUnarchiver.unarchivedObject(
+            ofClasses: [NSArray.self, NSData.self],
+            from: data
+        ) as? [Data]
+        else {
+            print(
+                "⚠️ Cookie file exists but failed to unarchive. File may be corrupted or use a different format."
+            )
+            print("   Path: \(cookieFile.path)")
+            print("   Size: \(data.count) bytes")
+            return nil
         }
-        return HTTPCookie(properties: convertedProperties)
+
+        let cookies = cookieDataArray.compactMap { cookieData -> HTTPCookie? in
+            guard let stringProperties = try? NSKeyedUnarchiver.unarchivedObject(
+                ofClasses: [NSDictionary.self, NSString.self, NSDate.self, NSNumber.self],
+                from: cookieData
+            ) as? [String: Any]
+            else {
+                return nil
+            }
+
+            var convertedProperties: [HTTPCookiePropertyKey: Any] = [:]
+            for (key, value) in stringProperties {
+                convertedProperties[HTTPCookiePropertyKey(key)] = value
+            }
+            return HTTPCookie(properties: convertedProperties)
+        }
+        return cookies.isEmpty ? nil : cookies
     }
 
-    return cookies.isEmpty ? nil : cookies
+    return decodeCookies(at: cookieFile)
 }
 
 /// Filters cookies to those that match the active API host
@@ -158,9 +418,9 @@ func filterCookiesForAPIHost(_ cookies: [HTTPCookie]) -> [HTTPCookie] {
 func getSAPISID(from cookies: [HTTPCookie]) -> String? {
     // Filter to youtube.com domain cookies first (better match for the API host)
     let ytCookies = filterCookiesForAPIHost(cookies)
-    let secureCookie = ytCookies.first { $0.name == "__Secure-3PAPISID" }
-    let fallbackCookie = ytCookies.first { $0.name == "SAPISID" }
-    return (secureCookie ?? fallbackCookie)?.value
+    let sapisid = ytCookies.first { $0.name == "SAPISID" }
+    let fallbackCookie = ytCookies.first { $0.name == "__Secure-3PAPISID" }
+    return (sapisid ?? fallbackCookie)?.value
 }
 
 /// Builds a cookie header string using HTTPCookie's built-in method.
@@ -175,24 +435,67 @@ func buildCookieHeader(from cookies: [HTTPCookie]) -> String? {
     return headerFields["Cookie"]
 }
 
-/// Computes SAPISIDHASH for YouTube API authentication.
-func computeSAPISIDHASH(sapisid: String) -> String {
+func buildSIDAuthorizationHeader(
+    from cookies: [HTTPCookie],
+    includeAllAvailableProofs: Bool
+) -> String? {
+    let ytCookies = filterCookiesForAPIHost(cookies)
+    let sapisid = ytCookies.first { $0.name == "SAPISID" }?.value
+        ?? ytCookies.first { $0.name == "__Secure-3PAPISID" }?.value
+    let oneParty = ytCookies.first { $0.name == "__Secure-1PAPISID" }?.value
+    let threeParty = ytCookies.first { $0.name == "__Secure-3PAPISID" }?.value
     let timestamp = Int(Date().timeIntervalSince1970)
-    let input = "\(timestamp) \(sapisid) \(activeOrigin)"
 
-    let data = Data(input.utf8)
-    var hash = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
-    data.withUnsafeBytes { buffer in
-        _ = CC_SHA1(buffer.baseAddress, CC_LONG(buffer.count), &hash)
+    func authorization(scheme: String, sid: String?) -> String? {
+        guard let sid else { return nil }
+        let input = "\(timestamp) \(sid) \(activeOrigin)"
+        let data = Data(input.utf8)
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        data.withUnsafeBytes { buffer in
+            _ = CC_SHA1(buffer.baseAddress, CC_LONG(buffer.count), &hash)
+        }
+        return "\(scheme) \(timestamp)_\(hash.map { String(format: "%02x", $0) }.joined())"
     }
-    let hashHex = hash.map { String(format: "%02x", $0) }.joined()
 
-    return "\(timestamp)_\(hashHex)"
+    var values = [authorization(scheme: "SAPISIDHASH", sid: sapisid)].compactMap(\.self)
+    if includeAllAvailableProofs {
+        values.append(contentsOf: [
+            authorization(scheme: "SAPISID1PHASH", sid: oneParty),
+            authorization(scheme: "SAPISID3PHASH", sid: threeParty),
+        ].compactMap(\.self))
+    }
+    return values.isEmpty ? nil : values.joined(separator: " ")
 }
 
 // MARK: - API Key Resolution
 
-func resolveAPIKey() async throws -> String {
+private func webClientConfigurationRequest(timeout: TimeInterval? = nil) -> URLRequest {
+    var request = URLRequest(url: activeWebClientURL)
+    if let timeout {
+        request.timeoutInterval = timeout
+    }
+    request.setValue(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        forHTTPHeaderField: "User-Agent"
+    )
+    return request
+}
+
+func webClientConfiguration(authenticated: Bool, cookieSnapshot: [HTTPCookie]? = nil) -> URLSessionConfiguration {
+    let configuration = URLSessionConfiguration.ephemeral
+    if authenticated, let cookies = cookieSnapshot ?? loadCookiesFromAppBackup(), !cookies.isEmpty,
+       let storage = configuration.httpCookieStorage
+    {
+        for cookie in cookies {
+            storage.setCookie(cookie)
+        }
+        configuration.httpShouldSetCookies = true
+        configuration.httpCookieAcceptPolicy = .always
+    }
+    return configuration
+}
+
+func resolveAPIKey(authenticated: Bool = false, cookieSnapshot: [HTTPCookie]? = nil) async throws -> String {
     if let cachedAPIKey {
         return cachedAPIKey
     }
@@ -202,15 +505,16 @@ func resolveAPIKey() async throws -> String {
     {
         let trimmed = override.trimmingCharacters(in: .whitespacesAndNewlines)
         cachedAPIKey = trimmed
+        await resolveLiveClientVersionIfNeeded(authenticated: authenticated, cookieSnapshot: cookieSnapshot)
         return trimmed
     }
 
-    var request = URLRequest(url: activeWebClientURL)
-    request.setValue(
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        forHTTPHeaderField: "User-Agent"
+    let request = webClientConfigurationRequest()
+    let (data, response) = try await boundedResponseData(
+        configuration: webClientConfiguration(authenticated: authenticated, cookieSnapshot: cookieSnapshot),
+        request: request,
+        maximumBytes: maximumConfigurationResponseBytes
     )
-    let (data, response) = try await URLSession.shared.data(for: request)
     if let httpResponse = response as? HTTPURLResponse,
        !(200 ... 399).contains(httpResponse.statusCode)
     {
@@ -233,12 +537,47 @@ func resolveAPIKey() async throws -> String {
 
     // Opportunistically capture the live client version so requests
     // match what the web client currently sends.
+    if cachedClientVersion == nil,
+       let version = extractInnertubeClientVersion(from: html)
+    {
+        cachedClientVersion = version
+    }
+    cachedAPIKey = key
+    return key
+}
+
+/// Resolves only the live client version when the API key came from an explicit
+/// environment override. Failure is non-fatal: callers can still use the
+/// configured fallback, and search-audit labels that source explicitly.
+func resolveLiveClientVersionIfNeeded(authenticated: Bool = false, cookieSnapshot: [HTTPCookie]? = nil) async {
+    guard cachedClientVersion == nil else { return }
+
+    let request = webClientConfigurationRequest(timeout: 5)
+    let data: Data
+    let response: URLResponse
+    do {
+        (data, response) = try await boundedResponseData(
+            configuration: webClientConfiguration(authenticated: authenticated, cookieSnapshot: cookieSnapshot),
+            request: request,
+            maximumBytes: maximumConfigurationResponseBytes
+        )
+    } catch let error as ResponseSizeLimitError {
+        print("⚠️ Web client configuration skipped: \(error.localizedDescription)")
+        return
+    } catch {
+        return
+    }
+
+    guard let httpResponse = response as? HTTPURLResponse,
+          (200 ... 399).contains(httpResponse.statusCode),
+          let html = String(data: data, encoding: .utf8)
+    else {
+        return
+    }
+
     if let version = extractInnertubeClientVersion(from: html) {
         cachedClientVersion = version
     }
-
-    cachedAPIKey = key
-    return key
 }
 
 func extractInnertubeAPIKey(from html: String) -> String? {
@@ -264,7 +603,121 @@ func extractConfigValue(named name: String, from html: String) -> String? {
     return String(html[range])
 }
 
-// MARK: - Request Builder
+func extractConfigBoolean(named name: String, from html: String) -> Bool? {
+    let pattern = "\"\(name)\"\\s*:\\s*(true|false)"
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let match = regex.firstMatch(
+              in: html,
+              range: NSRange(html.startIndex..., in: html)
+          ),
+          let range = Range(match.range(at: 1), in: html)
+    else {
+        return nil
+    }
+    return html[range] == "true"
+}
+
+func extractConfigInteger(named name: String, from html: String) -> Int? {
+    let pattern = "\"\(name)\"\\s*:\\s*(-?[0-9]+)"
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let match = regex.firstMatch(
+              in: html,
+              range: NSRange(html.startIndex..., in: html)
+          ),
+          let range = Range(match.range(at: 1), in: html)
+    else {
+        return nil
+    }
+    return Int(html[range])
+}
+
+func isValidClientVersion(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 64
+        && value.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { component in
+            !component.isEmpty && component.utf8.allSatisfy { (48 ... 57).contains($0) }
+        }
+}
+
+// MARK: - MusicMobileRequestProfile
+
+/// Mobile Home uses element models that the WEB_REMIX client does not request.
+/// This profile is scoped to read-only discovery, not production playback.
+struct MusicMobileRequestProfile {
+    enum Client: String {
+        case ios = "IOS_MUSIC"
+        case android = "ANDROID_MUSIC"
+
+        var defaultVersion: String {
+            switch self {
+            case .ios: "9.06.4"
+            case .android: "5.34.51"
+            }
+        }
+
+        var headerID: String {
+            switch self {
+            case .ios: "26"
+            case .android: "21"
+            }
+        }
+    }
+
+    let client: Client
+    let version: String
+
+    init(client: Client, version: String? = nil) {
+        self.client = client
+        self.version = version ?? client.defaultVersion
+    }
+
+    func clientContext(language: String) -> [String: Any] {
+        var context: [String: Any] = [
+            "clientName": self.client.rawValue, "clientVersion": self.version,
+            "hl": language, "gl": "US", "platform": "MOBILE",
+        ]
+        switch self.client {
+        case .ios:
+            context.merge([
+                "osName": "iOS", "osVersion": "26.2.1",
+                "deviceMake": "Apple", "deviceModel": "iPhone18,4",
+            ]) { _, value in value }
+        case .android:
+            context.merge([
+                "osName": "Android", "osVersion": "13", "androidSdkVersion": 33,
+                "clientFormFactor": "SMALL_FORM_FACTOR",
+            ]) { _, value in value }
+        }
+        return context
+    }
+
+    var userAgent: String {
+        switch self.client {
+        case .ios:
+            "com.google.ios.youtubemusic/\(self.version) iSL/3.4 iPhone/26.2.1 hw/iPhone18_4 (gzip)"
+        case .android:
+            "com.google.android.apps.youtube.music/\(self.version) (Linux; U; Android 13; en_US) gzip"
+        }
+    }
+
+    /// Keeps the body, client headers, and user agent on the same identity.
+    func applyHeaders(to request: inout URLRequest, cookieOnly: Bool, accessToken: String?, cookieHeader: String? = nil) {
+        request.setValue(self.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(self.client.headerID, forHTTPHeaderField: "X-Youtube-Client-Name")
+        request.setValue(self.version, forHTTPHeaderField: "X-Youtube-Client-Version")
+        if let accessToken {
+            request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
+            request.setValue(nil, forHTTPHeaderField: "Cookie")
+        } else if cookieOnly {
+            request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+            request.setValue(nil, forHTTPHeaderField: "Authorization")
+        }
+        if request.value(forHTTPHeaderField: "Cookie") == nil {
+            for field in ["X-Goog-AuthUser", "X-Goog-PageId", "X-Origin", "Origin", "Referer"] {
+                request.setValue(nil, forHTTPHeaderField: field)
+            }
+        }
+    }
+}
 
 func buildContext(brandAccountId: String? = nil) -> [String: Any] {
     var userDict: [String: Any] = [
@@ -286,7 +739,7 @@ func buildContext(brandAccountId: String? = nil) -> [String: Any] {
         "client": [
             "clientName": activeClientName,
             "clientVersion": cachedClientVersion ?? activeFallbackClientVersion,
-            "hl": "en",
+            "hl": globalHl,
             "gl": "US",
             "browserName": "Safari",
             "browserVersion": "17.0",
@@ -298,7 +751,7 @@ func buildContext(brandAccountId: String? = nil) -> [String: Any] {
     ]
 }
 
-func buildHeaders(authenticated: Bool = false, authUserIndex: Int? = nil) -> [String: String] {
+func buildHeaders(authenticated: Bool = false, authUserIndex: Int? = nil, cookieSnapshot: [HTTPCookie]? = nil) -> [String: String] {
     var headers: [String: String] = [
         "Content-Type": "application/json",
         "User-Agent":
@@ -306,14 +759,15 @@ func buildHeaders(authenticated: Bool = false, authUserIndex: Int? = nil) -> [St
         "Origin": activeOrigin,
         "Referer": "\(activeOrigin)/",
     ]
-
-    if authenticated, let cookies = loadCookiesFromAppBackup() {
-        if let sapisid = getSAPISID(from: cookies),
-           let cookieHeader = buildCookieHeader(from: cookies)
+    if authenticated, let cookies = cookieSnapshot ?? loadCookiesFromAppBackup() {
+        if let authorization = buildSIDAuthorizationHeader(
+            from: cookies,
+            includeAllAvailableProofs: false
+        ),
+            let cookieHeader = buildCookieHeader(from: cookies)
         {
-            let sapisidhash = computeSAPISIDHASH(sapisid: sapisid)
             headers["Cookie"] = cookieHeader
-            headers["Authorization"] = "SAPISIDHASH \(sapisidhash)"
+            headers["Authorization"] = authorization
             headers["X-Goog-AuthUser"] = "\(authUserIndex ?? globalAuthUserIndex)"
             headers["X-Origin"] = activeOrigin
             // Brand/delegated channel selection on the wire: real-world clients
@@ -330,17 +784,98 @@ func buildHeaders(authenticated: Bool = false, authUserIndex: Int? = nil) -> [St
     return headers
 }
 
-// MARK: - API Request
+func hasUsableAuthMaterial() -> Bool {
+    guard let cookies = loadCookiesFromAppBackup() else { return false }
+    return getSAPISID(from: cookies) != nil && buildCookieHeader(from: cookies) != nil
+}
 
-func makeRequest(endpoint: String, body: [String: Any], authenticated: Bool = false) async throws
-    -> (data: [String: Any], statusCode: Int)
+// MARK: - APIWireResponse
+
+struct APIWireResponse {
+    let data: Data
+    let statusCode: Int
+    let contentType: String?
+}
+
+private let maximumWireResponseBytes = 32 * 1024 * 1024
+private let maximumConfigurationResponseBytes = 8 * 1024 * 1024
+
+// MARK: - ResponseSizeLimitError
+
+struct ResponseSizeLimitError: LocalizedError {
+    let maximumBytes: Int
+
+    var errorDescription: String? {
+        "Response exceeds the configured \(self.maximumBytes / 1_048_576) MiB limit"
+    }
+}
+
+func boundedResponseData(
+    configuration: URLSessionConfiguration,
+    request: URLRequest,
+    maximumBytes: Int
+) async throws -> (Data, URLResponse) {
+    guard let originURL = request.url else {
+        throw NSError(
+            domain: "APIExplorer",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Request URL is missing"]
+        )
+    }
+    let delegate = BoundedResponseDataDelegate(
+        originURL: originURL,
+        maximumBytes: maximumBytes
+    )
+    return try await delegate.load(configuration: configuration, request: request)
+}
+
+func canonicalAPIEndpoint(_ endpoint: String) throws -> String {
+    let pathSegments = endpoint.split(separator: "/", omittingEmptySubsequences: false)
+    guard !endpoint.isEmpty, endpoint.count <= 160,
+          !endpoint.hasPrefix("/"), !endpoint.hasSuffix("/"),
+          !endpoint.contains("//"),
+          pathSegments.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }),
+          endpoint.unicodeScalars.allSatisfy({ scalar in
+              switch scalar.value {
+              case 45, 47, 48 ... 57, 65 ... 90, 95, 97 ... 122:
+                  true
+              default:
+                  false
+              }
+          })
+    else {
+        throw NSError(
+            domain: "APIExplorer",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Endpoint must be a plain relative API path"]
+        )
+    }
+    return endpoint
+}
+
+func makeWireRequest(
+    endpoint: String, body: [String: Any], authenticated: Bool = false,
+    cookieSnapshot: [HTTPCookie]? = nil,
+    mobileClient: MusicMobileRequestProfile.Client? = nil,
+    mobileWebKey: Bool = false, mobileCookieOnly: Bool = false,
+    mobileAccessToken: String? = nil, mobileCookieHeader: String? = nil
+) async throws
+    -> APIWireResponse
 {
-    let apiKey = try await resolveAPIKey()
+    let endpoint = try canonicalAPIEndpoint(endpoint)
+    let mobileProfile = mobileClient.map {
+        MusicMobileRequestProfile(client: $0, version: clientVersionWasForced ? cachedClientVersion : nil)
+    }
+    guard mobileAccessToken == nil || (mobileProfile != nil && !authenticated && !mobileCookieOnly && !youtubeMode) else {
+        throw DiscoveryError.unsupportedRequest
+    }
     var components = URLComponents(string: "\(activeBaseURL)/\(endpoint)")
-    components?.queryItems = [
-        URLQueryItem(name: "key", value: apiKey),
-        URLQueryItem(name: "prettyPrint", value: "false"),
-    ]
+    var queryItems = [URLQueryItem(name: "prettyPrint", value: "false")]
+    if mobileProfile == nil || mobileWebKey {
+        let apiKey = try await resolveAPIKey(authenticated: authenticated, cookieSnapshot: cookieSnapshot)
+        queryItems.insert(URLQueryItem(name: "key", value: apiKey), at: 0)
+    }
+    components?.queryItems = queryItems
     guard let url = components?.url else {
         throw NSError(
             domain: "APIExplorer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL"]
@@ -350,15 +885,26 @@ func makeRequest(endpoint: String, body: [String: Any], authenticated: Bool = fa
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
 
-    for (key, value) in buildHeaders(authenticated: authenticated) {
+    for (key, value) in buildHeaders(authenticated: authenticated, cookieSnapshot: cookieSnapshot) {
         request.setValue(value, forHTTPHeaderField: key)
+    }
+    if let mobileProfile {
+        mobileProfile.applyHeaders(to: &request, cookieOnly: mobileCookieOnly, accessToken: mobileAccessToken, cookieHeader: mobileCookieHeader)
     }
 
     var fullBody = body
-    fullBody["context"] = buildContext()
+    var context = buildContext()
+    if let mobileProfile {
+        context["client"] = mobileProfile.clientContext(language: globalHl)
+    }
+    fullBody["context"] = context
     request.httpBody = try JSONSerialization.data(withJSONObject: fullBody)
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await boundedResponseData(
+        configuration: .ephemeral,
+        request: request,
+        maximumBytes: maximumWireResponseBytes
+    )
 
     guard let httpResponse = response as? HTTPURLResponse else {
         throw NSError(
@@ -367,19 +913,36 @@ func makeRequest(endpoint: String, body: [String: Any], authenticated: Bool = fa
         )
     }
 
-    guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+    return APIWireResponse(
+        data: data,
+        statusCode: httpResponse.statusCode,
+        contentType: httpResponse.value(forHTTPHeaderField: "Content-Type")
+    )
+}
+
+func makeRequest(endpoint: String, body: [String: Any], authenticated: Bool = false) async throws
+    -> (data: [String: Any], statusCode: Int)
+{
+    let response = try await makeWireRequest(
+        endpoint: endpoint, body: body, authenticated: authenticated
+    )
+
+    guard let json = try JSONSerialization.jsonObject(with: response.data) as? [String: Any] else {
         throw NSError(
             domain: "APIExplorer", code: -1,
-            userInfo: [NSLocalizedDescriptionKey: "Invalid JSON response"]
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Non-object JSON or streaming response; use wire-action for a safe structural audit",
+            ]
         )
     }
 
-    return (json, httpResponse.statusCode)
+    return (json, response.statusCode)
 }
 
 // MARK: - Response Analysis
 
-private func joinedRunsText(_ data: [String: Any]?) -> String? {
+func joinedRunsText(_ data: [String: Any]?) -> String? {
     guard let data,
           let runs = data["runs"] as? [[String: Any]]
     else {
@@ -483,6 +1046,75 @@ private func playlistBrowseSummary(_ data: [String: Any]) -> String? {
     return output
 }
 
+/// Lists playlist destinations without exposing tracking or continuation tokens.
+private func playlistNavigationSummary(_ data: [String: Any]) -> String {
+    var destinations: [String] = []
+    var seen = Set<String>()
+
+    func visit(_ value: Any) {
+        guard destinations.count < 12 else { return }
+        if let dictionary = value as? [String: Any] {
+            for key in ["musicCardShelfRenderer", "musicTwoRowItemRenderer", "musicResponsiveListItemRenderer"] {
+                guard let renderer = dictionary[key] as? [String: Any],
+                      let endpoint = renderer["navigationEndpoint"] ?? renderer["onTap"] ?? renderer["title"],
+                      let browse = findFirstRenderer(named: "browseEndpoint", in: endpoint),
+                      let browseId = browse["browseId"] as? String,
+                      browseId.hasPrefix("VL") || browseId.hasPrefix("RD") || browseId.hasPrefix("PL"),
+                      seen.insert(browseId).inserted
+                else { continue }
+
+                let columns = renderer["flexColumns"] as? [[String: Any]]
+                let firstColumn = columns?.first?["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any]
+                let title = joinedRunsText(renderer["title"] as? [String: Any])
+                    ?? joinedRunsText(firstColumn?["text"] as? [String: Any]) ?? "Untitled"
+                destinations.append("  • \(terminalSafe(title)): \(terminalSafe(browseId))")
+            }
+            for key in dictionary.keys.sorted() {
+                if let child = dictionary[key] {
+                    visit(child)
+                }
+            }
+        } else if let array = value as? [Any] {
+            for child in array {
+                visit(child)
+            }
+        }
+    }
+
+    visit(data)
+    guard !destinations.isEmpty else { return "" }
+    return "\n📂 Playlist browse targets:\n" + destinations.joined(separator: "\n") + "\n"
+}
+
+private func playlistPanelBylineSummary(_ data: [String: Any]) -> String {
+    guard let renderer = findFirstRenderer(named: "playlistPanelVideoRenderer", in: data) else { return "" }
+
+    var output = "\n🎤 Playlist-panel byline runs:\n"
+    for field in ["shortBylineText", "longBylineText"] {
+        let runs = (renderer[field] as? [String: Any])?["runs"] as? [[String: Any]] ?? []
+        output += "  \(field): \(runs.count) run(s)\n"
+        for (index, run) in runs.enumerated() {
+            let text = run["text"] as? String ?? ""
+            let browseId = ((run["navigationEndpoint"] as? [String: Any])?["browseEndpoint"] as? [String: Any])?["browseId"] as? String
+            let browseKind = if let browseId {
+                if browseId.hasPrefix("MPLAUC") {
+                    "MPLAUC…"
+                } else if browseId.hasPrefix("UC") {
+                    "UC…"
+                } else if browseId.hasPrefix("MPRE") {
+                    "MPRE…"
+                } else {
+                    "other"
+                }
+            } else {
+                "none"
+            }
+            output += "    [\(index)] text=\(String(reflecting: text)) browse=\(browseKind)\n"
+        }
+    }
+    return output
+}
+
 /// Recursively counts renderer/viewModel dictionary keys in a response.
 /// Invaluable for mapping which renderers a YouTube surface currently serves
 /// (e.g. legacy `videoRenderer` vs. the newer `lockupViewModel`).
@@ -517,7 +1149,448 @@ func rendererHistogram(_ data: [String: Any], limit: Int = 25) -> String {
     return output
 }
 
-func analyzeResponse(_ data: [String: Any], verbose: Bool = false) -> String {
+// MARK: - PlaylistSetVideoIdSourceCounts
+
+private struct PlaylistSetVideoIdSourceCounts {
+    var playlistItemData = 0
+    var playlistEditEndpoint = 0
+}
+
+private func countPlaylistSetVideoIdSources(in value: Any, counts: inout PlaylistSetVideoIdSourceCounts) {
+    if let dictionary = value as? [String: Any] {
+        if let playlistItemData = dictionary["playlistItemData"] as? [String: Any],
+           let setVideoId = playlistItemData["playlistSetVideoId"] as? String,
+           !setVideoId.isEmpty
+        {
+            counts.playlistItemData += 1
+        }
+
+        if let editEndpoint = dictionary["playlistEditEndpoint"] as? [String: Any],
+           let actions = editEndpoint["actions"] as? [[String: Any]]
+        {
+            counts.playlistEditEndpoint += actions.count { action in
+                action["action"] as? String == "ACTION_REMOVE_VIDEO"
+                    && (action["setVideoId"] as? String)?.isEmpty == false
+            }
+        }
+
+        for nestedValue in dictionary.values {
+            countPlaylistSetVideoIdSources(in: nestedValue, counts: &counts)
+        }
+    } else if let array = value as? [Any] {
+        for item in array {
+            countPlaylistSetVideoIdSources(in: item, counts: &counts)
+        }
+    }
+}
+
+private func playlistSetVideoIdSourceSummary(_ data: [String: Any]) -> String {
+    var counts = PlaylistSetVideoIdSourceCounts()
+    countPlaylistSetVideoIdSources(in: data, counts: &counts)
+    guard counts.playlistItemData > 0 || counts.playlistEditEndpoint > 0 else { return "" }
+
+    return """
+
+    🧩 Playlist occurrence ID sources:
+      • playlistItemData.playlistSetVideoId: \(counts.playlistItemData)
+      • playlistEditEndpoint ACTION_REMOVE_VIDEO setVideoId: \(counts.playlistEditEndpoint)
+    """
+}
+
+// MARK: - ChapterProbeItem
+
+private struct ChapterProbeItem: Hashable {
+    let videoId: String?
+    let title: String
+    let startMillis: Int?
+    let endMillis: Int?
+    let timeText: String?
+    let hasThumbnail: Bool
+}
+
+private func textValue(from value: Any?) -> String? {
+    if let string = value as? String {
+        return string.isEmpty ? nil : string
+    }
+
+    guard let dictionary = value as? [String: Any] else {
+        return nil
+    }
+
+    if let simpleText = dictionary["simpleText"] as? String, !simpleText.isEmpty {
+        return simpleText
+    }
+
+    if let content = dictionary["content"] as? String, !content.isEmpty {
+        return content
+    }
+
+    if let runs = dictionary["runs"] as? [[String: Any]] {
+        let text = runs.compactMap { $0["text"] as? String }.joined()
+        return text.isEmpty ? nil : text
+    }
+
+    return nil
+}
+
+private func intValue(from value: Any?) -> Int? {
+    switch value {
+    case let int as Int:
+        int
+    case let double as Double:
+        Int(double)
+    case let number as NSNumber:
+        Int(number.int64Value)
+    case let string as String:
+        Int(string)
+    default:
+        nil
+    }
+}
+
+private func formatMillis(_ millis: Int?) -> String {
+    guard let millis else { return "?:??" }
+
+    let totalSeconds = max(0, millis / 1000)
+    let hours = totalSeconds / 3600
+    let minutes = (totalSeconds % 3600) / 60
+    let seconds = totalSeconds % 60
+
+    if hours > 0 {
+        return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+    }
+    return String(format: "%d:%02d", minutes, seconds)
+}
+
+private func findRepeatChapterCommand(in value: Any?) -> [String: Any]? {
+    if let dictionary = value as? [String: Any] {
+        if let command = dictionary["repeatChapterCommand"] as? [String: Any] {
+            return command
+        }
+
+        for nestedValue in dictionary.values {
+            if let command = findRepeatChapterCommand(in: nestedValue) {
+                return command
+            }
+        }
+    } else if let array = value as? [Any] {
+        for item in array {
+            if let command = findRepeatChapterCommand(in: item) {
+                return command
+            }
+        }
+    }
+
+    return nil
+}
+
+private func watchEndpoint(from renderer: [String: Any]) -> [String: Any]? {
+    guard let onTap = renderer["onTap"] as? [String: Any],
+          let watchEndpoint = onTap["watchEndpoint"] as? [String: Any]
+    else {
+        return nil
+    }
+
+    return watchEndpoint
+}
+
+private func chapterProbeItem(fromChapterRenderer renderer: [String: Any]) -> ChapterProbeItem? {
+    guard let title = textValue(from: renderer["title"]) else {
+        return nil
+    }
+
+    return ChapterProbeItem(
+        videoId: nil,
+        title: title,
+        startMillis: intValue(from: renderer["timeRangeStartMillis"]),
+        endMillis: nil,
+        timeText: nil,
+        hasThumbnail: renderer["thumbnail"] != nil
+    )
+}
+
+private func chapterProbeItem(fromMacroMarkerRenderer renderer: [String: Any]) -> ChapterProbeItem? {
+    guard let title = textValue(from: renderer["title"]) else {
+        return nil
+    }
+
+    let repeatCommand = findRepeatChapterCommand(in: renderer["repeatButton"])
+    let endpoint = watchEndpoint(from: renderer)
+    let startMillis = intValue(from: repeatCommand?["startTimeMs"])
+        ?? intValue(from: endpoint?["startTimeSeconds"]).map { $0 * 1000 }
+
+    return ChapterProbeItem(
+        videoId: endpoint?["videoId"] as? String,
+        title: title,
+        startMillis: startMillis,
+        endMillis: intValue(from: repeatCommand?["endTimeMs"]),
+        timeText: textValue(from: renderer["timeDescription"]),
+        hasThumbnail: renderer["thumbnail"] != nil
+    )
+}
+
+private func collectChapterProbeItems(
+    in value: Any,
+    chapterRenderers: inout [ChapterProbeItem],
+    macroMarkerItems: inout [ChapterProbeItem]
+) {
+    if let dictionary = value as? [String: Any] {
+        if let renderer = dictionary["chapterRenderer"] as? [String: Any],
+           let item = chapterProbeItem(fromChapterRenderer: renderer)
+        {
+            chapterRenderers.append(item)
+        }
+
+        if let renderer = dictionary["macroMarkersListItemRenderer"] as? [String: Any],
+           let item = chapterProbeItem(fromMacroMarkerRenderer: renderer)
+        {
+            macroMarkerItems.append(item)
+        }
+
+        for nestedValue in dictionary.values {
+            collectChapterProbeItems(
+                in: nestedValue,
+                chapterRenderers: &chapterRenderers,
+                macroMarkerItems: &macroMarkerItems
+            )
+        }
+    } else if let array = value as? [Any] {
+        for item in array {
+            collectChapterProbeItems(
+                in: item,
+                chapterRenderers: &chapterRenderers,
+                macroMarkerItems: &macroMarkerItems
+            )
+        }
+    }
+}
+
+private func deduplicatedChapterItems(_ items: [ChapterProbeItem]) -> [ChapterProbeItem] {
+    var seen: Set<String> = []
+    var result: [ChapterProbeItem] = []
+
+    for item in items {
+        let key = "\(item.videoId ?? "")|\(item.startMillis ?? -1)|\(item.title)"
+        guard seen.insert(key).inserted else { continue }
+        result.append(item)
+    }
+
+    return result.sorted { lhs, rhs in
+        switch (lhs.startMillis, rhs.startMillis) {
+        case let (left?, right?):
+            if left != right {
+                return left < right
+            }
+            return lhs.title < rhs.title
+        case (.some, nil):
+            return true
+        case (nil, .some):
+            return false
+        case (nil, nil):
+            return lhs.title < rhs.title
+        }
+    }
+}
+
+private func chapterProbeSummary(_ data: [String: Any], limit: Int = 8) -> String {
+    var chapterRenderers: [ChapterProbeItem] = []
+    var macroMarkerItems: [ChapterProbeItem] = []
+    collectChapterProbeItems(
+        in: data,
+        chapterRenderers: &chapterRenderers,
+        macroMarkerItems: &macroMarkerItems
+    )
+
+    let uniqueChapterRenderers = deduplicatedChapterItems(chapterRenderers)
+    let uniqueMacroMarkerItems = deduplicatedChapterItems(macroMarkerItems)
+    guard !uniqueChapterRenderers.isEmpty || !uniqueMacroMarkerItems.isEmpty else {
+        return ""
+    }
+
+    var output = "\n🎬 Chapter markers:\n"
+    if !uniqueChapterRenderers.isEmpty {
+        output += "  • playerOverlays chapterRenderer: \(uniqueChapterRenderers.count) unique chapter(s)"
+        if chapterRenderers.count != uniqueChapterRenderers.count {
+            output += " (\(chapterRenderers.count) raw)"
+        }
+        output += "\n"
+        output += "    Path: playerOverlays…multiMarkersPlayerBarRenderer.markersMap[].value.chapters[]\n"
+    }
+
+    if !uniqueMacroMarkerItems.isEmpty {
+        output += "  • macroMarkersListItemRenderer: \(uniqueMacroMarkerItems.count) unique chapter(s)"
+        if macroMarkerItems.count != uniqueMacroMarkerItems.count {
+            output += " (\(macroMarkerItems.count) raw; often duplicated in chapters panel + structured description/search preview)"
+        }
+        output += "\n"
+    }
+
+    let preferredItems = uniqueChapterRenderers.isEmpty ? uniqueMacroMarkerItems : uniqueChapterRenderers
+    let multipleVideoIds = Set(preferredItems.compactMap(\.videoId)).count > 1
+    for (index, item) in preferredItems.prefix(limit).enumerated() {
+        let start = item.timeText ?? formatMillis(item.startMillis)
+        let endSuffix = item.endMillis.map { "–\(formatMillis($0))" } ?? ""
+        let thumbnailSuffix = item.hasThumbnail ? " · thumbnail" : ""
+        let videoSuffix = multipleVideoIds ? " · videoId \(item.videoId ?? "unknown")" : ""
+        output += "    \(index + 1). \(start)\(endSuffix) — \(item.title)\(thumbnailSuffix)\(videoSuffix)\n"
+    }
+    if preferredItems.count > limit {
+        output += "    … and \(preferredItems.count - limit) more\n"
+    }
+
+    return output
+}
+
+// MARK: - LibraryFeedbackProbeItem
+
+private struct LibraryFeedbackProbeItem: Hashable {
+    enum Kind: String {
+        case single
+        case toggle
+    }
+
+    let kind: Kind
+    let iconType: String
+    let hasPrimaryToken: Bool
+    let hasToggledToken: Bool
+    let tokensAreDistinct: Bool?
+}
+
+private func firstFeedbackToken(in value: Any) -> String? {
+    if let dictionary = value as? [String: Any] {
+        if let token = dictionary["feedbackToken"] as? String, !token.isEmpty {
+            return token
+        }
+        for nestedValue in dictionary.values {
+            if let token = firstFeedbackToken(in: nestedValue) {
+                return token
+            }
+        }
+    } else if let array = value as? [Any] {
+        for item in array {
+            if let token = firstFeedbackToken(in: item) {
+                return token
+            }
+        }
+    }
+    return nil
+}
+
+private func isLibraryFeedbackIcon(_ iconType: String) -> Bool {
+    iconType.contains("LIBRARY") || iconType.contains("BOOKMARK")
+}
+
+private func collectLibraryFeedbackProbeItems(
+    in value: Any,
+    items: inout [LibraryFeedbackProbeItem]
+) {
+    if let dictionary = value as? [String: Any] {
+        if let renderer = dictionary["menuServiceItemRenderer"] as? [String: Any] {
+            let token = firstFeedbackToken(in: renderer["serviceEndpoint"] as Any)
+            if token != nil {
+                let icon = renderer["icon"] as? [String: Any]
+                let iconType = icon?["iconType"] as? String ?? "unknown"
+                if isLibraryFeedbackIcon(iconType) {
+                    items.append(LibraryFeedbackProbeItem(
+                        kind: .single,
+                        iconType: iconType,
+                        hasPrimaryToken: true,
+                        hasToggledToken: false,
+                        tokensAreDistinct: nil
+                    ))
+                }
+            }
+        }
+
+        if let renderer = dictionary["toggleMenuServiceItemRenderer"] as? [String: Any] {
+            let defaultToken = firstFeedbackToken(in: renderer["defaultServiceEndpoint"] as Any)
+            let toggledToken = firstFeedbackToken(in: renderer["toggledServiceEndpoint"] as Any)
+            guard defaultToken != nil || toggledToken != nil else {
+                for nestedValue in dictionary.values {
+                    collectLibraryFeedbackProbeItems(in: nestedValue, items: &items)
+                }
+                return
+            }
+            let icon = renderer["defaultIcon"] as? [String: Any]
+            let iconType = icon?["iconType"] as? String ?? "unknown"
+            if isLibraryFeedbackIcon(iconType) {
+                let tokensAreDistinct: Bool? = if let defaultToken, let toggledToken {
+                    defaultToken != toggledToken
+                } else {
+                    nil
+                }
+                items.append(LibraryFeedbackProbeItem(
+                    kind: .toggle,
+                    iconType: iconType,
+                    hasPrimaryToken: defaultToken != nil,
+                    hasToggledToken: toggledToken != nil,
+                    tokensAreDistinct: tokensAreDistinct
+                ))
+            }
+        }
+
+        for nestedValue in dictionary.values {
+            collectLibraryFeedbackProbeItems(in: nestedValue, items: &items)
+        }
+    } else if let array = value as? [Any] {
+        for item in array {
+            collectLibraryFeedbackProbeItems(in: item, items: &items)
+        }
+    }
+}
+
+private func libraryFeedbackProbeSummary(_ data: [String: Any]) -> String {
+    var items: [LibraryFeedbackProbeItem] = []
+    collectLibraryFeedbackProbeItems(in: data, items: &items)
+    guard !items.isEmpty else { return "" }
+
+    let grouped = Dictionary(grouping: items, by: \.self)
+    var output = "\n📚 Library feedback actions (token values redacted):\n"
+    for item in grouped.keys.sorted(by: {
+        ($0.kind.rawValue, $0.iconType) < ($1.kind.rawValue, $1.iconType)
+    }) {
+        let count = grouped[item]?.count ?? 0
+        switch item.kind {
+        case .single:
+            output += "  • single icon=\(item.iconType) token=\(item.hasPrimaryToken ? "present" : "missing") count=\(count)\n"
+        case .toggle:
+            let distinct = item.tokensAreDistinct.map { $0 ? "yes" : "no" } ?? "unknown"
+            output += "  • toggle defaultIcon=\(item.iconType) defaultToken=\(item.hasPrimaryToken ? "present" : "missing") toggledToken=\(item.hasToggledToken ? "present" : "missing") distinct=\(distinct) count=\(count)\n"
+        }
+    }
+    return output
+}
+
+private func collectAlbumPlaylistTargets(in value: Any, targets: inout Set<String>) {
+    if let dictionary = value as? [String: Any] {
+        if let playlistId = dictionary["playlistId"] as? String,
+           playlistId.hasPrefix("OLAK")
+        {
+            targets.insert(playlistId)
+        }
+        for child in dictionary.values {
+            collectAlbumPlaylistTargets(in: child, targets: &targets)
+        }
+    } else if let array = value as? [Any] {
+        for child in array {
+            collectAlbumPlaylistTargets(in: child, targets: &targets)
+        }
+    }
+}
+
+private func albumLibraryTargetSummary(_ data: [String: Any]) -> String {
+    var targets = Set<String>()
+    collectAlbumPlaylistTargets(in: data, targets: &targets)
+    guard !targets.isEmpty else { return "" }
+
+    return "\n💾 Album library target:\n  • Found \(targets.count) unique OLAK playlist target(s) for album mutations\n"
+}
+
+func analyzeResponse(
+    _ data: [String: Any],
+    verbose: Bool = false,
+    searchAuditContext: SearchAuditContext = .automatic
+) -> String {
     var output = ""
 
     // Top-level keys
@@ -601,9 +1674,214 @@ func analyzeResponse(_ data: [String: Any], verbose: Bool = false) -> String {
         output += playlistSummary
     }
 
+    output += playlistSetVideoIdSourceSummary(data)
+
+    output += albumLibraryTargetSummary(data)
+
+    output += chapterProbeSummary(data)
+
+    output += libraryFeedbackProbeSummary(data)
+
+    output += playlistPanelBylineSummary(data)
+
+    output += playlistNavigationSummary(data)
+
+    if !youtubeMode {
+        output += searchResponseAuditSummary(
+            data,
+            context: searchAuditContext
+        )
+    }
+
     output += rendererHistogram(data)
 
     return output
+}
+
+// MARK: - QueueProbeSong
+
+private struct QueueProbeSong {
+    let videoId: String
+    let title: String
+    let artists: String
+}
+
+private func playlistPanelRenderer(in data: [String: Any]) -> [String: Any]? {
+    guard let contents = data["contents"] as? [String: Any],
+          let watchNextRenderer = contents["singleColumnMusicWatchNextResultsRenderer"] as? [String: Any],
+          let tabbedRenderer = watchNextRenderer["tabbedRenderer"] as? [String: Any],
+          let watchNextTabbedResults = tabbedRenderer["watchNextTabbedResultsRenderer"] as? [String: Any],
+          let tabs = watchNextTabbedResults["tabs"] as? [[String: Any]],
+          let firstTab = tabs.first,
+          let tabRenderer = firstTab["tabRenderer"] as? [String: Any],
+          let tabContent = tabRenderer["content"] as? [String: Any],
+          let musicQueueRenderer = tabContent["musicQueueRenderer"] as? [String: Any],
+          let queueContent = musicQueueRenderer["content"] as? [String: Any]
+    else {
+        return nil
+    }
+
+    return queueContent["playlistPanelRenderer"] as? [String: Any]
+}
+
+private func playlistPanelVideoRenderer(from item: [String: Any]) -> [String: Any]? {
+    if let direct = item["playlistPanelVideoRenderer"] as? [String: Any] {
+        return direct
+    }
+
+    if let wrapper = item["playlistPanelVideoWrapperRenderer"] as? [String: Any],
+       let primary = wrapper["primaryRenderer"] as? [String: Any],
+       let wrapped = primary["playlistPanelVideoRenderer"] as? [String: Any]
+    {
+        return wrapped
+    }
+
+    return nil
+}
+
+private func parseQueueProbeSongs(from data: [String: Any]) -> [QueueProbeSong] {
+    guard let renderer = playlistPanelRenderer(in: data),
+          let contents = renderer["contents"] as? [[String: Any]]
+    else { return [] }
+
+    return contents.compactMap { item in
+        guard let videoRenderer = playlistPanelVideoRenderer(from: item),
+              let videoId = videoRenderer["videoId"] as? String
+        else { return nil }
+
+        let title = joinedRunsText(videoRenderer["title"] as? [String: Any]) ?? "Unknown"
+        let artists = joinedRunsText(videoRenderer["longBylineText"] as? [String: Any]) ?? ""
+        return QueueProbeSong(videoId: videoId, title: title, artists: artists)
+    }
+}
+
+private func queueProbeContinuationToken(in data: [String: Any]) -> String? {
+    guard let renderer = playlistPanelRenderer(in: data),
+          let continuations = renderer["continuations"] as? [[String: Any]],
+          let firstContinuation = continuations.first,
+          let nextRadioData = firstContinuation["nextRadioContinuationData"] as? [String: Any]
+    else { return nil }
+
+    return nextRadioData["continuation"] as? String
+}
+
+private func queueProbeAutoplayVideoId(in data: [String: Any]) -> String? {
+    guard let autoplay = data["playerOverlays"] as? [String: Any],
+          let playerOverlayRenderer = autoplay["playerOverlayRenderer"] as? [String: Any],
+          let autoplayRenderer = playerOverlayRenderer["autoplay"] as? [String: Any],
+          let playerOverlayAutoplayRenderer = autoplayRenderer["playerOverlayAutoplayRenderer"] as? [String: Any],
+          let item = playerOverlayAutoplayRenderer["item"] as? [String: Any],
+          let compactVideoRenderer = item["compactVideoRenderer"] as? [String: Any]
+    else { return nil }
+
+    return compactVideoRenderer["videoId"] as? String
+}
+
+private let queueProbeRedactedDiagnosticValue = "[REDACTED]"
+private let queueProbeDiagnosticKeys: Set<String> = [
+    "autoplay", "browseId", "compactVideoRenderer", "content", "contents", "continuation",
+    "continuations", "item", "longBylineText", "musicQueueRenderer", "nextRadioContinuationData",
+    "playerOverlayAutoplayRenderer", "playerOverlayRenderer", "playerOverlays", "playlistId",
+    "playlistPanelRenderer", "playlistPanelVideoRenderer", "playlistPanelVideoWrapperRenderer",
+    "primaryRenderer", "responseContext", "runs", "simpleText", "singleColumnMusicWatchNextResultsRenderer",
+    "tabRenderer", "tabbedRenderer", "tabs", "text", "title", "videoId", "watchNextTabbedResultsRenderer",
+]
+
+/// Preserve response structure without exporting personalized identifiers, text, or opaque values.
+private func sanitizedQueueProbeDiagnosticValue(_ value: Any) -> Any {
+    if let dictionary = value as? [String: Any] {
+        return sanitizedQueueProbeDiagnosticResponse(dictionary)
+    }
+
+    if let array = value as? [Any] {
+        return array.map(sanitizedQueueProbeDiagnosticValue)
+    }
+
+    if value is NSNull {
+        return value
+    }
+
+    return queueProbeRedactedDiagnosticValue
+}
+
+private func sanitizedQueueProbeDiagnosticResponse(_ data: [String: Any]) -> [String: Any] {
+    var sanitized: [String: Any] = [:]
+    for (index, key) in data.keys.sorted().enumerated() {
+        // Preserve known queue fields; dynamic keys may themselves contain private values.
+        // Numbered placeholders retain every member without collisions between unknown keys.
+        let safeKey = queueProbeDiagnosticKeys.contains(key) ? key : "[REDACTED_KEY_\(index)]"
+        sanitized[safeKey] = data[key].map(sanitizedQueueProbeDiagnosticValue)
+    }
+    return sanitized
+}
+
+private func prettyPrintedSanitizedQueueProbeResponse(_ data: [String: Any]) throws -> Data {
+    try JSONSerialization.data(
+        withJSONObject: sanitizedQueueProbeDiagnosticResponse(data),
+        options: [.prettyPrinted, .sortedKeys]
+    )
+}
+
+func probeQueue(videoId: String, playlistId: String? = nil, verbose: Bool = false, outputFile: String? = nil) async {
+    let resolvedPlaylistId = playlistId ?? "RDAMVM\(videoId)"
+    let body: [String: Any] = [
+        "videoId": videoId,
+        "playlistId": resolvedPlaylistId,
+        "enablePersistentPlaylistPanel": true,
+        "isAudioOnly": true,
+        "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
+    ]
+
+    print("🎧 Probing queue (identifiers and text stay hidden)")
+    print("   playlist: \(playlistId == nil ? "derived from seed" : "supplied")")
+    print("   endpoint: next")
+    if loadCookiesFromAppBackup() != nil, !forceUnauthenticatedRequests {
+        print("   auth: cookies available")
+    } else {
+        print("   auth: guest/no cookies")
+    }
+    print()
+
+    do {
+        let (data, statusCode) = try await makeRequest(endpoint: "next", body: body, authenticated: !forceUnauthenticatedRequests && loadCookiesFromAppBackup() != nil)
+        print("✅ HTTP \(statusCode)")
+        if statusCode == 401 || statusCode == 403 {
+            print("❌ Authentication required")
+            return
+        }
+
+        let songs = parseQueueProbeSongs(from: data)
+        let ids = songs.map(\.videoId)
+        let seedPositions = ids.enumerated().compactMap { index, id in id == videoId ? index : nil }
+        let firstPlayable = songs.first
+        let nextPlayable = songs.dropFirst().first
+        print("Queue summary:")
+        print("  • Parsed songs: \(songs.count)")
+        print("  • Seed positions: \(seedPositions.isEmpty ? "none" : seedPositions.map(String.init).joined(separator: ", "))")
+        print("  • Has first parsed song: \(firstPlayable == nil ? "no" : "yes")")
+        print("  • Has second parsed song: \(nextPlayable == nil ? "no" : "yes")")
+        print("  • Has autoplay overlay: \(queueProbeAutoplayVideoId(in: data) == nil ? "no" : "yes")")
+        print("  • Has continuation: \(queueProbeContinuationToken(in: data) == nil ? "no" : "yes")")
+
+        if verbose || outputFile != nil {
+            let sanitizedData = try prettyPrintedSanitizedQueueProbeResponse(data)
+
+            if verbose,
+               let sanitizedString = String(data: sanitizedData, encoding: .utf8)
+            {
+                print("\n📄 Sanitized response (scalar values and unknown keys redacted):")
+                print(sanitizedString)
+            }
+
+            if let outputFile {
+                let url = URL(fileURLWithPath: outputFile)
+                try writePrivateOutput(sanitizedData, to: url.path)
+                print("\n💾 Saved sanitized response to: \(outputFile)")
+            }
+        }
+    } catch {
+        print("❌ Queue probe failed (error code: \((error as NSError).code))")
+    }
 }
 
 // MARK: - Commands
@@ -611,20 +1889,25 @@ func analyzeResponse(_ data: [String: Any], verbose: Bool = false) -> String {
 /// Known endpoints that require authentication
 let authRequiredEndpoints = Set([
     "FEmusic_liked_playlists",
+    "FEmusic_liked_albums",
     "FEmusic_liked_videos",
     "FEmusic_history",
     "FEmusic_library_landing",
-    "FEmusic_library_albums",
     "FEmusic_library_artists",
     "FEmusic_library_corpus_artists",
     "FEmusic_library_corpus_track_artists",
     "FEmusic_library_songs",
     "FEmusic_library_non_music_audio_list",
+    "FEmusic_library_non_music_audio_channels_list",
+    "FEmusic_library_user_profile_channels_list",
+    "FEmusic_tastebuilder",
+    "FEmusic_listening_review",
     "FEmusic_recently_played",
     "FEmusic_offline",
     "FEmusic_library_privately_owned_landing",
     "FEmusic_library_privately_owned_tracks",
     "FEmusic_library_privately_owned_albums",
+    "FEmusic_library_privately_owned_releases",
     "FEmusic_library_privately_owned_artists",
 ])
 
@@ -664,6 +1947,11 @@ func needsAuthentication(_ browseId: String) -> Bool {
     // Podcast shows (MPSPP...) require authentication for episode data
     if browseId.hasPrefix("MPSPP") {
         return true
+    }
+    // Album pages are public, but authenticated requests expose personalized
+    // Save/Remove library controls and their OLAK mutation targets.
+    if browseId.hasPrefix("MPRE") || browseId.hasPrefix("OLAK") {
+        return loadCookiesFromAppBackup() != nil
     }
     return false
 }
@@ -719,9 +2007,8 @@ func exploreBrowse(
             if let prettyData = try? JSONSerialization.data(
                 withJSONObject: data, options: .prettyPrinted
             ) {
-                let url = URL(fileURLWithPath: outputFile)
-                try prettyData.write(to: url)
-                print("\n💾 Saved to: \(outputFile)")
+                try writePrivateOutput(prettyData, to: outputFile)
+                print("\n💾 Saved with owner-only permissions: \(outputFile)")
             }
         }
     } catch {
@@ -750,13 +2037,18 @@ let authRequiredActions = Set([
     "next",
 ])
 
+func actionNeedsAuthentication(_ endpoint: String) -> Bool {
+    guard !forceUnauthenticatedRequests else { return false }
+    // In YouTube mode, personalized actions (guide, next, search) return richer
+    // data signed in, so use auth whenever cookies are available.
+    return authRequiredActions.contains(endpoint)
+        || (youtubeMode && hasUsableAuthMaterial())
+}
+
 func exploreAction(
     _ endpoint: String, bodyJson: String, verbose: Bool = false, outputFile: String? = nil
 ) async {
-    // In YouTube mode, personalized actions (guide, next, search) return richer
-    // data signed in, so use auth whenever cookies are available.
-    let needsAuth = authRequiredActions.contains(endpoint)
-        || (youtubeMode && loadCookiesFromAppBackup() != nil)
+    let needsAuth = actionNeedsAuthentication(endpoint)
     let authIcon = needsAuth ? "🔐" : "🌐"
 
     print("\(authIcon) Exploring action endpoint: \(endpoint)")
@@ -769,7 +2061,7 @@ func exploreAction(
     guard let bodyData = bodyJson.data(using: .utf8),
           let body = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
     else {
-        print("❌ Invalid JSON body: \(bodyJson)")
+        print("❌ Invalid JSON object body")
         return
     }
 
@@ -786,7 +2078,11 @@ func exploreAction(
 
         print("✅ HTTP \(statusCode)")
         print()
-        print(analyzeResponse(data, verbose: verbose))
+        print(analyzeResponse(
+            data,
+            verbose: verbose,
+            searchAuditContext: endpoint == "search" && !youtubeMode ? .firstPage : .automatic
+        ))
 
         if verbose {
             print("\n📄 Raw response (pretty-printed):")
@@ -803,9 +2099,8 @@ func exploreAction(
             if let prettyData = try? JSONSerialization.data(
                 withJSONObject: data, options: .prettyPrinted
             ) {
-                let url = URL(fileURLWithPath: outputFile)
-                try prettyData.write(to: url)
-                print("\n💾 Saved to: \(outputFile)")
+                try writePrivateOutput(prettyData, to: outputFile)
+                print("\n💾 Saved with owner-only permissions: \(outputFile)")
             }
         }
     } catch {
@@ -813,20 +2108,633 @@ func exploreAction(
     }
 }
 
+// MARK: - PrivateInputLimits
+
+private enum PrivateInputLimits {
+    static let bodyBytes = 2 * 1024 * 1024
+    static let promptBytes = 64 * 1024
+    static let promptCharacters = 16000
+}
+
+private func posixError(_ description: String, code: Int32 = errno) -> NSError {
+    NSError(
+        domain: NSPOSIXErrorDomain,
+        code: Int(code),
+        userInfo: [NSLocalizedDescriptionKey: description]
+    )
+}
+
+private func writeAll(_ data: Data, fileDescriptor: Int32) throws {
+    try data.withUnsafeBytes { rawBuffer in
+        guard let baseAddress = rawBuffer.baseAddress else { return }
+        var offset = 0
+        while offset < rawBuffer.count {
+            let written = Darwin.write(
+                fileDescriptor,
+                baseAddress.advanced(by: offset),
+                rawBuffer.count - offset
+            )
+            if written < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                throw posixError("Could not write private output")
+            }
+            offset += written
+        }
+    }
+}
+
+private func extendedACLStatus(fileDescriptor: Int32) throws -> Bool {
+    errno = 0
+    guard let accessControlList = acl_get_fd_np(fileDescriptor, ACL_TYPE_EXTENDED) else {
+        if errno == ENOENT || errno == ENOTSUP || errno == EOPNOTSUPP {
+            return false
+        }
+        throw posixError("Could not inspect file access controls")
+    }
+    defer { _ = acl_free(UnsafeMutableRawPointer(accessControlList)) }
+
+    var firstEntry: acl_entry_t?
+    errno = 0
+    if acl_get_entry(accessControlList, Int32(ACL_FIRST_ENTRY.rawValue), &firstEntry) == 0 {
+        return true
+    }
+    if errno == EINVAL {
+        return false
+    }
+    throw posixError("Could not inspect file access controls")
+}
+
+private func clearExtendedACL(fileDescriptor: Int32) throws {
+    guard let emptyAccessControlList = acl_init(0) else {
+        throw posixError("Could not initialize file access controls")
+    }
+    defer { _ = acl_free(UnsafeMutableRawPointer(emptyAccessControlList)) }
+
+    let result = acl_set_fd_np(fileDescriptor, emptyAccessControlList, ACL_TYPE_EXTENDED)
+    if result == 0 || errno == ENOTSUP || errno == EOPNOTSUPP {
+        return
+    }
+    throw posixError("Could not clear inherited file access controls")
+}
+
+private func verifyOwnerOnlyNode(fileDescriptor: Int32, expectedType: mode_t) throws {
+    var status = stat()
+    guard fstat(fileDescriptor, &status) == 0 else {
+        throw posixError("Could not verify private file")
+    }
+    guard (status.st_mode & S_IFMT) == expectedType,
+          status.st_uid == geteuid(),
+          status.st_mode & 0o077 == 0,
+          try !extendedACLStatus(fileDescriptor: fileDescriptor)
+    else {
+        throw NSError(
+            domain: "APIExplorer",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "File access is not owner-only"]
+        )
+    }
+}
+
+func writePrivateOutput(_ data: Data, to path: String) throws {
+    let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+    let destinationDirectory = url.deletingLastPathComponent().path
+    let filename = url.lastPathComponent.isEmpty ? "api-explorer-output" : url.lastPathComponent
+    var directoryTemplate = Array("\(destinationDirectory)/.\(filename).stage.XXXXXX".utf8CString)
+    guard mkdtemp(&directoryTemplate) != nil else {
+        throw posixError("Could not create private staging directory")
+    }
+    let stagingDirectory = String(
+        decoding: directoryTemplate.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+        as: UTF8.self
+    )
+    guard stagingDirectory.withCString({ Darwin.chmod($0, S_IRWXU) }) == 0 else {
+        throw posixError("Could not secure private staging directory")
+    }
+    let stagingFile = "\(stagingDirectory)/payload"
+    var stagingFileExists = false
+    defer {
+        if stagingFileExists {
+            stagingFile.withCString { _ = Darwin.unlink($0) }
+        }
+        stagingDirectory.withCString { _ = Darwin.rmdir($0) }
+    }
+
+    let directoryDescriptor = stagingDirectory.withCString {
+        Darwin.open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+    }
+    guard directoryDescriptor >= 0 else {
+        throw posixError("Could not open private staging directory")
+    }
+    defer { _ = Darwin.close(directoryDescriptor) }
+    guard fchmod(directoryDescriptor, S_IRUSR | S_IWUSR | S_IXUSR) == 0 else {
+        throw posixError("Could not secure private staging directory")
+    }
+    try clearExtendedACL(fileDescriptor: directoryDescriptor)
+    try verifyOwnerOnlyNode(fileDescriptor: directoryDescriptor, expectedType: S_IFDIR)
+
+    let fileDescriptor = "payload".withCString {
+        Darwin.openat(
+            directoryDescriptor,
+            $0,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR
+        )
+    }
+    guard fileDescriptor >= 0 else {
+        throw posixError("Could not create private output")
+    }
+    stagingFileExists = true
+    defer { _ = Darwin.close(fileDescriptor) }
+
+    guard fchmod(fileDescriptor, S_IRUSR | S_IWUSR) == 0 else {
+        throw posixError("Could not secure private output")
+    }
+    try clearExtendedACL(fileDescriptor: fileDescriptor)
+    try verifyOwnerOnlyNode(fileDescriptor: fileDescriptor, expectedType: S_IFREG)
+    try writeAll(data, fileDescriptor: fileDescriptor)
+    guard fsync(fileDescriptor) == 0 else {
+        throw posixError("Could not synchronize private output")
+    }
+
+    let renameResult = stagingFile.withCString { sourcePath in
+        url.path.withCString { destinationPath in
+            Darwin.rename(sourcePath, destinationPath)
+        }
+    }
+    guard renameResult == 0 else {
+        throw posixError("Could not replace output file")
+    }
+    stagingFileExists = false
+}
+
+private func readBoundedData(
+    fileDescriptor: Int32,
+    maximumBytes: Int = PrivateInputLimits.bodyBytes,
+    contentDescription: String = "Request body"
+) throws -> Data {
+    var result = Data()
+    var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+    while true {
+        let maximumRead = min(buffer.count, maximumBytes + 1 - result.count)
+        guard maximumRead > 0 else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "\(contentDescription) exceeds its size limit",
+                ]
+            )
+        }
+        let readCount = buffer.withUnsafeMutableBytes { rawBuffer in
+            Darwin.read(fileDescriptor, rawBuffer.baseAddress, maximumRead)
+        }
+        if readCount == 0 {
+            break
+        }
+        if readCount < 0 {
+            if errno == EINTR {
+                continue
+            }
+            throw posixError("Could not read request body")
+        }
+        result.append(buffer, count: readCount)
+        if result.count > maximumBytes {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "\(contentDescription) exceeds its size limit",
+                ]
+            )
+        }
+    }
+    return result
+}
+
+func loadPrivatePrompt(from promptFile: String) throws -> String {
+    let data: Data
+    if promptFile == "-" {
+        guard Darwin.isatty(STDIN_FILENO) == 0 else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Interactive stdin is not accepted; pipe or redirect the prompt instead",
+                ]
+            )
+        }
+        data = try readBoundedData(
+            fileDescriptor: STDIN_FILENO,
+            maximumBytes: PrivateInputLimits.promptBytes,
+            contentDescription: "Prompt"
+        )
+    } else {
+        let expandedPath = NSString(string: promptFile).expandingTildeInPath
+        let fileDescriptor = expandedPath.withCString {
+            Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard fileDescriptor >= 0 else {
+            throw posixError("Could not open private prompt file")
+        }
+        defer { _ = Darwin.close(fileDescriptor) }
+
+        var status = stat()
+        guard fstat(fileDescriptor, &status) == 0 else {
+            throw posixError("Could not inspect private prompt file")
+        }
+        guard (status.st_mode & S_IFMT) == S_IFREG else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Prompt path must be a regular file"]
+            )
+        }
+        guard status.st_uid == geteuid(),
+              status.st_mode & 0o777 == S_IRUSR | S_IWUSR
+        else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Prompt file must be owned by the current user with mode 0600",
+                ]
+            )
+        }
+        guard try !extendedACLStatus(fileDescriptor: fileDescriptor) else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Prompt file must not have an extended ACL (use chmod -N)",
+                ]
+            )
+        }
+        guard status.st_size >= 0,
+              status.st_size <= off_t(PrivateInputLimits.promptBytes)
+        else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Prompt exceeds its size limit"]
+            )
+        }
+        data = try readBoundedData(
+            fileDescriptor: fileDescriptor,
+            maximumBytes: PrivateInputLimits.promptBytes,
+            contentDescription: "Prompt"
+        )
+    }
+
+    guard var prompt = String(data: data, encoding: .utf8) else {
+        throw NSError(
+            domain: "APIExplorer",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Prompt must be valid UTF-8"]
+        )
+    }
+    prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !prompt.isEmpty, prompt.count <= PrivateInputLimits.promptCharacters else {
+        throw NSError(
+            domain: "APIExplorer",
+            code: -1,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Prompt must contain 1-\(PrivateInputLimits.promptCharacters) characters",
+            ]
+        )
+    }
+    return prompt
+}
+
+/// Reuses the owner, mode, ACL, symlink, and bounded-read checks for private input.
+/// Only a regular file is accepted so a token can never be echoed by a terminal.
+func loadMobileAccessToken(from path: String) throws -> String {
+    guard path != "-", let token = try? loadPrivatePrompt(from: path),
+          token.utf8.count <= 8192,
+          token.unicodeScalars.allSatisfy({ scalar in
+              (65 ... 90).contains(scalar.value) || (97 ... 122).contains(scalar.value)
+                  || (48 ... 57).contains(scalar.value) || "-._~+/=".unicodeScalars.contains(scalar)
+          })
+    else { throw DiscoveryError.invalidMobileToken }
+    return token
+}
+
+/// Prevents discovery reports from replacing an input file, including
+/// relative paths, symlinked directories, and existing hard-link aliases.
+func pathsReferToSameFile(_ firstPath: String, _ secondPath: String) -> Bool {
+    let first = URL(fileURLWithPath: NSString(string: firstPath).expandingTildeInPath).resolvingSymlinksInPath().standardizedFileURL
+    let second = URL(fileURLWithPath: NSString(string: secondPath).expandingTildeInPath).resolvingSymlinksInPath().standardizedFileURL
+    if first == second {
+        return true
+    }
+    var firstStatus = stat()
+    var secondStatus = stat()
+    return first.path.withCString { Darwin.lstat($0, &firstStatus) } == 0
+        && second.path.withCString { Darwin.lstat($0, &secondStatus) } == 0
+        && firstStatus.st_dev == secondStatus.st_dev && firstStatus.st_ino == secondStatus.st_ino
+}
+
+/// Shell redirection can make stdin another alias of an output file.
+func fileDescriptorRefersToFile(_ fileDescriptor: Int32, path: String) -> Bool {
+    var inputStatus = stat()
+    var outputStatus = stat()
+    let output = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath).resolvingSymlinksInPath().standardizedFileURL
+    return fstat(fileDescriptor, &inputStatus) == 0
+        && (inputStatus.st_mode & S_IFMT) == S_IFREG
+        && output.path.withCString { Darwin.lstat($0, &outputStatus) } == 0
+        && inputStatus.st_dev == outputStatus.st_dev && inputStatus.st_ino == outputStatus.st_ino
+}
+
+func loadRequestBodyJSON(inlineBody: String?, bodyFile: String?) throws -> String {
+    if inlineBody != nil, bodyFile != nil {
+        throw NSError(
+            domain: "APIExplorer",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Use either an inline body or --body-file, not both"]
+        )
+    }
+    if let inlineBody {
+        return inlineBody
+    }
+    guard let bodyFile else {
+        throw NSError(
+            domain: "APIExplorer",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "A JSON body or --body-file is required"]
+        )
+    }
+
+    let data: Data
+    if bodyFile == "-" {
+        data = try readBoundedData(fileDescriptor: STDIN_FILENO)
+    } else {
+        let expandedPath = NSString(string: bodyFile).expandingTildeInPath
+        let fileDescriptor = expandedPath.withCString {
+            Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard fileDescriptor >= 0 else {
+            throw posixError("Could not open private request body")
+        }
+        defer { _ = Darwin.close(fileDescriptor) }
+
+        var status = stat()
+        guard fstat(fileDescriptor, &status) == 0 else {
+            throw posixError("Could not inspect private request body")
+        }
+        guard (status.st_mode & S_IFMT) == S_IFREG else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Request body path must be a regular file"]
+            )
+        }
+        guard status.st_mode & 0o077 == 0 else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Request body file must be owner-only (chmod 600)",
+                ]
+            )
+        }
+        guard try !extendedACLStatus(fileDescriptor: fileDescriptor) else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Request body file must not have an extended ACL (use chmod -N)",
+                ]
+            )
+        }
+        guard status.st_size >= 0,
+              status.st_size <= off_t(PrivateInputLimits.bodyBytes)
+        else {
+            throw NSError(
+                domain: "APIExplorer",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Request body exceeds 2 MiB"]
+            )
+        }
+        data = try readBoundedData(fileDescriptor: fileDescriptor)
+    }
+
+    guard !data.isEmpty, let body = String(data: data, encoding: .utf8)
+    else {
+        throw NSError(
+            domain: "APIExplorer",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Request body must be non-empty UTF-8 under 2 MiB"]
+        )
+    }
+    return body
+}
+
+func requiresPrivateBodySource(_ endpoint: String) -> Bool {
+    ["get_answer", "get_panel", "streaming_panel"].contains(endpoint)
+}
+
+func requiresRedactedWireInspection(_ endpoint: String) -> Bool {
+    endpoint == "next" || requiresPrivateBodySource(endpoint)
+}
+
+func exploreWireAction(
+    _ endpoint: String, bodyJson: String, outputFile: String? = nil
+) async {
+    let needsAuth = actionNeedsAuthentication(endpoint)
+    let authIcon = needsAuth ? "🔐" : "🌐"
+
+    print("\(authIcon) Inspecting wire response: \(endpoint)")
+    if needsAuth {
+        print("   Auth material: \(hasUsableAuthMaterial() ? "✅ available" : "❌ unavailable")")
+    }
+    print("   Raw response values stay hidden")
+    print()
+
+    guard let bodyData = bodyJson.data(using: .utf8),
+          let body = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
+    else {
+        print("❌ Invalid JSON object body")
+        return
+    }
+
+    do {
+        let response = try await makeWireRequest(
+            endpoint: endpoint, body: body, authenticated: needsAuth
+        )
+        print(wireResponseAuditSummary(
+            data: response.data,
+            statusCode: response.statusCode,
+            contentType: response.contentType
+        ))
+
+        if let outputFile {
+            try writePrivateOutput(response.data, to: outputFile)
+            print("\n💾 Saved raw response with owner-only permissions: \(outputFile)")
+            print("   ⚠️ Treat this file as sensitive; it may contain personalized or opaque data.")
+        }
+    } catch {
+        print("❌ Error: \(error.localizedDescription)")
+    }
+}
+
+// swiftlint:disable no_print
+private func auditSearchFilter(
+    _ probe: SearchFilterProbe,
+    authenticated: Bool,
+    verbose: Bool
+) async {
+    do {
+        let (filterResponse, filterStatus) = try await makeRequest(
+            endpoint: "search",
+            body: [
+                "query": probe.query,
+                "params": probe.params,
+            ],
+            authenticated: authenticated
+        )
+        print("\n══ \(probe.label) — HTTP \(filterStatus) ══")
+        guard isSuccessfulAPIResponse(statusCode: filterStatus, data: filterResponse) else {
+            print("  ❌ Filter probe failed: \(apiFailureDescription(statusCode: filterStatus, data: filterResponse))")
+            return
+        }
+        if verbose {
+            print("   Params: \(terminalSafe(probe.params))")
+        }
+        let filterSummary = searchResponseAuditSummary(
+            filterResponse,
+            sampleLimit: verbose ? 12 : 4,
+            context: .firstPage
+        )
+        print(filterSummary.isEmpty ? "  ⚠️ No recognized YouTube Music search shape" : filterSummary)
+        if probe.label == "Podcasts" {
+            print("  • Mozaic uses a dedicated podcast-show parser for this filter.")
+        }
+
+        guard let continuationValue = firstSearchContinuationValue(in: filterResponse) else {
+            print("  • Continuation probe: none offered")
+            return
+        }
+
+        let (continuationResponse, continuationStatus) = try await makeRequest(
+            endpoint: "search",
+            body: ["continuation": continuationValue],
+            authenticated: authenticated
+        )
+        print("  • Continuation probe via /search: HTTP \(continuationStatus)")
+        guard isSuccessfulAPIResponse(
+            statusCode: continuationStatus,
+            data: continuationResponse
+        ) else {
+            print("  ❌ Continuation probe failed: \(apiFailureDescription(statusCode: continuationStatus, data: continuationResponse))")
+            return
+        }
+        let continuationSummary = searchResponseAuditSummary(
+            continuationResponse,
+            sampleLimit: verbose ? 8 : 2,
+            context: .continuation
+        )
+        print(continuationSummary.isEmpty
+            ? "  ⚠️ Unrecognized search continuation response shape"
+            : continuationSummary)
+    } catch {
+        print("  ❌ \(probe.label) probe failed: \(error.localizedDescription)")
+    }
+}
+
+/// Audits the live YouTube Music search response, every filter chip returned by the
+/// service, and the first continuation page for each filter that offers one.
+func auditSearch(_ query: String, verbose: Bool = false) async {
+    guard !youtubeMode else {
+        print("❌ search-audit currently supports YouTube Music mode only")
+        print("   Use 'action search' for regular YouTube response inspection.")
+        return
+    }
+
+    let authenticated = !forceUnauthenticatedRequests && hasUsableAuthMaterial()
+    let mode = authenticated ? "cookie auth requested (validity unverified)" : "guest"
+    print("🔬 Auditing YouTube Music search")
+    print("   Query: \(terminalSafe(query))")
+    print("   Session: \(mode)")
+    print()
+
+    do {
+        if ProcessInfo.processInfo.environment[apiKeyEnvironmentVariable]?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).isEmpty == false {
+            await resolveLiveClientVersionIfNeeded(authenticated: authenticated)
+        }
+        let (baseResponse, baseStatus) = try await makeRequest(
+            endpoint: "search",
+            body: ["query": query],
+            authenticated: authenticated
+        )
+        let versionSource = if clientVersionWasForced {
+            "override"
+        } else if cachedClientVersion != nil {
+            "live"
+        } else {
+            "fallback"
+        }
+        print("   Client version: \(terminalSafe(cachedClientVersion ?? activeFallbackClientVersion)) (\(versionSource))")
+        print("══ Unfiltered search — HTTP \(baseStatus) ══")
+        guard isSuccessfulAPIResponse(statusCode: baseStatus, data: baseResponse) else {
+            print("  ❌ Unfiltered probe failed: \(apiFailureDescription(statusCode: baseStatus, data: baseResponse))")
+            return
+        }
+        let baseSummary = searchResponseAuditSummary(
+            baseResponse,
+            sampleLimit: verbose ? 20 : 8,
+            context: .firstPage
+        )
+        print(baseSummary.isEmpty ? "  ⚠️ No recognized YouTube Music search shape" : baseSummary)
+
+        let probes = searchFilterProbes(from: baseResponse)
+        guard !probes.isEmpty else {
+            print("\n⚠️ The unfiltered response exposed no navigable filter chips.")
+            return
+        }
+
+        print("\n🧭 Probing \(probes.count) live filter chip(s): \(probes.map(\.label).joined(separator: ", "))")
+        let unsupportedLabels = probes.map(\.label).filter { !mozaicSearchFilterLabels.contains($0) }
+        if !unsupportedLabels.isEmpty {
+            print("   Filter chips without a dedicated Mozaic filter: \(unsupportedLabels.joined(separator: ", "))")
+        }
+
+        for probe in probes {
+            await auditSearchFilter(probe, authenticated: authenticated, verbose: verbose)
+        }
+    } catch {
+        print("❌ Search audit failed: \(error.localizedDescription)")
+    }
+}
+
+// swiftlint:enable no_print
+
 /// Explores a continuation request to fetch more items.
 /// - Parameters:
 ///   - token: The continuation token
-///   - endpoint: The endpoint to use ("browse" for home/library, "next" for mix queues)
+///   - endpoint: The endpoint to use ("browse" for home/library, "search" for search, "next" for mix queues)
 func exploreContinuation(
     _ token: String, endpoint: String = "browse", verbose: Bool = false, outputFile: String? = nil
 ) async {
     print("🔄 Exploring continuation request")
-    print("   Token: \(token.prefix(50))...")
+    print("   Token: present (value hidden)")
     print("   Endpoint: \(endpoint)")
     print()
 
     var body: [String: Any] = ["continuation": token]
-
+    // Preserve the caller's requested session mode: cookies are used when they
+    // are available, while --guest/--no-auth forces a signed-out continuation.
+    let authenticated = !forceUnauthenticatedRequests && hasUsableAuthMaterial()
     // For "next" endpoint continuations (mix queues), add required parameters
     if endpoint == "next" {
         body["enablePersistentPlaylistPanel"] = true
@@ -834,9 +2742,8 @@ func exploreContinuation(
     }
 
     do {
-        // Always authenticate for continuations
         let (data, statusCode) = try await makeRequest(
-            endpoint: endpoint, body: body, authenticated: true
+            endpoint: endpoint, body: body, authenticated: authenticated
         )
 
         if statusCode == 401 || statusCode == 403 {
@@ -846,7 +2753,11 @@ func exploreContinuation(
 
         print("✅ HTTP \(statusCode)")
         print()
-        print(analyzeResponse(data, verbose: verbose))
+        print(analyzeResponse(
+            data,
+            verbose: verbose,
+            searchAuditContext: endpoint == "search" && !youtubeMode ? .continuation : .automatic
+        ))
 
         // Analyze continuation-specific structure
         print("\n📊 Continuation Analysis:")
@@ -883,19 +2794,18 @@ func exploreContinuation(
                     }
                 }
             }
-        } else if let actions = data["onResponseReceivedActions"] as? [[String: Any]] {
-            print("   Found onResponseReceivedActions (2025 format)")
-            for (idx, action) in actions.enumerated() {
-                print("   └─ Action \(idx) keys: \(Array(action.keys))")
-                if let appendAction = action["appendContinuationItemsAction"] as? [String: Any],
-                   let items = appendAction["continuationItems"] as? [[String: Any]]
-                {
-                    print("      └─ continuationItems: \(items.count) items")
-                }
-            }
         } else {
-            print("   ⚠️ No recognized continuation format found")
-            print("   Top-level keys: \(Array(data.keys))")
+            let actionGroups = searchContinuationActionGroups(in: data)
+            if !actionGroups.isEmpty {
+                print("   Found action-envelope continuation format")
+                for (index, group) in actionGroups.enumerated() {
+                    print("   └─ Group \(index): \(group.envelope).\(group.command)")
+                    print("      └─ continuationItems: \(group.items.count) items")
+                }
+            } else {
+                print("   ⚠️ No recognized continuation format found")
+                print("   Top-level keys: \(Array(data.keys))")
+            }
         }
 
         if verbose {
@@ -913,9 +2823,8 @@ func exploreContinuation(
             if let prettyData = try? JSONSerialization.data(
                 withJSONObject: data, options: .prettyPrinted
             ) {
-                let url = URL(fileURLWithPath: outputFile)
-                try prettyData.write(to: url)
-                print("\n💾 Saved to: \(outputFile)")
+                try writePrivateOutput(prettyData, to: outputFile)
+                print("\n💾 Saved with owner-only permissions: \(outputFile)")
             }
         }
     } catch {
@@ -1040,7 +2949,13 @@ func discoverAccounts(verbose: Bool) async {
 private func fetchAccountInfo(authUserIndex: Int, verbose: Bool) async -> (
     name: String, handle: String?
 )? {
-    guard let apiKey = try? await resolveAPIKey() else {
+    let apiKey: String
+    do {
+        apiKey = try await resolveAPIKey(authenticated: true)
+    } catch let error as ResponseSizeLimitError {
+        print("⚠️ Account discovery skipped: \(error.localizedDescription)")
+        return nil
+    } catch {
         return nil
     }
     var components = URLComponents(string: "\(activeBaseURL)/account/account_menu")
@@ -1279,8 +3194,11 @@ func probeSigninSwitchReal(nextURLString: String) async {
         return
     }
     // Normalize protocol-relative URLs.
-    if signin.hasPrefix("//") { signin = "https:" + signin }
-    else if signin.hasPrefix("/") { signin = "https://www.youtube.com" + signin }
+    if signin.hasPrefix("//") {
+        signin = "https:" + signin
+    } else if signin.hasPrefix("/") {
+        signin = "https://www.youtube.com" + signin
+    }
 
     // Rewrite only the `next` param.
     guard var comps = URLComponents(string: signin) else {
@@ -1441,7 +3359,8 @@ func probeYtcfg(pageURLString: String?, verbose: Bool) async {
         let dataSyncId = extractConfigValue(named: "DATASYNC_ID", from: html)
         let delegated = extractConfigValue(named: "DELEGATED_SESSION_ID", from: html)
         let sessionIndex = extractConfigValue(named: "SESSION_INDEX", from: html)
-        let loggedIn = extractConfigValue(named: "LOGGED_IN", from: html)
+            ?? extractConfigInteger(named: "SESSION_INDEX", from: html).map(String.init)
+        let loggedIn = extractConfigBoolean(named: "LOGGED_IN", from: html)
 
         func redact(_ value: String?) -> String {
             guard let value, !value.isEmpty else { return "(absent/empty)" }
@@ -1466,13 +3385,16 @@ func probeYtcfg(pageURLString: String?, verbose: Bool) async {
         }
         print("DELEGATED_SESSION_ID:  \(redact(delegated))")
         print("SESSION_INDEX:         \(sessionIndex ?? "(absent)")")
-        print("LOGGED_IN:             \(loggedIn ?? "(absent)")")
+        print("LOGGED_IN:             \(loggedIn.map(String.init) ?? "(absent)")")
 
         if verbose {
-            for name in ["DATASYNC_ID", "DELEGATED_SESSION_ID", "SESSION_INDEX"] {
-                if extractConfigValue(named: name, from: html) == nil {
-                    print("  (note: \(name) not found in page ytcfg)")
-                }
+            let missingFields = [
+                (name: "DATASYNC_ID", isMissing: dataSyncId == nil),
+                (name: "DELEGATED_SESSION_ID", isMissing: delegated == nil),
+                (name: "SESSION_INDEX", isMissing: sessionIndex == nil),
+            ]
+            for field in missingFields where field.isMissing {
+                print("  (note: \(field.name) not found in page ytcfg)")
             }
         }
     } catch {
@@ -1666,18 +3588,24 @@ func listEndpoints() {
         FEmusic_moods_and_genres      Browse by mood (Chill, Focus) or genre (Pop, Rock)
         FEmusic_new_releases          Recently released albums, singles, videos
         FEmusic_podcasts              Podcast discovery
+        FEmusic_radio_builder         Radio controls and form entities (creation unverified)
 
         🔐 AUTHENTICATED (Requires Sign-in)
         ───────────────────────────────────────────────────────────────────────────────
         FEmusic_liked_playlists       User's saved/created playlists
+        FEmusic_liked_albums          User's saved albums
         FEmusic_liked_videos          Liked songs (returns playlist format)
         FEmusic_history               Listening history (organized by time)
         FEmusic_library_landing       Library overview page
-        FEmusic_library_albums        Saved albums (requires params*)
+        FEmusic_tastebuilder          Artist-selection data; acceptance is not replayable in discover
+        FEmusic_listening_review      Recap probe (signed-in sample returned a message only)
         FEmusic_library_artists       Rejected with HTTP 400 in current sessions
         FEmusic_library_corpus_artists Followed artists (returns public UC... pages)
         FEmusic_library_corpus_track_artists  Artists chip from Library (returns MPLAUC... pages)
-        FEmusic_library_songs         All songs in library (requires params*)
+        FEmusic_library_songs         Unverified legacy ID; the Songs chip issues FEmusic_liked_videos
+        FEmusic_library_non_music_audio_list       Dedicated podcast library
+        FEmusic_library_non_music_audio_channels_list Podcast library channel filter (preserve params)
+        FEmusic_library_user_profile_channels_list Profiles filter (preserve issued params)
         FEmusic_recently_played       Recently played content
         FEmusic_offline               Downloaded content (may not work on desktop)
 
@@ -1685,7 +3613,8 @@ func listEndpoints() {
         ───────────────────────────────────────────────────────────────────────────────
         FEmusic_library_privately_owned_landing   Uploads landing page
         FEmusic_library_privately_owned_tracks    User-uploaded songs
-        FEmusic_library_privately_owned_albums    User-uploaded albums
+        FEmusic_library_privately_owned_releases  Upload Albums chip (empty signed-in sample verified)
+        FEmusic_library_privately_owned_albums    Rejected legacy probe; use the issued releases route
         FEmusic_library_privately_owned_artists   Artists from user uploads
 
         🌐 DYNAMIC BROWSE IDs (Pattern-based)
@@ -1695,6 +3624,8 @@ func listEndpoints() {
         MPLAUC{libraryArtistId}       Library artist detail (from Artists chip, requires auth)
         MPREb_{albumId}               Album detail
         MPLYt_{lyricsId}              Lyrics content
+        MPTC{creditsId}               Song credits dialog (use server-issued browseId)
+        MPTR{relatedId}               Related tracks, playlists, artists (from next tabs)
         FEmusic_moods_and_genres_category   Mood/Genre category (with params)
 
         ═══════════════════════════════════════════════════════════════════════════════
@@ -1772,16 +3703,15 @@ func listEndpoints() {
                                       Body: {}
 
         ═══════════════════════════════════════════════════════════════════════════════
-        📌 LIBRARY PARAMS (for library_albums, library_artists, library_songs)
+        📌 OPTIONAL LIBRARY SORT PARAMS
         ═══════════════════════════════════════════════════════════════════════════════
 
-        ggMGKgQIARAA    Recently Added
-        ggMGKgQIAhAA    Recently Played
-        ggMGKgQIAxAA    Alphabetical A-Z
-        ggMGKgQIBBAA    Alphabetical Z-A
-        ggMCCAE         Default Sort
+        ggMGKgQIARAA    Alphabetical A-Z
+        ggMGKgQIARAB    Alphabetical Z-A
+        ggMGKgQIABAB    Recently Added
 
-        Example: swift run api-explorer browse FEmusic_library_albums ggMGKgQIARAA
+        Saved albums use FEmusic_liked_albums and do not require params for the default order.
+        Example: swift run api-explorer browse FEmusic_liked_albums
 
         FEmusic_library_corpus_track_artists is the Library Artists chip endpoint.
         It requires sign-in for useful content but does not need sort params.
@@ -1816,6 +3746,20 @@ func listEndpoints() {
         subscription/unsubscribe      Body: {"channelIds": ["UC..."]}
         browse/edit_playlist          Watch Later add/remove via playlistId "WL"
 
+        🤖 AI / PANEL TRANSPORTS (experimental, inspect with redacted audit commands)
+        ───────────────────────────────────────────────────────────────────────────────
+        get_answer                    Timed/polling AI answer command transport
+        get_panel                     Engagement-panel continuation/bootstrap transport
+        streaming_panel               Chunked engagement-panel response transport
+        get_watch                     Combined player + watch-next bootstrap transport
+
+        Audit a video:                swift run api-explorer ask-video-audit <VIDEO_ID>
+        Compare Ask request profiles: swift run api-explorer ask-video-parity <VIDEO_ID>
+        Inspect wire format:          swift run api-explorer --youtube wire-action <ep> '{}'
+        Discover read-only routes:    swift run api-explorer discover help
+        Signed-in Library filters:   swift run api-explorer discover browse '{"browseId":"FEmusic_library_landing"}'
+        Transcript navigation:       next may issue getTranscriptEndpoint; guest replay returned 400
+
         ═══════════════════════════════════════════════════════════════════════════════
         💡 USAGE TIPS
         ═══════════════════════════════════════════════════════════════════════════════
@@ -1845,8 +3789,19 @@ func showHelp() {
 
         Commands:
           browse <browseId> [params]     Explore a browse endpoint
-          action <endpoint> <body>       Explore an action endpoint (body as JSON)
-          continuation <token> [ep]      Explore a continuation (ep: 'browse' or 'next')
+          action <endpoint> [body]       Explore a JSON action endpoint
+          wire-action <endpoint> [body]  Safely inspect JSON, streaming, or opaque responses
+          discover <endpoint> [body]     Inspect read-only navigation, filters, and response shapes
+          ask-video-audit <videoId>      Audit Ask Gemini / YouChat without sending a prompt
+          ask-video-parity <videoId>     Compare ordered read-only Ask request profiles
+          ask-video-live-test <videoId>  Replay the server-issued summary suggestion
+          ask-video-free-text-test <videoId>
+                                         Validate one server-commanded free-text request
+          search-audit <query>           Audit live Music search shapes, filters, and continuations
+          continuation <token> [ep]      Explore a continuation (ep: 'browse', 'search', or 'next')
+          queue-probe <videoId> [playlistId]
+                                         Summarize the Music next/radio queue shape
+          analyze-file <path>            Safely summarize a saved JSON response
           list                           List all known endpoints
           auth                           Check authentication status
           accounts                       Discover available accounts (via authuser)
@@ -1860,24 +3815,47 @@ func showHelp() {
           help                           Show this help message
 
         Options:
-          -v, --verbose                  Show full raw JSON response (not truncated)
-          -o, --output <file>            Save raw JSON response to a file
+          -v, --verbose                  Show raw JSON or expand audits; discover/queue-probe stay redacted
+          -o, --output <file>            Save mode-0600 output; discover/queue-probe stay redacted
+          --body-file <path|->           Read a sensitive JSON body from a chmod-600 file or stdin
+          --prompt-file <path|->         Read a private prompt from a mode-0600 file or stdin
+          --confirm-live-ai              Required acknowledgement for live Ask commands
+          --fresh-chats N                Run 1-3 independent summary chats (default: 1)
+          --follow-up                    Replay the first server-issued follow-up suggestion
+          --follow <index>               Follow a numbered discover entry, repeat up to 5 times
+          --limit N                      Show 1-500 discover entries (default: 40)
           --authuser N                   Use Google account at index N (for multi-account)
           --brand <ID>                   Use brand account ID (21-digit number)
+          --client-version <version>     Override the resolved InnerTube client version
+          --hl <code>                    Override the InnerTube `hl` language parameter
+                                         (default: en). Use to compare how a locale
+                                         code localizes real responses.
           --youtube, --yt                Target regular YouTube (www.youtube.com, WEB client)
                                          instead of YouTube Music
+          --ios-music                    Use IOS_MUSIC with discover, including mobile Home models
+          --android-music                Use ANDROID_MUSIC with discover
+          --mobile-web-key               Add the resolved web API key to mobile discovery
+          --mobile-cookie-only           Omit SAPISIDHASH while retaining cookies for comparison
+          --mobile-token-file <path>     Read a mobile OAuth access token from a mode-0600 file
+          --no-auth, --guest             Force signed-out requests even if Mozaic cookies exist
 
         YouTube mode examples:
           # Browse YouTube surfaces (auth used automatically when cookies exist)
-          swift run api-explorer --youtube browse FEwhat_to_watch     # Home feed
-          swift run api-explorer --youtube browse FEgaming_destination # Explore destination
+          swift run api-explorer --youtube --guest browse FEwhat_to_watch     # Signed-out Home feed
+          swift run api-explorer --youtube --guest browse FEgaming_destination # Signed-out Explore destination
           swift run api-explorer --youtube browse FEsubscriptions     # Subscriptions feed
           swift run api-explorer --youtube browse FEhistory           # Watch history
           swift run api-explorer --youtube browse VLWL                # Watch Later
           swift run api-explorer --youtube browse VLLL                # Liked videos
-          swift run api-explorer --youtube action search '{"query":"swift concurrency"}'
+          swift run api-explorer --youtube --guest action search '{"query":"swift concurrency"}'
           swift run api-explorer --youtube action next '{"videoId":"dQw4w9WgXcQ"}'
           swift run api-explorer --youtube action guide '{}'          # Sidebar + subscriptions list
+          swift run api-explorer ask-video-audit dQw4w9WgXcQ          # Redacted AI audit
+          swift run api-explorer ask-video-parity dQw4w9WgXcQ         # Read-only profile matrix
+          swift run api-explorer ask-video-live-test dQw4w9WgXcQ --confirm-live-ai --follow-up
+          swift run api-explorer ask-video-free-text-test dQw4w9WgXcQ --confirm-live-ai --prompt-file -
+          swift run api-explorer --youtube wire-action get_watch '{"playerRequest":{"videoId":"dQw4w9WgXcQ"},"watchNextRequest":{"videoId":"dQw4w9WgXcQ"}}'
+          swift run api-explorer --youtube wire-action streaming_panel --body-file /path/to/private-body.json
 
         Examples:
           # Explore public endpoints
@@ -1898,10 +3876,18 @@ func showHelp() {
           swift run api-explorer action search '{"query":"never gonna give you up"}'
           swift run api-explorer action player '{"videoId":"dQw4w9WgXcQ"}'
           swift run api-explorer action next '{"playlistId":"RDEM...","videoId":"abc123"}'
+          swift run api-explorer queue-probe dQw4w9WgXcQ
+
+          # Deeply audit YouTube Music search response coverage
+          swift run api-explorer --guest search-audit "ambient electronic mix"
 
           # Continuation (for pagination / infinite mix)
           swift run api-explorer continuation <token>           # browse endpoint (default)
+          swift run api-explorer --guest continuation <token> search # guest filtered search results
           swift run api-explorer continuation <token> next      # next endpoint (for mix queues)
+
+          # Safely inspect a saved response without printing raw token values
+          swift run api-explorer analyze-file Tests/MozaicTests/Fixtures/example.json
 
           # Check auth status
           swift run api-explorer auth
@@ -1910,73 +3896,271 @@ func showHelp() {
                 For authenticated endpoints, sign in to the Mozaic app first.
                 Debug builds export auth cookies to:
                     ~/Library/Application Support/Mozaic/cookies.dat
+                Use --guest/--no-auth to validate signed-out behavior without
+                reading those cookies.
 
         """
     )
 }
 
+/// Analyzes a saved JSON response without printing raw values.
+/// Useful for parser/fixture validation when live authenticated cookies are unavailable.
+func analyzeSavedResponse(at path: String) {
+    let url = URL(fileURLWithPath: path)
+    do {
+        let data = try Data(contentsOf: url)
+        guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            print("❌ Saved response is not a JSON object")
+            return
+        }
+        print("📄 Analyzing saved response: \(url.lastPathComponent)")
+        print("   Raw JSON and token values remain hidden")
+        print()
+        print(analyzeResponse(response))
+    } catch {
+        print("❌ Failed to analyze saved response: \(error.localizedDescription)")
+    }
+}
+
 // MARK: - Main Entry Point
+
+private func commandLineOptionValue(
+    after index: Int,
+    in arguments: [String],
+    allowSingleDash: Bool = false
+) -> String? {
+    guard index + 1 < arguments.count else { return nil }
+    let value = arguments[index + 1]
+    if value == "-" {
+        return allowSingleDash ? value : nil
+    }
+    guard !value.hasPrefix("-") else { return nil }
+    return value
+}
 
 func runMain() async {
     let args = Array(CommandLine.arguments.dropFirst())
-    let verbose = args.contains("-v") || args.contains("--verbose")
-
-    // Parse output file option
+    var verbose = false
+    var confirmLiveAI = false
+    var includeAskFollowUp = false
+    var freshChatCount = 1
     var outputFile: String?
-    for (index, arg) in args.enumerated() {
-        if arg == "-o" || arg == "--output", index + 1 < args.count {
-            outputFile = args[index + 1]
-            break
-        }
-    }
-
-    // Parse authuser option
-    for (index, arg) in args.enumerated() {
-        if arg == "--authuser", index + 1 < args.count {
-            if let value = Int(args[index + 1]) {
-                globalAuthUserIndex = value
-            }
-            break
-        }
-    }
-
-    // Parse brand account option
-    for (index, arg) in args.enumerated() {
-        if arg == "--brand", index + 1 < args.count {
-            globalBrandAccountId = args[index + 1]
-            break
-        }
-    }
-
-    // Parse YouTube mode option (target www.youtube.com / WEB client)
-    if args.contains("--youtube") || args.contains("--yt") {
-        activateYouTubeMode()
-    }
-
-    // Filter out option flags and their values
+    var bodyFile: String?
+    var promptFile: String?
+    var discoveryFollowIndices: [Int] = []
+    var discoveryLimit = 40
+    var discoveryLimitWasSpecified = false
+    var mobileClient: MusicMobileRequestProfile.Client?
+    var mobileWebKey = false
+    var mobileCookieOnly = false
+    var mobileTokenFile: String?
     var filteredArgs: [String] = []
-    var skipNext = false
-    for arg in args {
-        if skipNext {
-            skipNext = false
+
+    var index = 0
+    while index < args.count {
+        let argument = args[index]
+        switch argument {
+        case "-v", "--verbose":
+            verbose = true
+        case "--youtube", "--yt":
+            activateYouTubeMode()
+        case "--ios-music", "--android-music":
+            guard mobileClient == nil else {
+                print("❌ Select only one mobile client profile")
+                exit(1)
+            }
+            mobileClient = argument == "--ios-music" ? .ios : .android
+        case "--mobile-web-key":
+            mobileWebKey = true
+        case "--mobile-cookie-only":
+            mobileCookieOnly = true
+        case "--mobile-token-file":
+            guard let value = commandLineOptionValue(after: index, in: args) else {
+                print("❌ --mobile-token-file requires a private regular file path")
+                exit(1)
+            }
+            mobileTokenFile = value
+            index += 1
+        case "--no-auth", "--guest":
+            forceUnauthenticatedRequests = true
+        case "--confirm-live-ai":
+            confirmLiveAI = true
+        case "--follow-up":
+            includeAskFollowUp = true
+        case "--follow":
+            guard let rawValue = commandLineOptionValue(after: index, in: args),
+                  let value = Int(rawValue), value >= 0,
+                  discoveryFollowIndices.count < 5
+            else {
+                print("❌ --follow requires a nonnegative entry index, at most 5 times")
+                exit(1)
+            }
+            discoveryFollowIndices.append(value)
+            index += 1
+        case "--limit":
+            guard let rawValue = commandLineOptionValue(after: index, in: args),
+                  let value = Int(rawValue), (1 ... 500).contains(value)
+            else {
+                print("❌ --limit requires an integer between 1 and 500")
+                exit(1)
+            }
+            discoveryLimit = value
+            discoveryLimitWasSpecified = true
+            index += 1
+        case "-o", "--output":
+            guard let value = commandLineOptionValue(
+                after: index,
+                in: args,
+                allowSingleDash: true
+            ) else {
+                print("❌ \(argument) requires a path")
+                return
+            }
+            index += 1
+            outputFile = value
+        case "--body-file":
+            guard let value = commandLineOptionValue(
+                after: index,
+                in: args,
+                allowSingleDash: true
+            ) else {
+                print("❌ --body-file requires a path or -")
+                return
+            }
+            index += 1
+            bodyFile = value
+        case "--prompt-file":
+            guard let value = commandLineOptionValue(
+                after: index,
+                in: args,
+                allowSingleDash: true
+            ) else {
+                print("❌ --prompt-file requires a path or -")
+                return
+            }
+            index += 1
+            promptFile = value
+        case "--authuser":
+            guard let rawValue = commandLineOptionValue(after: index, in: args),
+                  let value = Int(rawValue),
+                  value >= 0
+            else {
+                print("❌ --authuser requires a nonnegative integer")
+                return
+            }
+            index += 1
+            authUserOptionWasSpecified = true
+            globalAuthUserIndex = value
+        case "--brand":
+            guard let value = commandLineOptionValue(after: index, in: args) else {
+                print("❌ --brand requires an account ID")
+                return
+            }
+            index += 1
+            globalBrandAccountId = value
+        case "--hl":
+            guard let rawValue = commandLineOptionValue(after: index, in: args) else {
+                print("❌ --hl requires a language code")
+                return
+            }
+            index += 1
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, !value.hasPrefix("-") else {
+                print("❌ Invalid --hl value: provide a language code such as en, ko, or zh-CN")
+                return
+            }
+            globalHl = value
+        case "--client-version":
+            guard let rawValue = commandLineOptionValue(after: index, in: args) else {
+                print("❌ --client-version requires a value")
+                return
+            }
+            index += 1
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard isValidClientVersion(value) else {
+                print("❌ Invalid --client-version value: provide a version such as 1.20231204.01.00")
+                return
+            }
+            cachedClientVersion = value
+            clientVersionWasForced = true
+        case "--fresh-chats":
+            guard let rawValue = commandLineOptionValue(after: index, in: args),
+                  let value = Int(rawValue),
+                  (1 ... 3).contains(value)
+            else {
+                print("❌ --fresh-chats requires an integer between 1 and 3")
+                return
+            }
+            index += 1
+            freshChatCount = value
+        case "--":
+            filteredArgs.append(contentsOf: args.dropFirst(index + 1))
+            index = args.count
             continue
+        default:
+            filteredArgs.append(argument)
         }
-        if arg == "-v" || arg == "--verbose" || arg == "--youtube" || arg == "--yt" {
-            continue
-        }
-        if arg == "-o" || arg == "--output" || arg == "--authuser" || arg == "--brand" {
-            skipNext = true
-            continue
-        }
-        filteredArgs.append(arg)
+        index += 1
     }
 
     guard let command = filteredArgs.first else {
         showHelp()
         return
     }
+    guard promptFile == nil || command == "ask-video-free-text-test" else {
+        print("❌ --prompt-file is supported only by ask-video-free-text-test")
+        return
+    }
+    guard command == "discover" || (discoveryFollowIndices.isEmpty && !discoveryLimitWasSpecified) else {
+        print("❌ --follow and --limit are supported only by discover")
+        exit(1)
+    }
+    guard mobileClient == nil || (command == "discover" && !youtubeMode) else {
+        print("❌ Mobile profiles are supported only by discover and cannot be combined with --youtube")
+        exit(1)
+    }
+    guard (!mobileWebKey && !mobileCookieOnly) || mobileClient != nil else {
+        print("❌ --mobile-web-key and --mobile-cookie-only require a discover mobile profile")
+        exit(1)
+    }
+    guard mobileTokenFile == nil || (command == "discover" && mobileClient != nil
+        && !forceUnauthenticatedRequests && !mobileCookieOnly
+        && globalBrandAccountId == nil && !authUserOptionWasSpecified)
+    else {
+        print("❌ --mobile-token-file requires mobile discover and cannot mix with guest, cookie-only, or web account selection")
+        exit(1)
+    }
 
     switch command {
+    case "discover":
+        if filteredArgs.count == 2, filteredArgs[1] == "help" {
+            print(discoveryHelp())
+            return
+        }
+        guard (2 ... 3).contains(filteredArgs.count) else {
+            print("❌ Usage: discover <endpoint> [body-json] [--body-file <path|->] [--follow N]")
+            exit(1)
+        }
+        do {
+            let bodyJSON = try loadRequestBodyJSON(
+                inlineBody: filteredArgs.count == 3 ? filteredArgs[2] : nil,
+                bodyFile: bodyFile
+            )
+            let succeeded = await discoverAPI(
+                endpoint: filteredArgs[1], bodyJSON: bodyJSON,
+                followIndices: discoveryFollowIndices, limit: discoveryLimit,
+                verbose: verbose, outputFile: outputFile, mobileClient: mobileClient,
+                mobileWebKey: mobileWebKey, mobileCookieOnly: mobileCookieOnly,
+                mobileTokenFile: mobileTokenFile, bodyFile: bodyFile
+            )
+            if !succeeded {
+                exit(1)
+            }
+        } catch {
+            print("❌ Could not read the discovery request body")
+            exit(1)
+        }
+
     case "browse":
         guard filteredArgs.count >= 2 else {
             print("❌ Usage: browse <browseId> [params]")
@@ -1987,19 +4171,161 @@ func runMain() async {
         await exploreBrowse(browseId, params: params, verbose: verbose, outputFile: outputFile)
 
     case "action":
-        guard filteredArgs.count >= 3 else {
-            print("❌ Usage: action <endpoint> <body-json>")
-            print("   Example: action search '{\"query\":\"hello\"}'")
+        guard filteredArgs.count >= 2 else {
+            print("❌ Usage: action <endpoint> [body-json] [--body-file <path|->]")
             return
         }
-        let endpoint = filteredArgs[1]
-        let bodyJson = filteredArgs[2]
-        await exploreAction(endpoint, bodyJson: bodyJson, verbose: verbose, outputFile: outputFile)
+        do {
+            let endpoint = try canonicalAPIEndpoint(filteredArgs[1])
+            if requiresPrivateBodySource(endpoint) {
+                print("❌ \(endpoint) must use wire-action, not action")
+                print("   Sensitive panel responses are always summarized with raw values hidden.")
+                return
+            }
+            let bodyJson = try loadRequestBodyJSON(
+                inlineBody: filteredArgs.count >= 3 ? filteredArgs[2] : nil,
+                bodyFile: bodyFile
+            )
+            if requiresRedactedWireInspection(endpoint) {
+                await exploreWireAction(
+                    endpoint, bodyJson: bodyJson, outputFile: outputFile
+                )
+            } else {
+                await exploreAction(
+                    endpoint, bodyJson: bodyJson, verbose: verbose, outputFile: outputFile
+                )
+            }
+        } catch {
+            print("❌ \(error.localizedDescription)")
+        }
+
+    case "wire-action":
+        guard filteredArgs.count >= 2 else {
+            print("❌ Usage: wire-action <endpoint> [body-json] [--body-file <path|->]")
+            print("   Safely reports structure without printing raw response values.")
+            return
+        }
+        do {
+            let endpoint = try canonicalAPIEndpoint(filteredArgs[1])
+            if requiresPrivateBodySource(endpoint), bodyFile == nil {
+                print("❌ \(endpoint) requires --body-file <chmod-600-path|->")
+                print("   Opaque panel/conversation values must not be placed in argv or shell history.")
+                return
+            }
+            let bodyJson = try loadRequestBodyJSON(
+                inlineBody: filteredArgs.count >= 3 ? filteredArgs[2] : nil,
+                bodyFile: bodyFile
+            )
+            await exploreWireAction(
+                endpoint, bodyJson: bodyJson, outputFile: outputFile
+            )
+        } catch {
+            print("❌ \(error.localizedDescription)")
+        }
+
+    case "ask-video-audit":
+        guard filteredArgs.count >= 2 else {
+            print("❌ Usage: ask-video-audit <videoId>")
+            return
+        }
+        if outputFile != nil {
+            print("⚠️ --output is ignored by ask-video-audit; the audit never saves raw payloads")
+        }
+        await auditAskVideo(filteredArgs[1], verbose: verbose)
+
+    case "ask-video-parity":
+        guard filteredArgs.count >= 2 else {
+            print("❌ Usage: ask-video-parity <videoId>")
+            return
+        }
+        await auditAskVideoRequestParity(
+            filteredArgs[1],
+            hasUnsupportedOptions: filteredArgs.count != 2
+                || outputFile != nil
+                || bodyFile != nil
+                || clientVersionWasForced
+                || includeAskFollowUp
+                || freshChatCount != 1
+        )
+
+    case "ask-video-live-test":
+        guard filteredArgs.count == 2 else {
+            print("❌ Usage: ask-video-live-test <videoId> --confirm-live-ai [--follow-up] [--fresh-chats N]")
+            return
+        }
+        guard confirmLiveAI else {
+            print("❌ ask-video-live-test requires --confirm-live-ai")
+            print("   This command sends the server-issued summary suggestion to YouTube.")
+            return
+        }
+        guard outputFile == nil,
+              bodyFile == nil,
+              !clientVersionWasForced,
+              !forceUnauthenticatedRequests,
+              !authUserOptionWasSpecified,
+              globalBrandAccountId == nil
+        else {
+            print("❌ ask-video-live-test received an unsupported authentication, client, or file option")
+            print("   Supported options: --confirm-live-ai, --follow-up, --fresh-chats N, --verbose")
+            return
+        }
+        await liveTestAskVideo(
+            filteredArgs[1],
+            freshChatCount: freshChatCount,
+            includeFollowUp: includeAskFollowUp,
+            verbose: verbose
+        )
+
+    case "ask-video-free-text-test":
+        guard filteredArgs.count == 2 else {
+            print("❌ Usage: ask-video-free-text-test <videoId> --confirm-live-ai --prompt-file <chmod-600-path|->")
+            return
+        }
+        guard confirmLiveAI else {
+            print("❌ ask-video-free-text-test requires --confirm-live-ai")
+            print("   This command submits one private free-text prompt to YouTube.")
+            return
+        }
+        guard let promptFile else {
+            print("❌ ask-video-free-text-test requires --prompt-file <chmod-600-path|->")
+            return
+        }
+        guard outputFile == nil,
+              bodyFile == nil,
+              !verbose,
+              !clientVersionWasForced,
+              !forceUnauthenticatedRequests,
+              !authUserOptionWasSpecified,
+              globalBrandAccountId == nil,
+              !includeAskFollowUp,
+              freshChatCount == 1
+        else {
+            print("❌ ask-video-free-text-test received an unsupported option or account mode")
+            print("   Supported options: --confirm-live-ai and --prompt-file <chmod-600-path|->")
+            return
+        }
+        do {
+            let prompt = try loadPrivatePrompt(from: promptFile)
+            await liveTestAskVideoFreeText(filteredArgs[1], prompt: prompt)
+        } catch {
+            print("❌ Could not load the private prompt: \(error.localizedDescription)")
+        }
+
+    case "search-audit":
+        guard filteredArgs.count >= 2 else {
+            print("❌ Usage: search-audit <query>")
+            print("   Example: search-audit \"ambient electronic mix\"")
+            return
+        }
+        if outputFile != nil {
+            print("⚠️ --output is ignored by search-audit; use 'action search' to save raw JSON")
+        }
+        await auditSearch(filteredArgs[1], verbose: verbose)
 
     case "continuation":
         guard filteredArgs.count >= 2 else {
             print("❌ Usage: continuation <token> [endpoint]")
-            print("   endpoint: 'browse' (default) for home/library, 'next' for mix queues")
+            print("   endpoint: 'browse' (default), 'search' for search, or 'next' for mix queues")
             print("   Get the token from a browse response's continuationItemRenderer or")
             print("   from a next response's nextRadioContinuationData.continuation")
             return
@@ -2009,6 +4335,23 @@ func runMain() async {
         await exploreContinuation(
             token, endpoint: endpoint, verbose: verbose, outputFile: outputFile
         )
+
+    case "queue-probe":
+        guard filteredArgs.count >= 2 else {
+            print("❌ Usage: queue-probe <videoId> [playlistId]")
+            print("   playlistId defaults to RDAMVM<videoId>, matching YTMusicClient.getRadioQueue")
+            return
+        }
+        let videoId = filteredArgs[1]
+        let playlistId = filteredArgs.count >= 3 ? filteredArgs[2] : nil
+        await probeQueue(videoId: videoId, playlistId: playlistId, verbose: verbose, outputFile: outputFile)
+
+    case "analyze-file":
+        guard filteredArgs.count >= 2 else {
+            print("❌ Usage: analyze-file <path>")
+            return
+        }
+        analyzeSavedResponse(at: filteredArgs[1])
 
     case "list":
         listEndpoints()

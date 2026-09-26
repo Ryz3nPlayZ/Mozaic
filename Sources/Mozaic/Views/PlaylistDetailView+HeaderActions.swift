@@ -110,7 +110,7 @@ extension PlaylistDetailView {
 
     @ViewBuilder
     private func sidebarButton(_ detail: PlaylistDetail, showsTitles: Bool) -> some View {
-        if let sidebarItem = SidebarPinnedItem.from(detail) {
+        if self.hasPersonalAccount, let sidebarItem = SidebarPinnedItem.from(detail) {
             let isPinnedToSidebar = self.sidebarPinnedItemsManager?.isPinned(sidebarItem) ?? false
             Button {
                 self.sidebarPinnedItemsManager?.toggle(sidebarItem)
@@ -133,13 +133,13 @@ extension PlaylistDetailView {
 
     @ViewBuilder
     private func libraryButton(_ detail: PlaylistDetail, showsTitles: Bool) -> some View {
-        if !detail.isUploadedSongs {
-            let currentlyInLibrary = self.isInLibrary || self.isAddedToLibrary
+        if !detail.isUploadedSongs, self.hasPersonalAccount {
+            let currentlyInLibrary = self.isInLibrary
             let libraryTitle = currentlyInLibrary
                 ? String(localized: "Added to Library")
                 : String(localized: "Add to Library")
             Button {
-                self.toggleLibrary()
+                self.toggleLibrary(detail)
             } label: {
                 self.headerActionLabel(
                     libraryTitle,
@@ -149,6 +149,7 @@ extension PlaylistDetailView {
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
+            .disabled(self.isUpdatingLibrary || (detail.isAlbum && detail.libraryTargetId == nil))
         }
     }
 
@@ -183,9 +184,14 @@ extension PlaylistDetailView {
                         canDelete: detail.canDelete
                     ),
                     client: self.viewModel.client,
-                    libraryViewModel: self.libraryViewModel
+                    libraryViewModel: self.libraryViewModel,
+                    playerService: self.playerService
                 ) {
-                    self.dismiss()
+                    if let onPlaylistDeleted = self.onPlaylistDeleted {
+                        onPlaylistDeleted()
+                    } else {
+                        self.dismiss()
+                    }
                 }
             } label: {
                 self.headerActionLabel(

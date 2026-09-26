@@ -54,23 +54,23 @@ struct EqualizerSettingsView: View {
         Form {
             Section {
                 Toggle("Enable Equalizer", isOn: self.isEnabled)
-                    .help("Processes Mozaic's audio output through a 6-band equalizer.")
+                    .help(String(localized: "Processes Mozaic's audio output through a 6-band equalizer."))
 
                 EQStatusRow(status: self.service.status)
 
                 HStack {
                     Spacer()
-                    Button("Reset") {
+                    Button(String(localized: "Reset")) {
                         self.service.reset()
                     }
                     .disabled(!self.service.settings.isEnabled)
                 }
             } header: {
-                Text("Output")
+                Text(String(localized: "Output"))
             }
 
             Section {
-                Picker("Preset", selection: self.preset) {
+                Picker(String(localized: "Preset"), selection: self.preset) {
                     ForEach(self.availablePresets) { preset in
                         Text(preset.displayName).tag(preset)
                     }
@@ -89,12 +89,12 @@ struct EqualizerSettingsView: View {
                 .opacity(self.service.settings.isEnabled ? 1 : 0.45)
                 .animation(.easeInOut(duration: 0.2), value: self.service.settings.isEnabled)
             } header: {
-                Text("Bands")
+                Text(String(localized: "Bands"))
             }
 
             Section {
                 HStack {
-                    Text("Preamp")
+                    Text(String(localized: "Preamp"))
                     Spacer()
                     Text(Self.formatGain(self.service.settings.preampDB))
                         .font(.caption.monospacedDigit())
@@ -108,7 +108,7 @@ struct EqualizerSettingsView: View {
                 )
                 .disabled(!self.service.settings.isEnabled)
             } header: {
-                Text("Preamp")
+                Text(String(localized: "Preamp"))
             }
         }
         .formStyle(.grouped)
@@ -161,7 +161,7 @@ private struct EQStatusRow: View {
 
             if self.showsSettingsLink, let url = Self.screenRecordingPaneURL {
                 Link(destination: url) {
-                    Text("Open Settings")
+                    Text(String(localized: "Open Settings"))
                 }
                 .controlSize(.small)
             }
@@ -215,7 +215,9 @@ private struct EQStatusRow: View {
     }
 
     private var showsSettingsLink: Bool {
-        if case .permissionNeeded = self.status { return true }
+        if case .permissionNeeded = self.status {
+            return true
+        }
         return false
     }
 }
@@ -287,7 +289,7 @@ private struct EQBandSlider: View {
             Text(self.band.displayLabel)
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
-            Text("Hz")
+            Text(String(localized: "Hz"))
                 .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
         }

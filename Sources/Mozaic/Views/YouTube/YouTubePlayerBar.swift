@@ -2,47 +2,77 @@ import SwiftUI
 
 // MARK: - YouTubePlayerBar
 
-/// The Liquid Glass player bar, adapted for YouTube video playback.
-///
-/// Same capsule, sizing, and interaction patterns as the music `PlayerBar`
-/// (which is untouched); shown instead of it while a YouTube video is
-/// loaded. Differences per the YouTube content model:
-/// - No shuffle/repeat — previous/next skip between videos
-///   (session history / the watch page's related list).
-/// - Center shows the video thumbnail, title, and channel · views.
-/// - No lyrics/queue buttons.
-/// - The minimize button drives the video pop-out (picture in picture);
-///   the TV button toggles fullscreen on the popped-out window.
+/// The Liquid Glass player bar for inline and detached YouTube playback.
 struct YouTubePlayerBar: View {
     private static let brandAccent = PackageResourceLookup.brandAccent
+    private static let fullVideoDetailsWidth: CGFloat = 294
+    private static let compactVideoDetailsWidth: CGFloat = 141
+    private static let baseYouTubeOptionsWidth: CGFloat = 210
+    private static let floatOnTopOptionsWidthIncrement: CGFloat = 28 + 6
 
+    /// Below this the details block would collide with the transport controls.
+    /// Only the resizable detached window reaches this narrow layout.
+    private static let baseHiddenVideoDetailsBreakpoint: CGFloat = 580
+
+    private struct ChapterProgressSpan {
+        let chapter: YouTubeChapter
+        let start: TimeInterval
+        let end: TimeInterval
+    }
+
+    @Environment(AuthService.self) private var authService
     @Environment(YouTubePlayerService.self) private var youtubePlayer
+    @Environment(YouTubeViewModelStore.self) private var youtubeStore: YouTubeViewModelStore?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+
+    private let isDetachedWindow: Bool
+    private let onVolumeOverlayChange: (Bool) -> Void
 
     /// Namespace for glass effect morphing.
     @Namespace private var playerNamespace
 
-    @State private var isHoveringSeekBar = false
+    @State private var settings = SettingsManager.shared
     @State private var seekValue: Double = 0
     @State private var isSeeking = false
+    @State private var seekHold = PlayerBarSeekHold()
     @State private var volumeValue: Double = 1.0
     @State private var isAdjustingVolume = false
+    @State private var showsVolumeOverlay = false
+    @State private var chapterPreviewMarker: PlayerBarProgressMarker?
+    @State private var airPlayAnchor = AirPlayPickerAnchor()
+
+    init(isDetachedWindow: Bool, onVolumeOverlayChange: @escaping (Bool) -> Void = { _ in }) {
+        self.isDetachedWindow = isDetachedWindow
+        self.onVolumeOverlayChange = onVolumeOverlayChange
+    }
 
     var body: some View {
         CompatGlassContainer(spacing: 0) {
-            HStack(spacing: 0) {
-                self.playbackControls
+            GeometryReader { proxy in
+                let usesCompactDetails = proxy.size.width <= PlayerBarLayout.compactDetailsBreakpoint
+                let hidesDetails = proxy.size.width <= self.hiddenVideoDetailsBreakpoint
 
-                Spacer()
+                HStack(spacing: 10) {
+                    if !hidesDetails {
+                        self.videoDetailsSection(usesCompactDetails: usesCompactDetails)
+                            .frame(
+                                width: usesCompactDetails
+                                    ? Self.compactVideoDetailsWidth
+                                    : Self.fullVideoDetailsWidth,
+                                height: 52
+                            )
+                    }
 
-                self.centerSection
+                    self.youtubeProgressSection
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 52)
 
-                Spacer()
-
-                self.rightSection
+                    self.youtubeOptionsSection
+                        .frame(width: self.youtubeOptionsWidth, height: 52)
+                }
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity)
             .frame(height: 52)
             .compatGlass(interactive: true, in: .capsule)
             .compatGlassID("youtubePlayerBar", in: self.playerNamespace)
@@ -53,22 +83,37 @@ struct YouTubePlayerBar: View {
             self.playerAreaFade
         }
         .onChange(of: self.youtubePlayer.progress) { _, newValue in
-            if !self.isSeeking, self.youtubePlayer.duration > 0 {
-                self.seekValue = newValue / self.youtubePlayer.duration
+            self.seekHold.reconcile(observedProgress: newValue)
+            if !self.isSeeking, !self.seekHold.isActive, self.youtubePlayer.duration > 0 {
+                self.seekValue = self.displayedPlaybackProgress / self.youtubePlayer.duration
             }
+        }
+        .onChange(of: self.youtubePlayer.duration) { _, newValue in
+            self.seekHold.reconcile(observedProgress: self.youtubePlayer.progress)
+            if !self.isSeeking, !self.seekHold.isActive, newValue > 0 {
+                self.seekValue = self.displayedPlaybackProgress / newValue
+            }
+        }
+        .onChange(of: self.currentSeekIdentity) { _, _ in
+            self.clearSeekHold()
+            self.chapterPreviewMarker = nil
+        }
+        .onChange(of: self.canSeek) { _, _ in
+            self.clearSeekHold()
+            self.chapterPreviewMarker = nil
         }
         .onChange(of: self.youtubePlayer.volume) { _, newValue in
             if !self.isAdjustingVolume {
                 self.volumeValue = newValue
             }
         }
+        .onChange(of: self.showsVolumeOverlay) { _, isPresented in self.onVolumeOverlayChange(isPresented) }
         .onAppear {
             self.volumeValue = self.youtubePlayer.volume
             if self.youtubePlayer.duration > 0 {
                 self.seekValue = self.youtubePlayer.progress / self.youtubePlayer.duration
             }
         }
-        .accessibilityIdentifier(AccessibilityID.YouTubeContent.playerBar)
     }
 
     private var playerAreaFade: some View {
@@ -87,343 +132,353 @@ struct YouTubePlayerBar: View {
         .accessibilityHidden(true)
     }
 
-    // MARK: - Playback Controls
+    // MARK: - Updated Player Layout
 
-    private var playbackControls: some View {
-        HStack(spacing: 16) {
-            // Previous video (session history; restarts when none)
-            Button {
-                HapticService.playback()
-                self.youtubePlayer.skipBackward()
-            } label: {
-                Image(systemName: "backward.fill")
-                    .font(.system(size: 17, weight: .medium))
-                    .foregroundStyle(.primary)
-            }
-            .buttonStyle(.pressable)
-            .disabled(self.youtubePlayer.currentVideo == nil)
-            .accessibilityLabel(String(localized: "Previous video"))
-
-            // Play/Pause
-            Button {
-                HapticService.playback()
-                self.youtubePlayer.playPause()
-            } label: {
-                Image(systemName: self.youtubePlayer.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 22, weight: .medium))
-                    .foregroundStyle(.primary)
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .buttonStyle(.pressable)
-            .compatGlassID("youtubePlayPause", in: self.playerNamespace)
-            .accessibilityIdentifier(AccessibilityID.YouTubeContent.watchPlayPause)
-            .disabled(self.youtubePlayer.currentVideo == nil)
-            .accessibilityLabel(
-                self.youtubePlayer.isPlaying
-                    ? String(localized: "Pause")
-                    : String(localized: "Play")
-            )
-
-            // Next video (up next from the watch page)
-            Button {
-                HapticService.playback()
-                Task {
-                    await self.youtubePlayer.skipForward()
-                }
-            } label: {
-                Image(systemName: "forward.fill")
-                    .font(.system(size: 17, weight: .medium))
-                    .foregroundStyle(.primary)
-            }
-            .buttonStyle(.pressable)
-            .disabled(self.youtubePlayer.currentVideo == nil)
-            .accessibilityLabel(String(localized: "Next video"))
-        }
-    }
-
-    // MARK: - Center Section (video info ⇄ full-width seek scrubber on hover)
-
-    private var centerSection: some View {
-        ZStack {
-            // Video info — top-aligned so it lifts off the bottom progress line.
-            VStack(spacing: 0) {
-                self.videoInfoView
-                Spacer(minLength: 0)
-            }
-            .blur(radius: self.showsSeekControls ? 8 : 0)
-            .opacity(self.showsSeekControls ? 0 : 1)
-
-            // Thin idle progress line ⇄ full-width hover scrubber.
-            if self.youtubePlayer.currentVideo != nil {
-                self.seekOverlay
-            }
-        }
-        .frame(maxWidth: 540, minHeight: 38)
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            withAnimation(self.hoverAnimation) {
-                self.isHoveringSeekBar = hovering
-            }
-        }
-    }
-
-    private var showsSeekControls: Bool {
-        self.isHoveringSeekBar && self.youtubePlayer.currentVideo != nil
-    }
-
-    /// Hover grow/shrink animation, honouring Reduce Motion.
-    private var hoverAnimation: Animation {
-        self.reduceMotion ? .easeInOut(duration: 0.12) : AppAnimation.snappy
-    }
-
-    /// Fraction (0...1) to render: the live drag value while seeking, otherwise actual progress.
-    private var displayFraction: Double {
-        if self.isSeeking {
-            return min(max(0, self.seekValue), 1)
-        }
-        guard self.youtubePlayer.duration > 0 else { return 0 }
-        return min(max(0, self.youtubePlayer.progress / self.youtubePlayer.duration), 1)
-    }
-
-    private var videoInfoView: some View {
+    private func videoDetailsSection(usesCompactDetails: Bool) -> some View {
         HStack(spacing: 8) {
-            // 16:9 video thumbnail
-            CachedAsyncImage(
-                url: self.youtubePlayer.currentVideo?.thumbnailURL,
-                targetSize: CGSize(width: 128, height: 72)
-            ) { image in
-                image
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            } placeholder: {
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(.quaternary)
-                    .overlay {
-                        Image(systemName: "play.rectangle")
-                            .font(.system(size: 13))
-                            .foregroundStyle(.secondary)
-                    }
-            }
-            .frame(width: 57, height: 32)
-            .clipShape(.rect(cornerRadius: 4))
-
-            if let video = self.youtubePlayer.currentVideo {
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(video.title)
-                        .font(.system(size: 11, weight: .medium))
-                        .lineLimit(1)
-                        .foregroundStyle(.primary)
-
-                    if let channelName = video.channelName, !channelName.isEmpty {
-                        Text(channelName)
-                            .font(.system(size: 10))
-                            .lineLimit(1)
-                            .foregroundStyle(.secondary)
-                    }
+            PlayerBarArtworkView(
+                width: 57,
+                height: 32,
+                cornerRadius: 6,
+                glowSources: self.currentVideoGlowSources,
+                glowIdentity: self.currentVideoGlowIdentity,
+                glowTargetSize: CGSize(width: 64, height: 36),
+                showsHoverOverlay: false
+            ) {
+                CachedAsyncImage(
+                    url: self.youtubePlayer.currentVideo?.thumbnailURL,
+                    targetSize: CGSize(width: 64, height: 36)
+                ) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(.quaternary)
+                        .overlay {
+                            Image(systemName: "play.rectangle")
+                                .font(.system(size: 16))
+                                .foregroundStyle(.secondary)
+                        }
                 }
-                .frame(maxWidth: 240, alignment: .leading)
+                .frame(width: 57, height: 32)
+                .clipShape(.rect(cornerRadius: 6, style: .continuous))
             }
-        }
-        .fixedSize(horizontal: true, vertical: false)
-        .frame(maxWidth: .infinity, alignment: .center)
-    }
+            .accessibilityHidden(self.youtubePlayer.currentVideo == nil)
 
-    // MARK: - Seek Overlay (full-width: thin idle line ⇄ hover scrubber)
+            if !usesCompactDetails {
+                VStack(alignment: .leading, spacing: 4) {
+                    PlayerBarMarqueeText(
+                        text: self.videoDetailsTitle,
+                        font: .system(size: 13),
+                        color: .primary,
+                        height: 13,
+                        reduceMotion: self.reduceMotion
+                    )
+                    .id(self.currentTitleIdentity)
 
-    private var seekOverlay: some View {
-        ZStack {
-            // Full-width hover scrubber (elapsed · long bar · remaining).
-            AppleMusicScrubber(
-                fraction: self.displayFraction,
-                accent: Self.brandAccent,
-                elapsedText: Self.formatTime(self.isSeeking
-                    ? self.seekValue * self.youtubePlayer.duration
-                    : self.youtubePlayer.progress),
-                remainingText: "-\(Self.formatTime(self.youtubePlayer.duration - (self.isSeeking ? self.seekValue * self.youtubePlayer.duration : self.youtubePlayer.progress)))",
-                isInteractive: self.showsSeekControls && self.canSeek,
-                onScrub: { fraction in
-                    self.isSeeking = true
-                    self.seekValue = fraction
-                },
-                onCommit: {
-                    self.performSeek()
-                }
-            )
-            .opacity(self.showsSeekControls ? 1 : 0)
-            .allowsHitTesting(self.showsSeekControls && self.canSeek)
-
-            // Thin idle progress line shown when not hovering.
-            VStack(spacing: 0) {
-                Spacer(minLength: 0)
-                IdleProgressLine(fraction: self.displayFraction)
-            }
-            .opacity(self.showsSeekControls ? 0 : 1)
-            .allowsHitTesting(false)
-        }
-    }
-
-    /// Seeking is unavailable during ads or before a duration is known.
-    private var canSeek: Bool {
-        self.youtubePlayer.duration > 0 && !self.youtubePlayer.isShowingAd
-    }
-
-    private func performSeek() {
-        guard self.isSeeking else { return }
-        self.youtubePlayer.seek(to: self.seekValue * self.youtubePlayer.duration)
-        self.isSeeking = false
-    }
-
-    // MARK: - Right Section (actions + volume)
-
-    private var rightSection: some View {
-        HStack(spacing: 8) {
-            self.actionButtons
-
-            Divider()
-                .frame(height: 20)
-                .padding(.horizontal, 4)
-
-            Image(systemName: self.volumeIcon)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(.primary.opacity(0.85))
-                .frame(width: 18)
-
-            self.volumeSlider
-        }
-    }
-
-    private var actionButtons: some View {
-        HStack(spacing: 12) {
-            // Like
-            Button {
-                Task {
-                    await self.youtubePlayer.toggleLike()
-                }
-            } label: {
-                Image(systemName: self.youtubePlayer.currentRating == .like
-                    ? "hand.thumbsup.fill"
-                    : "hand.thumbsup")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(self.youtubePlayer.currentRating == .like ? .red : .primary.opacity(0.85))
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .buttonStyle(.pressable)
-            .symbolEffect(.bounce, value: self.youtubePlayer.currentRating == .like)
-            .accessibilityIdentifier(AccessibilityID.YouTubeContent.watchLikeButton)
-            .disabled(self.youtubePlayer.currentVideo == nil)
-            .accessibilityLabel(String(localized: "Like"))
-
-            // Dislike
-            Button {
-                Task {
-                    await self.youtubePlayer.toggleDislike()
-                }
-            } label: {
-                Image(systemName: self.youtubePlayer.currentRating == .dislike
-                    ? "hand.thumbsdown.fill"
-                    : "hand.thumbsdown")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(self.youtubePlayer.currentRating == .dislike ? .red : .primary.opacity(0.85))
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .buttonStyle(.pressable)
-            .symbolEffect(.bounce, value: self.youtubePlayer.currentRating == .dislike)
-            .accessibilityIdentifier(AccessibilityID.YouTubeContent.watchDislikeButton)
-            .disabled(self.youtubePlayer.currentVideo == nil)
-            .accessibilityLabel(String(localized: "Dislike"))
-
-            // Full view — expands the pop-out window to fullscreen
-            Button {
-                HapticService.toggle()
-                if self.youtubePlayer.surfaceLocation == .inline {
-                    self.youtubePlayer.popOutToWindow()
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .milliseconds(250))
-                        YouTubeVideoWindowController.shared.toggleFullscreen(returnInlineOnExit: true)
-                    }
-                } else {
-                    YouTubeVideoWindowController.shared.toggleFullscreen()
-                }
-            } label: {
-                Image(systemName: "arrow.up.left.and.arrow.down.right")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(.primary.opacity(0.85))
-            }
-            .buttonStyle(.pressable)
-            .accessibilityIdentifier(AccessibilityID.YouTubeContent.watchFullView)
-            .disabled(self.youtubePlayer.currentVideo == nil)
-            .accessibilityLabel(String(localized: "Full view"))
-
-            // Watch Later (in the TV button's old slot, ahead of AirPlay)
-            Button {
-                Task {
-                    await self.youtubePlayer.toggleWatchLater()
-                }
-            } label: {
-                Image(systemName: self.youtubePlayer.isInWatchLater
-                    ? "checkmark.circle.fill"
-                    : "clock.badge.plus")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(self.youtubePlayer.isInWatchLater ? .red : .primary.opacity(0.85))
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .buttonStyle(.pressable)
-            .symbolEffect(.bounce, value: self.youtubePlayer.isInWatchLater)
-            .accessibilityIdentifier(AccessibilityID.YouTubeContent.watchLaterButton)
-            .disabled(self.youtubePlayer.currentVideo == nil)
-            .accessibilityLabel(String(localized: "Add to Watch Later"))
-
-            // AirPlay
-            Button {
-                HapticService.toggle()
-                self.youtubePlayer.showAirPlayPicker()
-            } label: {
-                Image(systemName: "airplayvideo")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(.primary.opacity(0.85))
-            }
-            .buttonStyle(.pressable)
-            .disabled(self.youtubePlayer.currentVideo == nil)
-            .accessibilityLabel(String(localized: "AirPlay"))
-
-            self.captionsMenu
-
-            self.qualityMenu
-
-            // Picture in picture (pop out / pop in) — hidden in fullscreen,
-            // where popping in/out makes no sense.
-            if !self.youtubePlayer.isWindowFullscreen {
-                Button {
-                    HapticService.toggle()
-                    if self.youtubePlayer.surfaceLocation == .floating {
-                        self.youtubePlayer.requestPopIn()
+                    if self.isShowingChapterPreview {
+                        Spacer()
+                            .frame(height: 11)
                     } else {
-                        self.youtubePlayer.popOutToWindow()
+                        PlayerBarMetadataButton(
+                            text: self.youtubePlayer.currentVideo?.channelName ?? String(localized: "YouTube"),
+                            isEnabled: self.canNavigateToCurrentChannel,
+                            action: self.openCurrentChannel
+                        )
                     }
-                } label: {
-                    Image(systemName: self.youtubePlayer.surfaceLocation == .floating
-                        ? "pip.exit"
-                        : "pip.enter")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(self.youtubePlayer.surfaceLocation == .floating ? .red : .primary.opacity(0.85))
+                }
+                .frame(width: 129, height: 29, alignment: .leading)
+            }
+
+            if self.hasPersonalAccount {
+                HStack(spacing: 6) {
+                    PlayerBarIconButton(
+                        action: {
+                            Task {
+                                await self.youtubePlayer.toggleLike()
+                            }
+                        },
+                        isSelected: self.youtubePlayer.currentRating == .like,
+                        accessibilityID: AccessibilityID.YouTubeContent.watchLikeButton,
+                        accessibilityLabel: String(localized: "Like"),
+                        icon: {
+                            Image(systemName: self.youtubePlayer.currentRating == .like ? "hand.thumbsup.fill" : "hand.thumbsup")
+                                .font(.system(size: 16, weight: .regular))
+                                .frame(width: 10, height: 16)
+                                .foregroundStyle(self.youtubePlayer.currentRating == .like ? Self.brandAccent : .primary)
+                                .contentTransition(.symbolEffect(.replace))
+                        }
+                    )
+                    .symbolEffect(.bounce, value: self.youtubePlayer.currentRating == .like)
+                    .disabled(self.youtubePlayer.currentVideo == nil)
+
+                    PlayerBarIconButton(
+                        action: {
+                            Task {
+                                await self.youtubePlayer.toggleDislike()
+                            }
+                        },
+                        isSelected: self.youtubePlayer.currentRating == .dislike,
+                        accessibilityID: AccessibilityID.YouTubeContent.watchDislikeButton,
+                        accessibilityLabel: String(localized: "Dislike"),
+                        icon: {
+                            Image(systemName: self.youtubePlayer.currentRating == .dislike ? "hand.thumbsdown.fill" : "hand.thumbsdown")
+                                .font(.system(size: 16, weight: .regular))
+                                .frame(width: 10, height: 16)
+                                .foregroundStyle(self.youtubePlayer.currentRating == .dislike ? Self.brandAccent : .primary)
+                                .contentTransition(.symbolEffect(.replace))
+                        }
+                    )
+                    .symbolEffect(.bounce, value: self.youtubePlayer.currentRating == .dislike)
+                    .disabled(self.youtubePlayer.currentVideo == nil)
+                }
+            }
+        }
+        .padding(.leading, 14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    }
+
+    private var currentVideoGlowSources: [URL] {
+        guard let video = self.youtubePlayer.currentVideo else { return [] }
+        return self.uniqueURLs([
+            self.fallbackThumbnailURL(for: video.videoId),
+            video.thumbnailURL,
+        ])
+    }
+
+    private var currentVideoGlowIdentity: String? {
+        guard let video = self.youtubePlayer.currentVideo else { return nil }
+        return video.videoId
+    }
+
+    private func fallbackThumbnailURL(for videoId: String) -> URL? {
+        URL(string: "https://i.ytimg.com/vi/\(videoId)/mqdefault.jpg")
+    }
+
+    private func uniqueURLs(_ urls: [URL?]) -> [URL] {
+        var seen = Set<URL>()
+        return urls.compactMap { url in
+            guard let url, seen.insert(url).inserted else { return nil }
+            return url
+        }
+    }
+
+    private var currentTitleIdentity: String {
+        [
+            self.youtubePlayer.currentVideo?.id ?? "none",
+            self.youtubePlayer.currentVideo?.title ?? "none",
+            self.chapterPreviewMarker?.id ?? "none",
+        ].joined(separator: "|")
+    }
+
+    private var videoDetailsTitle: String {
+        guard let chapterPreviewMarker, let title = chapterPreviewMarker.title else {
+            return self.youtubePlayer.currentVideo?.title ?? String(localized: "Not Playing")
+        }
+        if let subtitle = chapterPreviewMarker.subtitle {
+            return "\(subtitle) · \(title)"
+        }
+        return title
+    }
+
+    private var isShowingChapterPreview: Bool {
+        self.chapterPreviewMarker?.title != nil
+    }
+
+    private var youtubeProgressSection: some View {
+        ZStack(alignment: .top) {
+            Group {
+                if self.youtubePlayer.isShowingAd {
+                    PlayerBarAdIndicator()
+                } else {
+                    PlayerBarProgressLane(
+                        fraction: self.displayFraction,
+                        accent: Self.brandAccent,
+                        elapsedText: Self.formatTime(self.progressTextValue),
+                        remainingText: "-\(Self.formatTime(max(0, self.youtubePlayer.duration - self.progressTextValue)))",
+                        markers: self.chapterProgressMarkers,
+                        segments: self.chapterProgressSegments,
+                        isLive: self.isLive,
+                        canSeek: self.canSeek,
+                        isLoading: self.isProgressLoading,
+                        onScrub: { fraction in
+                            self.isSeeking = true
+                            self.seekValue = fraction
+                        },
+                        onCommit: self.performSeek,
+                        onMarkerPreviewChange: { self.chapterPreviewMarker = $0 }
+                    )
+                }
+            }
+            .padding(.top, 18)
+            // Match the music player's segmented lane layering so chapter tooltips stay above
+            // transport controls without intercepting their clicks.
+            .zIndex(1)
+
+            self.youtubeTransportControls
+                .padding(.top, 2)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var youtubeTransportControls: some View {
+        HStack(spacing: 6) {
+            if !self.isLive {
+                self.youtubeSeekButton(isForward: false)
+            }
+
+            PlayerBarIconButton(
+                action: {
+                    HapticService.playback()
+                    self.youtubePlayer.playPause()
+                },
+                accessibilityID: AccessibilityID.YouTubeContent.watchPlayPause,
+                accessibilityLabel: self.youtubePlayer.isPlaying ? String(localized: "Pause") : String(localized: "Play"),
+                icon: {
+                    Image(systemName: self.youtubePlayer.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 20, weight: .regular))
+                        .frame(width: 12, height: 20)
+                        .foregroundStyle(.primary)
                         .contentTransition(.symbolEffect(.replace))
                 }
-                .buttonStyle(.pressable)
-                .accessibilityIdentifier(AccessibilityID.YouTubeContent.watchPictureInPicture)
-                .disabled(self.youtubePlayer.currentVideo == nil)
-                .accessibilityLabel(
-                    self.youtubePlayer.surfaceLocation == .floating
-                        ? String(localized: "Pop video back into Mozaic")
-                        : String(localized: "Picture in Picture")
-                )
+            )
+            .compatGlassID("youtubePlayPause", in: self.playerNamespace)
+            .disabled(self.youtubePlayer.currentVideo == nil)
+
+            if !self.isLive {
+                self.youtubeSeekButton(isForward: true)
+            }
+
+            PlayerBarIconButton(
+                action: self.toggleYouTubeVolumeOverlay,
+                accessibilityLabel: String(localized: "Volume"),
+                accessibilityValue: "\(Int(self.displayedVolume * 100))%",
+                icon: {
+                    Image(systemName: self.volumeIcon)
+                        .font(.system(size: 15, weight: .regular))
+                        .frame(width: 10, height: 15)
+                        .foregroundStyle(.primary)
+                        .contentTransition(.symbolEffect(.replace))
+                }
+            )
+            .playerBarVolumeOverlay(isPresented: self.$showsVolumeOverlay) {
+                self.youtubeVolumeOverlay
             }
         }
     }
 
-    // MARK: - Captions & Quality Menus
+    private func youtubeSeekButton(isForward: Bool) -> some View {
+        PlayerBarIconButton(
+            action: {
+                HapticService.playback()
+                if isForward {
+                    self.youtubePlayer.seekForward()
+                } else {
+                    self.youtubePlayer.seekBackward()
+                }
+            },
+            accessibilityLabel: isForward ? String(localized: "Forward 30 seconds") : String(localized: "Back 30 seconds"),
+            icon: {
+                Image(systemName: isForward ? "goforward.30" : "gobackward.30")
+                    .font(.system(size: 16, weight: .regular))
+                    .frame(width: 16, height: 16)
+                    .foregroundStyle(.primary)
+            }
+        )
+        .disabled(!self.canSeek)
+    }
 
-    private var captionsMenu: some View {
-        Menu {
+    private var youtubeOptionsSection: some View {
+        HStack(spacing: 6) {
+            PlayerBarIconButton(
+                action: self.openYouTubeFullView,
+                accessibilityID: AccessibilityID.YouTubeContent.watchFullView,
+                accessibilityLabel: String(localized: "Full view"),
+                icon: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 15, weight: .regular))
+                        .frame(width: 16, height: 16)
+                        .foregroundStyle(.primary)
+                }
+            )
+            .disabled(self.youtubePlayer.currentVideo == nil)
+
+            if self.hasPersonalAccount {
+                PlayerBarIconButton(
+                    action: {
+                        Task {
+                            await self.youtubePlayer.toggleWatchLater()
+                        }
+                    },
+                    isSelected: self.youtubePlayer.isInWatchLater,
+                    accessibilityID: AccessibilityID.YouTubeContent.watchLaterButton,
+                    accessibilityLabel: String(localized: "Add to Watch Later"),
+                    icon: {
+                        Image(systemName: self.youtubePlayer.isInWatchLater ? "clock.fill" : "clock")
+                            .font(.system(size: 15, weight: .regular))
+                            .frame(width: 16, height: 16)
+                            .foregroundStyle(self.youtubePlayer.isInWatchLater ? Self.brandAccent : .primary)
+                            .contentTransition(.symbolEffect(.replace))
+                    }
+                )
+                .symbolEffect(.bounce, value: self.youtubePlayer.isInWatchLater)
+                .disabled(self.youtubePlayer.currentVideo == nil)
+            }
+
+            PlayerBarIconButton(
+                action: {
+                    HapticService.toggle()
+                    self.youtubePlayer.showAirPlayPicker(at: self.airPlayAnchor.screenPoint)
+                },
+                accessibilityLabel: String(localized: "AirPlay"),
+                icon: {
+                    Image(systemName: "airplayvideo")
+                        .font(.system(size: 16, weight: .regular))
+                        .frame(width: 10, height: 16)
+                        .foregroundStyle(.primary)
+                }
+            )
+            .background {
+                AirPlayPickerAnchorView(anchor: self.airPlayAnchor)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+            .disabled(self.youtubePlayer.currentVideo == nil)
+
+            self.compactCaptionsMenu
+            self.compactQualityMenu
+
+            if self.showsFloatOnTopControl {
+                self.youtubeFloatOnTopButton
+            }
+
+            PlayerBarIconButton(
+                action: self.toggleYouTubePictureInPicture,
+                isSelected: self.youtubePlayer.surfaceLocation == .floating,
+                accessibilityID: AccessibilityID.YouTubeContent.watchPictureInPicture,
+                accessibilityLabel: self.youtubePlayer.surfaceLocation == .floating
+                    ? String(localized: "Pop video back into Mozaic")
+                    : String(localized: "Picture in Picture")
+            ) {
+                Image(systemName: self.youtubePlayer.surfaceLocation == .floating ? "pip.exit" : "pip.enter")
+                    .font(.system(size: 15, weight: .regular))
+                    .frame(width: 13, height: 14)
+                    .foregroundStyle(self.youtubePlayer.surfaceLocation == .floating ? Self.brandAccent : .primary)
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .disabled(self.youtubePlayer.currentVideo == nil || self.youtubePlayer.isWindowFullscreen)
+        }
+        .padding(.trailing, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+    }
+
+    private var compactCaptionsMenu: some View {
+        PlayerBarIconMenu(
+            isSelected: self.youtubePlayer.activeCaptionLanguageCode != nil,
+            accessibilityID: AccessibilityID.YouTubeContent.captionsButton,
+            accessibilityLabel: String(localized: "Closed captions")
+        ) {
             Button {
                 self.youtubePlayer.selectCaptionTrack(languageCode: nil)
             } label: {
@@ -445,74 +500,315 @@ struct YouTubePlayerBar: View {
                     }
                 }
             }
-        } label: {
-            Image(systemName: self.youtubePlayer.activeCaptionLanguageCode == nil
-                ? "captions.bubble"
-                : "captions.bubble.fill")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(self.youtubePlayer.activeCaptionLanguageCode != nil ? .red : .primary.opacity(0.85))
+        } icon: {
+            Image(systemName: self.youtubePlayer.activeCaptionLanguageCode == nil ? "captions.bubble" : "captions.bubble.fill")
+                .font(.system(size: 16, weight: .regular))
+                .frame(width: 16, height: 16)
+                .foregroundStyle(self.youtubePlayer.activeCaptionLanguageCode == nil ? .primary : Self.brandAccent)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
         .disabled(self.youtubePlayer.currentVideo == nil)
-        .accessibilityIdentifier(AccessibilityID.YouTubeContent.captionsButton)
-        .accessibilityLabel(String(localized: "Closed captions"))
     }
 
-    private var qualityMenu: some View {
-        Menu {
+    private var compactQualityMenu: some View {
+        PlayerBarIconMenu(
+            accessibilityID: AccessibilityID.YouTubeContent.qualityButton,
+            accessibilityLabel: String(localized: "Video quality")
+        ) {
             ForEach(self.youtubePlayer.qualityLevels, id: \.self) { level in
                 Button {
                     self.youtubePlayer.selectQuality(level)
                 } label: {
-                    if self.youtubePlayer.currentQuality == level {
+                    if (self.youtubePlayer.userPinnedQuality ?? "auto") == level {
                         Label(YouTubeQuality.displayName(for: level), systemImage: "checkmark")
                     } else {
                         Text(YouTubeQuality.displayName(for: level))
                     }
                 }
             }
-        } label: {
+        } icon: {
             Image(systemName: "gearshape")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(.primary.opacity(0.85))
+                .font(.system(size: 16, weight: .regular))
+                .frame(width: 16, height: 16)
+                .foregroundStyle(.primary)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
         .disabled(self.youtubePlayer.qualityLevels.isEmpty)
-        .accessibilityIdentifier(AccessibilityID.YouTubeContent.qualityButton)
-        .accessibilityLabel(String(localized: "Video quality"))
     }
 
-    private var volumeSlider: some View {
-        Slider(value: self.$volumeValue, in: 0 ... 1) { editing in
-            if editing {
-                self.isAdjustingVolume = true
-            } else {
-                self.youtubePlayer.volume = self.volumeValue
-                self.isAdjustingVolume = false
+    private var youtubeVolumeOverlay: some View {
+        CompatGlassContainer(spacing: 0) {
+            VStack(spacing: 10) {
+                Image(systemName: self.volumeIcon)
+                    .font(.system(size: 15, weight: .regular))
+                    .frame(width: 16, height: 16)
+                    .foregroundStyle(.primary)
+
+                PlayerBarVerticalSlider(
+                    value: self.$volumeValue,
+                    accent: Self.brandAccent,
+                    accessibilityIdentifier: nil,
+                    accessibilityLabel: String(localized: "Volume"),
+                    onEditingChanged: { editing in
+                        self.isAdjustingVolume = editing
+                        if !editing {
+                            self.youtubePlayer.volume = self.volumeValue
+                        }
+                    },
+                    onValueChanged: { oldValue, newValue in
+                        if self.isAdjustingVolume {
+                            if (oldValue > 0 && newValue == 0) || (oldValue < 1 && newValue == 1) {
+                                HapticService.sliderBoundary()
+                            }
+                            self.youtubePlayer.volume = newValue
+                        }
+                    }
+                )
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 16)
+            .frame(width: 46, height: 168)
+            .background {
+                Capsule()
+                    .fill(self.volumeOverlayFill)
+            }
+            .compatGlass(interactive: true, tint: self.volumeOverlayTint, in: .capsule)
+            .shadow(color: self.volumeOverlayShadow, radius: 14, y: 5)
+        }
+    }
+
+    private var volumeOverlayFill: Color {
+        self.colorScheme == .dark ? .black.opacity(0.22) : .white.opacity(0.72)
+    }
+
+    private var volumeOverlayTint: Color {
+        self.colorScheme == .dark ? .white.opacity(0.10) : .black.opacity(0.06)
+    }
+
+    private var volumeOverlayShadow: Color {
+        self.colorScheme == .dark ? .black.opacity(0.36) : .black.opacity(0.18)
+    }
+
+    /// Fraction (0...1) to render: the live drag value while seeking, otherwise actual progress.
+    private var displayFraction: Double {
+        if self.isSeeking {
+            return min(max(0, self.seekValue), 1)
+        }
+        guard self.youtubePlayer.duration > 0 else { return 0 }
+        return min(max(0, self.displayedPlaybackProgress / self.youtubePlayer.duration), 1)
+    }
+
+    private var progressTextValue: TimeInterval {
+        self.isSeeking ? self.seekValue * self.youtubePlayer.duration : self.displayedPlaybackProgress
+    }
+
+    private var displayedPlaybackProgress: TimeInterval {
+        self.seekHold.displayProgress(observedProgress: self.youtubePlayer.progress)
+    }
+
+    private var currentSeekIdentity: String {
+        self.youtubePlayer.currentVideo?.videoId ?? "none"
+    }
+
+    private var chapterProgressMarkers: [PlayerBarProgressMarker] {
+        guard self.canSeek else { return [] }
+        return self.youtubePlayer.chapters.compactMap { chapter in
+            guard chapter.startTime > 0, chapter.startTime < self.youtubePlayer.duration else { return nil }
+            return PlayerBarProgressMarker(
+                id: chapter.id,
+                fraction: chapter.startTime / self.youtubePlayer.duration,
+                title: chapter.title,
+                subtitle: chapter.timeText ?? Self.formatTime(chapter.startTime)
+            )
+        }
+    }
+
+    private var chapterProgressSegments: [PlayerBarProgressSegment] {
+        guard self.canSeek else { return [] }
+        return Self.chapterProgressSegments(
+            chapters: self.youtubePlayer.chapters,
+            duration: self.youtubePlayer.duration
+        )
+    }
+
+    /// Converts YouTube's chapter starts and optional bounds into the same normalized spans used by
+    /// the music player's segmented mix seek bar. Marker data remains separate so chapter snapping
+    /// and the existing metadata preview continue to work while segment visuals are active.
+    static func chapterProgressSegments(
+        chapters: [YouTubeChapter],
+        duration: TimeInterval
+    ) -> [PlayerBarProgressSegment] {
+        guard duration.isFinite, duration > 0 else { return [] }
+
+        let sortedChapters = chapters
+            .filter { chapter in
+                chapter.startTime.isFinite
+                    && chapter.startTime >= 0
+                    && chapter.startTime < duration
+            }
+            .sorted { lhs, rhs in
+                if lhs.startTime != rhs.startTime {
+                    return lhs.startTime < rhs.startTime
+                }
+                return lhs.title < rhs.title
+            }
+
+        var uniqueChapters: [YouTubeChapter] = []
+        for chapter in sortedChapters where uniqueChapters.last?.startTime != chapter.startTime {
+            uniqueChapters.append(chapter)
+        }
+
+        let resolvedChapters: [ChapterProgressSpan] = uniqueChapters.enumerated().compactMap { index, chapter in
+            let start = chapter.startTime
+            let nextStart = uniqueChapters.indices.contains(index + 1)
+                ? uniqueChapters[index + 1].startTime
+                : duration
+            let upperBound = min(nextStart, duration)
+            let explicitEnd = chapter.endTime.flatMap { endTime in
+                endTime.isFinite && endTime > start ? endTime : nil
+            }
+            let end = min(explicitEnd ?? upperBound, upperBound)
+            guard end > start else { return nil }
+            return ChapterProgressSpan(chapter: chapter, start: start, end: end)
+        }
+
+        let count = resolvedChapters.count
+        return resolvedChapters.enumerated().map { index, resolved in
+            PlayerBarProgressSegment(
+                id: resolved.chapter.id,
+                start: resolved.start / duration,
+                end: resolved.end / duration,
+                index: index,
+                count: count,
+                title: resolved.chapter.title,
+                itemLabel: String(localized: "Chapter"),
+                rangeText: "\(Self.formatTime(resolved.start)) – \(Self.formatTime(resolved.end))"
+            )
+        }
+    }
+
+    private var isLive: Bool {
+        self.youtubePlayer.currentVideo?.isLive == true
+    }
+
+    /// A live stream can report a finite DVR duration, so duration alone does not enable seeking.
+    private var canSeek: Bool {
+        self.youtubePlayer.duration > 0 && !self.youtubePlayer.isShowingAd && !self.isLive
+    }
+
+    private var isProgressLoading: Bool {
+        self.youtubePlayer.isPlaybackLoading
+    }
+
+    private var canNavigateToCurrentChannel: Bool {
+        self.youtubeStore != nil && self.currentChannelId != nil
+    }
+
+    private var currentChannelId: String? {
+        guard let channelId = self.youtubePlayer.currentVideo?.channelId, !channelId.isEmpty else {
+            return nil
+        }
+        return channelId
+    }
+
+    private func openCurrentChannel() {
+        guard let channelId = self.currentChannelId else { return }
+        self.youtubeStore?.navigationPath.append(YouTubeRoute.channel(channelId: channelId))
+    }
+
+    private func performSeek() {
+        guard self.isSeeking, self.canSeek else { return }
+        let seekTime = self.seekValue * self.youtubePlayer.duration
+        let holdID = self.seekHold.begin(target: seekTime)
+        self.isSeeking = false
+        self.youtubePlayer.seek(to: seekTime)
+
+        Task { @MainActor in
+            try? await Task.sleep(for: PlayerBarSeekHold.timeout)
+            if self.seekHold.clearIfCurrent(holdID) {
+                self.syncSeekValueFromDisplayedProgress()
             }
         }
-        .controlSize(.small)
-        .frame(width: 80)
-        .tint(Self.brandAccent)
-        .accessibilityLabel(String(localized: "Volume"))
+    }
+
+    private func clearSeekHold() {
+        self.seekHold.clear()
+        self.isSeeking = false
+        self.syncSeekValueFromDisplayedProgress()
+    }
+
+    private func syncSeekValueFromDisplayedProgress() {
+        if self.youtubePlayer.duration > 0 {
+            self.seekValue = self.displayedPlaybackProgress / self.youtubePlayer.duration
+        } else {
+            self.seekValue = 0
+        }
     }
 
     private var volumeIcon: String {
-        let currentVolume = self.isAdjustingVolume ? self.volumeValue : self.youtubePlayer.volume
-        if currentVolume == 0 {
-            return "speaker.slash.fill"
-        } else if currentVolume < 0.5 {
-            return "speaker.wave.1.fill"
+        if self.displayedVolume == 0 {
+            "speaker.slash.fill"
+        } else if self.displayedVolume < 0.5 {
+            "speaker.wave.1.fill"
         } else {
-            return "speaker.wave.2.fill"
+            "speaker.wave.2.fill"
         }
     }
 
-    private static func formatTime(_ seconds: Double) -> String {
+    private var displayedVolume: Double {
+        self.isAdjustingVolume ? self.volumeValue : self.youtubePlayer.volume
+    }
+
+    private func toggleYouTubeVolumeOverlay() {
+        HapticService.toggle()
+        let isPresented = !self.showsVolumeOverlay
+        withAnimation(AppAnimation.quick) {
+            self.showsVolumeOverlay = isPresented
+        }
+    }
+
+    private func openYouTubeFullView() {
+        HapticService.toggle()
+        if self.youtubePlayer.surfaceLocation == .inline {
+            self.youtubePlayer.popOutToWindow()
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(250))
+                YouTubeVideoWindowController.shared.toggleFullscreen(returnInlineOnExit: true)
+            }
+        } else {
+            YouTubeVideoWindowController.shared.toggleFullscreen()
+        }
+    }
+
+    private func toggleYouTubePictureInPicture() {
+        guard !self.youtubePlayer.isWindowFullscreen else { return }
+        HapticService.toggle()
+        if self.youtubePlayer.surfaceLocation == .floating {
+            self.youtubePlayer.requestPopIn()
+        } else {
+            self.youtubePlayer.popOutToWindow()
+        }
+    }
+}
+
+extension YouTubePlayerBar {
+    static func shouldShowFloatOnTopControl(
+        isDetachedWindow: Bool,
+        surfaceLocation: YouTubePlayerService.SurfaceLocation,
+        isFullscreenOrTransitioning: Bool
+    ) -> Bool {
+        isDetachedWindow && YouTubeVideoWindowLevelPolicy.canToggleFloatOnTop(
+            isFloating: surfaceLocation == .floating,
+            isFullscreenOrTransitioning: isFullscreenOrTransitioning
+        )
+    }
+
+    static func hiddenVideoDetailsBreakpoint(showsFloatOnTopControl: Bool) -> CGFloat {
+        self.baseHiddenVideoDetailsBreakpoint
+            + (showsFloatOnTopControl ? self.floatOnTopOptionsWidthIncrement : 0)
+    }
+}
+
+private extension YouTubePlayerBar {
+    static func formatTime(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds >= 0 else { return "0:00" }
         let total = Int(seconds)
         let hours = total / 3600
@@ -522,6 +818,54 @@ struct YouTubePlayerBar: View {
             return String(format: "%d:%02d:%02d", hours, mins, secs)
         }
         return String(format: "%d:%02d", mins, secs)
+    }
+
+    var hasPersonalAccount: Bool {
+        self.authService.hasPersonalAccount
+    }
+
+    var youtubeFloatOnTopButton: some View {
+        let help = String(localized: "Keep the video above standard windows on this Space.")
+
+        return PlayerBarIconButton(
+            action: self.toggleYouTubeFloatOnTop,
+            isSelected: self.settings.keepYouTubeVideoOnTop,
+            accessibilityID: AccessibilityID.YouTubeContent.videoWindowFloatOnTop,
+            accessibilityLabel: String(localized: "Float on Top"),
+            accessibilityValue: self.settings.keepYouTubeVideoOnTop
+                ? String(localized: "On")
+                : String(localized: "Off")
+        ) {
+            Image(systemName: self.settings.keepYouTubeVideoOnTop ? "pin.fill" : "pin")
+                .font(.system(size: 15, weight: .regular))
+                .frame(width: 14, height: 16)
+                .foregroundStyle(self.settings.keepYouTubeVideoOnTop ? Self.brandAccent : .primary)
+                .contentTransition(.symbolEffect(.replace))
+        }
+        .accessibilityHint(Text(help))
+        .help(help)
+    }
+
+    var youtubeOptionsWidth: CGFloat {
+        Self.baseYouTubeOptionsWidth
+            + (self.showsFloatOnTopControl ? Self.floatOnTopOptionsWidthIncrement : 0)
+    }
+
+    var showsFloatOnTopControl: Bool {
+        Self.shouldShowFloatOnTopControl(
+            isDetachedWindow: self.isDetachedWindow,
+            surfaceLocation: self.youtubePlayer.surfaceLocation,
+            isFullscreenOrTransitioning: self.youtubePlayer.isWindowFullscreen
+        )
+    }
+
+    var hiddenVideoDetailsBreakpoint: CGFloat {
+        Self.hiddenVideoDetailsBreakpoint(showsFloatOnTopControl: self.showsFloatOnTopControl)
+    }
+
+    func toggleYouTubeFloatOnTop() {
+        HapticService.toggle()
+        self.settings.keepYouTubeVideoOnTop.toggle()
     }
 }
 
@@ -536,7 +880,7 @@ extension View {
     /// `PlayerBar` (see docs/architecture.md).
     func youtubePlayerBarInset() -> some View {
         safeAreaInset(edge: .bottom, spacing: 0) {
-            YouTubePlayerBar()
+            YouTubePlayerBar(isDetachedWindow: false)
         }
     }
 }
@@ -544,7 +888,6 @@ extension View {
 // MARK: - AccessibilityID Additions
 
 extension AccessibilityID.YouTubeContent {
-    static let playerBar = "youtubeContent.playerBar"
     static let watchPlayPause = "youtubeContent.watchPlayPause"
     static let watchLikeButton = "youtubeContent.watchLikeButton"
     static let watchDislikeButton = "youtubeContent.watchDislikeButton"

@@ -22,8 +22,8 @@ cask "mozaic" do
       brew install sozercan/repo/mozaic
   EOS
 
-  postflight do
-    system_command "/usr/bin/xattr", args: ["-cr", "#{appdir}/Mozaic.app"], sudo: false
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-cr", "{{appdir}}/Mozaic.app"], sudo: false
   end
 
   zap trash: [

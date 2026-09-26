@@ -32,10 +32,16 @@ struct ChartsView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .localizedNavigationTitle("Charts")
-            .navigationDestinations(client: self.viewModel.client)
+            .navigationDestinations(
+                client: self.viewModel.client,
+                playerBarNavigationAction: self.playerBarNavigationAction
+            )
+            .playerBarMusicNavigation(path: self.$navigationPath)
         }
+        .playerBarMusicNavigation(path: self.$navigationPath)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             PlayerBar()
+                .playerBarMusicNavigation(path: self.$navigationPath)
         }
         .onAppear {
             if self.viewModel.loadingState == .idle {
@@ -47,6 +53,14 @@ struct ChartsView: View {
         .refreshable {
             await self.viewModel.refresh()
         }
+        .popsNavigationStackOnSidebarReselect(path: self.$navigationPath, for: .charts)
+    }
+
+    private var playerBarNavigationAction: PlayerBarNavigationAction {
+        PlayerBarNavigationAction(
+            openArtist: { self.navigationPath.append($0) },
+            openAlbum: { self.navigationPath.append($0) }
+        )
     }
 
     // MARK: - Views
@@ -57,6 +71,18 @@ struct ChartsView: View {
                 ForEach(self.viewModel.sections) { section in
                     self.sectionView(section)
                 }
+
+                if self.viewModel.hasMoreSections || self.viewModel.loadingState == .loadingMore {
+                    LoadMoreFooter(
+                        isLoading: self.viewModel.loadingState == .loadingMore,
+                        title: "Load More",
+                        loadingTitle: "Loading more...",
+                        autoLoad: true,
+                        autoLoadTrigger: self.viewModel.sections.count
+                    ) {
+                        await self.viewModel.loadMore()
+                    }
+                }
             }
             // Edge-to-edge so shelves slide under the glass sidebar; resting
             // inset is restored per-shelf via contentInset.
@@ -65,25 +91,23 @@ struct ChartsView: View {
     }
 
     private func sectionView(_ section: HomeSection) -> some View {
-        CarouselShelfSection(
+        HomeItemShelfSection(
             accessibilityLabel: section.title,
-            items: Array(section.items.enumerated()),
-            id: \.element.id,
-            itemAlignment: .top,
-            contentInset: DetailContentLayout.horizontalInset
-        ) {
-            Text(section.title)
-                .font(.title2)
-                .fontWeight(.semibold)
-        } itemContent: { index, item in
-            HomeSectionItemCard(
-                item: item,
-                rank: section.isChart ? index + 1 : nil,
-                playAction: self.playlistPlayAction(for: item)
-            ) {
+            items: section.items,
+            isChart: section.isChart,
+            contentInset: DetailContentLayout.horizontalInset,
+            action: { item, index in
                 self.playItem(item, in: section, at: index)
+            },
+            playlistPlayAction: { item in
+                self.playlistPlayAction(for: item)
+            },
+            header: {
+                Text(section.title)
+                    .font(.title2)
+                    .fontWeight(.semibold)
             }
-        }
+        )
     }
 
     // MARK: - Actions
@@ -133,4 +157,5 @@ struct ChartsView: View {
     let client = YTMusicClient(authService: authService, webKitManager: .shared)
     ChartsView(viewModel: ChartsViewModel(client: client))
         .environment(PlayerService())
+        .environment(authService)
 }

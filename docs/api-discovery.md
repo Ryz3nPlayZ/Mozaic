@@ -1,8 +1,10 @@
 # YouTube Music and YouTube API Reference
 
-> **Complete documentation of YouTube Music and regular YouTube InnerTube endpoints for Mozaic development.**
+> **Working reference for YouTube Music and regular YouTube InnerTube endpoints used by Mozaic.**
 >
 > This document catalogs known YouTube Music API endpoints, their authentication requirements, implementation status, and usage patterns. The same `api-explorer` tool also supports regular YouTube via `--youtube`; see [YouTube Mode](youtube.md) for the video-source architecture.
+
+The [implementation status](#implementation-status) records what Mozaic supports, what is missing, and the evidence from the latest probes. Results are dated because endpoint behavior can change.
 
 ## Table of Contents
 
@@ -11,16 +13,16 @@
   - [Brand Account Support](#brand-account-support)
 - [Browse Endpoints](#browse-endpoints)
   - [Implemented](#implemented-browse-endpoints)
-  - [Available (Not Implemented)](#available-browse-endpoints)
+  - [Not implemented](#not-implemented-browse-endpoints)
 - [Action Endpoints](#action-endpoints)
   - [Implemented](#implemented-action-endpoints)
-  - [Available (Not Implemented)](#available-action-endpoints)
+  - [Not implemented](#not-implemented-action-endpoints)
 - [Undocumented Endpoints](#undocumented-endpoints)
 - [Request Patterns](#request-patterns)
 - [Response Parsing](#response-parsing)
 - [Parsers Reference](#parsers-reference)
 - [Error Handling](#error-handling)
-- [Implementation Priorities](#implementation-priorities)
+- [Implementation status](#implementation-status)
 - [Using the API Explorer](#using-the-api-explorer)
 
 ---
@@ -52,6 +54,41 @@ Use `swift run api-explorer --youtube ...` to target regular YouTube. Use the de
 
 1. **Browse Endpoints** - Load content pages (Home, Explore, Library, etc.)
 2. **Action Endpoints** - Perform operations (Search, Like, Subscribe, etc.)
+
+---
+
+### Guest Mode / Unauthenticated Playback (verified 2026-07-01)
+
+Mozaic can drive a signed-out public experience without user cookies. Public
+endpoint requests should be sent without signed-in browser credentials when
+`AuthService` is logged out, while still using the normal WebView playback URLs
+for media:
+
+- Music playback: `https://music.youtube.com/watch?v=<videoId>`
+- YouTube playback: `https://www.youtube.com/watch?v=<videoId>`
+
+Forced signed-out API Explorer probes confirmed these public surfaces:
+
+| Surface | Endpoint | Signed-out behavior |
+|---------|----------|---------------------|
+| Music search | `search` | HTTP 200; song `videoId`s returned |
+| Music metadata / queue | `next` | HTTP 200; current item, lyrics tab, and queue data returned |
+| Music radio | `next` with `playlistId: RDAMVM<videoId>` | HTTP 200; 50-item radio queue plus continuation |
+| Music queue continuation | `continuation … next` | HTTP 200; more radio items returned |
+| Music bulk queue metadata | `music/get_queue` | HTTP 200; `playlistPanelVideoRenderer` metadata returned |
+| Public Music browse | `FEmusic_home`, `FEmusic_explore`, `FEmusic_charts`, `FEmusic_moods_and_genres`, `FEmusic_new_releases`, `FEmusic_podcasts` | HTTP 200 public content |
+| Lyrics browse | `MPLYt...` from `next` | HTTP 200 when lyrics are public |
+| YouTube search/watch-next | `--youtube search`, `--youtube next` | HTTP 200 public results / related videos; chapter markers are present in `next` for videos that expose chapters |
+
+Personal surfaces and mutations remain sign-in-only. Gate or hide UI for:
+
+- Music: library, history, liked music, add-to-playlist, like/dislike, save/remove from library, account/brand switching.
+- YouTube: subscriptions, history, playlists, liked videos, Watch Later, subscribe/rate/comment mutations.
+
+Do **not** rely on `/player` streaming URLs for guest playback. Signed-out
+`player` probes for both WEB_REMIX and WEB returned HTTP 200 but
+`playabilityStatus.status = UNPLAYABLE` and no `streamingData`; the browser
+player/WebView remains the correct playback surface.
 
 ---
 
@@ -91,7 +128,7 @@ Brand accounts (YouTube channels) can be accessed by setting `context.user.onBeh
 
 #### Discovering Brand Accounts
 
-Use the `account/accounts_list` endpoint to get all accounts (primary + brand) with their IDs:
+Use the `account/accounts_list` endpoint to get all accounts (primary + brand) with their IDs. An unauthenticated call can still return HTTP 200, but only with a sign-in/select response; account identities require SAPISIDHASH authentication. During an explicit account switch from Guest Mode, Mozaic authorizes only this account-list refresh with the preserved signed-in session while keeping guest content published until the switch commits:
 
 ```bash
 swift run api-explorer brandaccounts
@@ -105,7 +142,7 @@ swift run api-explorer brandaccounts
 
   0: Primary Account (@handle) [Primary] ← current
   1: Brand Channel (@brand-handle) [Brand Account]
-     Brand ID: 111997145576882617490
+     Brand ID: <BRAND_ID>
 ```
 
 **API Response Path**:
@@ -131,7 +168,7 @@ let body: [String: Any] = [
             "clientVersion": "1.20231204.01.00"
         ],
         "user": [
-            "onBehalfOfUser": "111997145576882617490"  // Brand account ID
+            "onBehalfOfUser": "<BRAND_ID>"  // Brand account ID
         ]
     ],
     "browseId": "FEmusic_liked_playlists"
@@ -144,7 +181,7 @@ let body: [String: Any] = [
 swift run api-explorer brandaccounts
 
 # Access brand account library
-swift run api-explorer browse FEmusic_liked_playlists --brand 111997145576882617490
+swift run api-explorer browse FEmusic_liked_playlists --brand <BRAND_ID>
 ```
 
 #### Key Differences: authuser vs brand
@@ -168,11 +205,14 @@ Browse endpoints use `POST /browse` with a `browseId` parameter.
 |-----------|------|------|-------------|--------|
 | `FEmusic_home` | Home | 🌐 | Personalized recommendations, mixes, quick picks | `HomeResponseParser` |
 | `FEmusic_explore` | Explore | 🌐 | New releases, charts, moods shortcuts | `HomeResponseParser` |
-| `FEmusic_charts` | Charts | 🌐 | Top songs, albums by country/genre | `HomeResponseParser` |
+| `FEmusic_charts` | Charts | 🌐 | Chart sections; country selection is not implemented | `HomeResponseParser` |
 | `FEmusic_moods_and_genres` | Moods & Genres | 🌐 | Browse by mood/genre grids | `HomeResponseParser` |
 | `FEmusic_new_releases` | New Releases | 🌐 | Recent albums, singles, videos | `HomeResponseParser` |
-| `FEmusic_library_landing` | Library Landing | 🔐 | All library content (playlists, podcasts, artists) | `PlaylistParser.parseLibraryContent` |
+| `FEmusic_history` | History | 🔐 | Recently played tracks, grouped by time | `HomeResponseParser` |
+| `FEmusic_library_landing` | Library Landing | 🔐 | Library content previews (playlists, albums, podcasts, artists) | `PlaylistParser.parseLibraryContent` |
 | `FEmusic_liked_playlists` | Library Playlists | 🔐 | User's saved/created playlists | `PlaylistParser` |
+| `FEmusic_liked_albums` | Library Albums | 🔐 | User's saved albums | `PlaylistParser.parseLibraryAlbumsPage` / `parseLibraryAlbumsContinuation` |
+| `FEmusic_library_corpus_artists` | Followed Artists | 🔐 | Followed artists with public channel browse IDs | `PlaylistParser.parseLibraryArtists` |
 | `FEmusic_library_privately_owned_tracks` | Uploaded Songs | 🔐 | User-uploaded songs with playlist-style rows and continuation | `PlaylistParser` |
 | `VLLM` | Liked Songs | 🔐 | All songs user has liked (with pagination) | `PlaylistParser` |
 | `VL{playlistId}` | Playlist Detail | 🌐 | Playlist tracks and metadata | `PlaylistParser` |
@@ -235,6 +275,21 @@ let body = ["browseId": "FEmusic_liked_playlists"]
 
 ---
 
+#### Library Albums (`FEmusic_liked_albums`)
+
+```swift
+let body = ["browseId": "FEmusic_liked_albums"]
+// Requires authentication; params are optional for the default order
+```
+
+**Returns**: A paginated grid of saved albums with album browse IDs, artwork, artist metadata, and release year. Mozaic follows grid continuation tokens until the saved-album collection is exhausted.
+
+**Parser**: Uses `PlaylistParser.parseLibraryAlbumsPage()` for the initial response and `PlaylistParser.parseLibraryAlbumsContinuation()` for subsequent grid pages, then merges any landing-page preview albums as a fallback.
+
+**Library mutations**: Album detail navigation uses an `MPRE...` browse ID, but `like/like` and `like/removelike` must target the album's `OLAK...` playlist ID. Album browse responses expose that playlist ID through play/queue endpoints even when the personalized Save button is unavailable.
+
+---
+
 #### Liked Songs (`VLLM`)
 
 > ⚠️ **Use `VLLM`, not `FEmusic_liked_videos`** — The `FEmusic_liked_videos` browse ID returns only ~13 songs with NO continuation token. To fetch all liked songs, use `VLLM` (VL prefix + LM playlist ID) which returns the full list with proper pagination.
@@ -254,25 +309,34 @@ let body = ["browseId": "VLLM"]
 
 ---
 
-### Available Browse Endpoints
+### Not implemented browse endpoints
 
-These endpoints are functional but not yet implemented in Mozaic.
+These browse paths have no dedicated integration in Mozaic. The notes distinguish usable responses from sign-in prompts and failed probes.
 
-| Browse ID | Name | Auth | Priority | Notes |
-|-----------|------|------|----------|-------|
-| `FEmusic_history` | History | 🔐 | **High** | Recently played tracks |
-| `FEmusic_library_non_music_audio_list` | Subscribed Podcasts | 🔐 | Medium | User's subscribed podcast shows |
-| `FEmusic_library_albums` | Library Albums | 🔐 | Medium | Requires auth + params* |
-| `FEmusic_library_corpus_track_artists` | Library Artists (Artists chip) | 🔐 | Medium | Sign-in backed; returns `MPLAUC...` library artist pages |
-| `FEmusic_library_artists` | Library Artists (param-based) | 🔐 | Medium | Requires auth + params*; distinct from the Artists chip |
-| `FEmusic_library_songs` | Library Songs | 🔐 | Low | Requires auth + params* |
-| `FEmusic_recently_played` | Recently Played | 🔐 | Medium | Requires auth |
-| `FEmusic_library_privately_owned_landing` | Uploads | 🔐 | Low | User-uploaded content |
-| `FEmusic_library_privately_owned_albums` | Uploaded Albums | 🔐 | Low | Uploaded albums |
+| Browse ID | Name | Auth | Notes |
+|-----------|------|------|-------|
+| `FEmusic_library_non_music_audio_list` | Podcast library | 🔐 | Signed-in request returned nine grid items; the app uses the Library landing preview instead |
+| `FEmusic_library_non_music_audio_channels_list` | Podcast Channels filter | 🔐 | Issued params returned 25 channel rows, then 21 more through continuation |
+| `FEmusic_library_user_profile_channels_list` | Library Profiles filter | 🔐 | Issued params returned one user-channel row and a message; no dedicated app integration |
+| `FEmusic_library_corpus_track_artists` | Library Artists | 🔐 | Returns `MPLAUC...` library artist pages; followed artists use the implemented `FEmusic_library_corpus_artists` endpoint |
+| `FEmusic_library_artists` | Library Artists, legacy route | 🔐 | Returned HTTP 400 even with full authentication; no working request established |
+| `FEmusic_library_songs` | Library Songs, legacy route | 🔐 | Historical probe returned HTTP 400; the current Library Songs chip issues `FEmusic_liked_videos` |
+| `FEmusic_recently_played` | Recently Played | 🔐 | Historical probe returned HTTP 400; History is implemented through `FEmusic_history` |
+| `FEmusic_library_privately_owned_landing` | Uploads landing | 🔐 | No dedicated landing page; Uploaded Songs is implemented separately |
+| `FEmusic_library_privately_owned_releases` | Uploaded Albums | 🔐 | Server-issued Albums chip returned a signed-in empty-state response; populated album rows remain unverified |
+| `FEmusic_library_privately_owned_artists` | Uploaded Artists | 🔐 | Server-issued Artists chip returned a signed-in empty-state response; populated artist rows remain unverified |
+| `FEmusic_library_privately_owned_albums` | Uploaded Albums, legacy probe | 🔐 | Guest and signed-in requests returned HTTP 400; the issued Albums route uses `privately_owned_releases` |
+| Server-issued `MPTC...` | Song credits | 🌐 | Four populated credit sections returned on 2026-09-04 |
+| Server-issued `MPTR...` | Related Music content | 🌐 | Recommendations, playlists, and artists returned on 2026-09-04 |
+| `FEmusic_radio_builder` | Radio builder | 🌐 | Form schema returned; station creation and saving were not tested |
+| `FEmusic_tastebuilder` | Taste profile | 🔐 | Signed-in response contained 1,700 item renderers across 120 lists; acceptance and selection submission were not sent |
+| `FEmusic_listening_review` | Recap | 🔐 | Signed-in request returned a message, without usable Recap content |
 
 > `FEmusic_library_corpus_track_artists` is the browseId behind the Library landing Artists chip. With authentication it returns `musicResponsiveListItemRenderer` rows whose `browseId` values look like `MPLAUC...` and use `pageType = MUSIC_PAGE_TYPE_LIBRARY_ARTIST`. Without authentication it still returns HTTP 200, but only with a sign-in prompt.
 >
-> \* `FEmusic_library_albums`, `FEmusic_library_artists`, and `FEmusic_library_songs` are separate param-based library endpoints. They return HTTP 400 without authentication and the correct `params` value.
+> `FEmusic_library_albums` is a legacy browse ID that currently returns HTTP 400. Saved albums use `FEmusic_liked_albums`; optional sorting params are not required for the default order.
+
+### Additional browse response details
 
 #### Uploaded Songs (`FEmusic_library_privately_owned_tracks`)
 
@@ -297,10 +361,10 @@ let body = ["browseId": "FEmusic_library_landing"]
 ```
 
 **Response structure**:
-- Returns all library content in a single `gridRenderer`
+- Returns mixed library items in a paginated `gridRenderer`
 - Includes: Playlists (`VL*`), Podcasts (`MPSPP*`), artist/profile tiles (`UC*`), Profiles, Auto playlists
 - Contains filter chips for: Playlists, Podcasts, Songs, Albums, Artists, Profiles
-- Each chip's `browseEndpoint.browseId` provides the filtered endpoint
+- Each chip's `browseEndpoint.browseId` provides the filtered endpoint; signed-in selections can wrap it in `commandExecutorCommand.commands`
 - The landing grid may expose artist tiles as `UC*`, but the filtered Artists chip returns library-artist browse IDs instead
 
 **Filter chip endpoints discovered**:
@@ -365,12 +429,24 @@ let body = ["browseId": "FEmusic_charts"]
 - Top albums chart
 - Trending videos
 - Genre-specific charts
-- Country-specific charts (via params)
+- Country-specific charts via `formData.selectedValues`, revalidated 2026-09-04
 
-**Implementation suggestion**:
-```swift
-func getCharts(country: String? = nil) async throws -> ChartsResponse
+The country menu exposes `musicMultiSelectMenuItemRenderer` entries backed by
+`frameworkUpdates.entityBatchUpdate.mutations[].payload.musicFormBooleanChoice`.
+The observed `opaqueToken` values are two-letter country codes, including `ZZ`
+for Global. A Japan request returned HTTP 200 with `JP` selected:
+
+```json
+{"browseId":"FEmusic_charts","formData":{"selectedValues":["JP"]}}
 ```
+
+This chart selection is separate from the client's `context.client.gl` value.
+Do not generalize chart form handling to other browse IDs: tastebuilder forms
+can change recommendation preferences.
+
+**Mozaic status**: Chart sections and pagination are implemented. Country choices,
+selection requests, and a country picker are not implemented. See the
+[country discovery details](#chart-countries) for the observed menu and response.
 
 ---
 
@@ -385,6 +461,11 @@ let body = ["browseId": "FEmusic_moods_and_genres"]
 - Grid of genres (Pop, Rock, Hip-Hop, R&B, etc.)
 
 Each item links to a playlist or browse endpoint for that mood/genre.
+
+As verified on July 13, 2026, mood and genre cards use the browse ID
+`FEmusic_moods_and_genres_category` with an opaque `params` value. Keep the
+browse ID and params as separate structured fields when parsing; concatenated
+display IDs are not a safe source for reconstructing navigation endpoints.
 
 ---
 
@@ -422,9 +503,10 @@ Action endpoints perform operations or fetch specific data.
 
 | Endpoint | Name | Auth | Description |
 |----------|------|------|-------------|
-| `search` | Search | 🌐 | Search songs, albums, artists, playlists |
+| `search` | Search | 🌐 | Search songs, videos, albums/audiobooks, artists/profiles, playlists, podcasts, and episodes |
 | `music/get_search_suggestions` | Suggestions | 🌐 | Autocomplete for search |
 | `next` | Now Playing | 🌐 | Track info, lyrics ID, radio queue |
+| `music/get_queue` | Get Queue | 🌐 | Metadata for video IDs and playlist queues |
 | `like/like` | Like | 🔐 | Like a song/album/playlist |
 | `like/dislike` | Dislike | 🔐 | Dislike a song |
 | `like/removelike` | Remove Like | 🔐 | Remove like/dislike rating |
@@ -432,7 +514,11 @@ Action endpoints perform operations or fetch specific data.
 | `subscription/subscribe` | Subscribe | 🔐 | Subscribe to artist |
 | `subscription/unsubscribe` | Unsubscribe | 🔐 | Unsubscribe from artist |
 | `account/accounts_list` | Accounts List | 🔐 | List all accounts (primary + brand) |
-| `account/account_menu` | Account Menu | 🔐 | Current account info and settings |
+| `playlist/get_add_to_playlist` | Add-to-Playlist Menu | 🔐 | Playlist choices cached with library TTL |
+| `browse/edit_playlist` | Edit Playlist | 🔐 | Add/remove tracks and invalidate affected caches |
+| `playlist/create` | Create Playlist | 🔐 | Create a playlist, optionally with seed videos |
+| `playlist/delete` | Delete Playlist | 🔐 | Delete a user-owned playlist when the response exposes that action |
+| `guide` | YouTube Guide | 🔐 | Regular YouTube subscriptions; no Music sidebar integration |
 
 ---
 
@@ -443,10 +529,12 @@ let body = ["query": "never gonna give you up"]
 ```
 
 **Response Structure**:
-- `musicCardShelfRenderer` — **Top Result** section (single prominent result: song, album, artist, or playlist)
-- `musicShelfRenderer` — Regular results (mixed songs, albums, artists, playlists)
+- `musicCardShelfRenderer` — **Top Result** section. Its title can navigate through either `browseEndpoint` or `watchEndpoint`, and its `contents` can include additional rows.
+- `itemSectionRenderer.contents[]` — Current mixed-search rows. Each wrapper commonly contains one `musicResponsiveListItemRenderer`.
+- `musicShelfRenderer` — Filtered result lists and occasional direct mixed-search sections.
+- `musicResponsiveListItemRenderer` — Songs, videos, albums, audiobooks, artists, profiles, playlists, podcast shows, and podcast episodes.
 
-> ⚠️ **Important**: The Top Result (most relevant match) is returned in `musicCardShelfRenderer`, not `musicShelfRenderer`. This is often the artist/album the user is looking for. Always parse both renderer types.
+> ⚠️ **Important**: Revalidated on 2026-07-19, mixed search no longer consistently returns direct `musicShelfRenderer` sections. Parse `musicCardShelfRenderer`, its nested `contents`, direct `musicShelfRenderer`, and `itemSectionRenderer.contents`. Top Results can be directly playable `watchEndpoint` videos, not only browse destinations.
 
 **Top Result Example** (searching "manifest"):
 ```json
@@ -474,7 +562,30 @@ let body = ["query": "never gonna give you up"]
 }
 ```
 
-**Parser**: `SearchResponseParser` (handles both `musicCardShelfRenderer` and `musicShelfRenderer`)
+**Observed mixed result types (guest session, 2026-07-19)**:
+
+- `Song` — usually `MUSIC_VIDEO_TYPE_ATV`
+- `Video` — `MUSIC_VIDEO_TYPE_OMV` or `MUSIC_VIDEO_TYPE_UGC`
+- `Album`
+- `Audiobook` — `MUSIC_PAGE_TYPE_AUDIOBOOK`; currently uses an album-like `MPRE...` browse destination
+- `Artist`
+- `Profile` — `MUSIC_PAGE_TYPE_USER_CHANNEL`
+- `Playlist`
+- `Podcast` — `MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE`
+- `Episode` — `MUSIC_VIDEO_TYPE_PODCAST_EPISODE` with an `MPED...` title destination
+
+Playable rows can expose the same video ID through several paths:
+
+```text
+playlistItemData.videoId
+navigationEndpoint.watchEndpoint.videoId
+flexColumns[0]...runs[0].navigationEndpoint.watchEndpoint.videoId
+overlay...musicPlayButtonRenderer.playNavigationEndpoint.watchEndpoint.videoId
+```
+
+Browse rows commonly use `musicResponsiveListItemRenderer.navigationEndpoint.browseEndpoint`.
+
+**Parser**: `SearchResponseParser`. The API shape audit command below reports which live rows the current parser can and cannot reach.
 
 **Filter Params** (base64-encoded filter values for `params` field):
 
@@ -488,7 +599,20 @@ let body = ["query": "never gonna give you up"]
 | Community Playlists | `EgeKAQQoAEABagwQDhAKEAMQBBAJEAU=` | User-created playlists |
 | Podcasts | `EgWKAQJQAWoQEBAQCRAEEAMQBRAKEBUQEQ%3D%3D` | Filter to podcast shows only |
 
-> **Filter Pattern**: `EgWKAQ` (base) + filter code + `AWoMEA4QChADEAQQCRAF` (no spelling correction suffix). The filter code encodes the content type (songs=II, albums=IY, artists=Ig, playlists=Io, podcasts=JQ).
+> **Static params vs. live chips**: The table above records Mozaic's existing no-spelling-correction params. Live `chipCloudChipRenderer.navigationEndpoint.searchEndpoint.params` values are contextual: the same filter label had different complete suffixes for different queries on 2026-07-19. Do not assume one server-issued full params value is universal.
+
+Observed filter type codes in live chips:
+
+| Live Filter | Encoded Type Code | Current Mozaic Filter |
+|-------------|-------------------|----------------------|
+| Songs | `II` | ✅ |
+| Videos | `IQ` | ✅ |
+| Albums | `IY` | ✅ |
+| Artists | `Ig` | ✅ |
+| Profiles | `JY` | ✅ |
+| Episodes | `JI` | ✅ |
+| Podcasts | `JQ` | ✅ |
+| Community / Featured playlists | Specialized playlist params | ✅ |
 
 **Usage Example** (podcasts):
 ```swift
@@ -497,6 +621,65 @@ let body: [String: Any] = [
     "params": "EgWKAQJQAWoQEBAQCRAEEAMQBRAKEBUQEQ%3D%3D"
 ]
 ```
+
+**Filtered Search Continuation** (revalidated 2026-07-19):
+
+The first-page token is carried by the shelf, not the enclosing section list:
+
+```text
+contents.tabbedSearchResultsRenderer.tabs[0].tabRenderer.content
+  .sectionListRenderer.contents[].musicShelfRenderer
+  .continuations[0].nextContinuationData.continuation
+```
+
+Send that token back to the `search` endpoint:
+
+```swift
+let body = ["continuation": token]
+// POST /youtubei/v1/search
+```
+
+The common response uses:
+
+```text
+continuationContents.musicShelfContinuation.contents[]
+continuationContents.musicShelfContinuation.continuations[]
+```
+
+Search continuations can also use action envelopes. Preserve action order and parse both append and reload commands:
+
+```text
+onResponseReceivedActions[] | onResponseReceivedCommands[] | onResponseReceivedEndpoints[]
+  .appendContinuationItemsAction.continuationItems[]
+  .reloadContinuationItemsCommand.continuationItems[]
+```
+
+The `continuationItems` array can mix result renderers with a trailing `continuationItemRenderer` carrying the next token. `SearchResponseParser.parseContinuation` supports both the shelf envelope and these action envelopes.
+
+Sending the captured search token to `browse` returned unrelated browse/home sections in the same guest session, not the next search page.
+
+**Deep audit command**:
+
+```bash
+swift run api-explorer --guest search-audit "ambient electronic mix"
+```
+
+This probes the unfiltered response, every live filter chip, and one `/search` continuation page per filter when offered. It reports renderer wrappers, destination paths, content/page types, token carrier locations, and current mixed-parser coverage without printing continuation values.
+
+To compare a response against Mozaic's currently configured WEB_REMIX version instead of the live web version resolved by API Explorer:
+
+```bash
+swift run api-explorer --guest --client-version 1.20231204.01.00 \
+  search-audit "ambient electronic mix"
+```
+
+`search-audit` labels the client-version source as `live`, `override`, or `fallback`. When it reports `fallback`, use `--client-version` before drawing a version-comparison conclusion. API Explorer also resolves the live version independently when the API key comes from its environment override.
+
+For this query, the live version `1.20260715.04.00` and Mozaic's configured `1.20231204.01.00` showed no structural difference in section wrappers, result-type counts, filter chips, or continuation carriers. This does not prove that every result identity was identical or fully rule out version-specific behavior; it does show that the observed parser gaps reproduce with Mozaic's configured version.
+
+A July 19, 2026 guest audit matrix covering the reported query, `Taylor Swift`, `The Daily podcast`, and `lofi hip hop` found no unhandled result rows after the parser update. It also exposed `MUSIC_PAGE_TYPE_AUDIOBOOK` inside mixed and Albums-filter results; Mozaic now keeps those results semantically distinct as audiobooks while reusing the existing album payload and playlist-style detail navigation.
+
+`search-audit` labels the version source as `live`, `override`, or `fallback`. The audit performs a bounded live-version lookup even when `MOZAIC_YTMUSIC_API_KEY` supplies the API key; unrelated API Explorer commands keep the environment override's immediate behavior. If web configuration discovery fails, the report explicitly identifies the configured fallback instead of presenting it as live.
 
 ---
 
@@ -582,7 +765,19 @@ let body = ["feedbackTokens": [addToken]]
 _ = try await request("feedback", body: body)
 ```
 
-Tokens come from `getSong(videoId:)` response.
+Tokens come from `getSong(videoId:)` response. `FeedbackTokens.add` and
+`FeedbackTokens.remove` are action-specific: select the add token when the
+target state is in-library and the remove token when the target state is
+out-of-library. Keep the known pair stable across optimistic UI updates; do not
+swap the fields. A later authoritative metadata response may replace or rotate
+the pair.
+
+`api-explorer` reports library feedback action structure without printing token
+values. It can also inspect a saved response safely:
+
+```bash
+swift run api-explorer analyze-file path/to/response.json
+```
 
 ---
 
@@ -618,20 +813,16 @@ _ = try await request("like/removelike", body: body)
 
 ---
 
-### Available Action Endpoints
+### Not implemented action endpoints
 
-| Endpoint | Name | Auth | Priority | Notes |
-|----------|------|------|----------|-------|
-| `player` | Player | 🌐 | Medium | Video metadata, streaming URLs |
-| `music/get_queue` | Get Queue | 🌐 | **High** | Queue data for video IDs |
-| `playlist/get_add_to_playlist` | Add to Playlist | 🔐 | Medium | Get playlists for "Add to" menu; cached with library TTL |
-| `browse/edit_playlist` | Edit Playlist | 🔐 | Medium | Add/remove playlist tracks; invalidates library/menu caches |
-| `playlist/create` | Create Playlist | 🔐 | Medium | Create new playlist; supports optional seed `videoIds` |
-| `playlist/delete` | Delete Playlist | 🔐 | Low | Delete a user-owned playlist when delete affordance is present |
-| `guide` | Guide | 🌐 | Low | Sidebar structure |
-| `account/account_menu` | Account Menu | 🔐 | Low | Account settings |
+| Endpoint | Name | Auth | Notes |
+|----------|------|------|-------|
+| `player` | Player | 🌐 | No direct native-client integration; playback uses WebView. Guest responses can be `UNPLAYABLE` without streaming data |
+| `get_transcript` | YouTube Transcript | Unverified | Server-issued commands found, but both guest replays returned HTTP 400 on 2026-09-04. Captions are implemented separately |
 
 ---
+
+### Additional action response details
 
 #### Player (`player`)
 
@@ -639,7 +830,9 @@ _ = try await request("like/removelike", body: body)
 let body = ["videoId": "dQw4w9WgXcQ"]
 ```
 
-**Response** (works WITHOUT auth!):
+**Historical response example**: The 2024 probe included streaming data. On
+2026-07-01, guest Music and YouTube requests instead returned `UNPLAYABLE`
+without `streamingData`. HTTP 200 alone does not establish playability.
 ```json
 {
   "playabilityStatus": { "status": "OK" },
@@ -722,13 +915,18 @@ let body = ["playlistId": "RDCLAK5uy_l2pHac-aawJYLcesgTf67gaKU-B9ekk1o"]
 }
 ```
 
-> ⚠️ **Note**: The response uses a **wrapper structure** (`playlistPanelVideoWrapperRenderer.primaryRenderer.playlistPanelVideoRenderer`) 
-> rather than a direct `playlistPanelVideoRenderer`. Parsers must handle this wrapper.
+> ⚠️ **Note**: Responses can contain either a direct `playlistPanelVideoRenderer` or a **wrapper structure** (`playlistPanelVideoWrapperRenderer.primaryRenderer.playlistPanelVideoRenderer`). Parsers must handle both.
 
 **playlistPanelVideoRenderer keys** (verified):
 - `title`, `longBylineText`, `thumbnail`, `lengthText`
 - `selected`, `navigationEndpoint`, `videoId`, `shortBylineText`
 - `trackingParams`, `menu`
+
+Artist navigation, verified with guest requests for **Chill R&B** and **Country Summer** on 2026-09-04:
+
+- `shortBylineText` contains a single display-only run, such as `COLORS & Tems`, without artist browse endpoints.
+- `longBylineText` contains separate artist runs with `UC...` browse endpoints. Ampersands or commas separate co-artists; a bullet separates the artists from view and like counts.
+- Parse artists from the long byline, stopping before trailing metadata. Use the short byline as a fallback when the long byline has no artists.
 
 **Use cases**:
 - Get metadata for multiple videos in one call (queue display)
@@ -865,8 +1063,8 @@ These endpoints were discovered through API exploration (2024-12-22) but are not
 
 | Endpoint | Type | Auth | Parameters | Description |
 |----------|------|------|------------|-------------|
-| `FEmusic_radio_builder` | Browse | 🌐 | - | Radio station builder UI data (form fields, artist selection) |
-| `FEmusic_liked_videos` | Browse | 🔐 | - | User's liked videos (alternative to `FEmusic_liked_videos`) |
+| `FEmusic_radio_builder` | Browse | 🌐 | - | Form dialog and chips verified on 2026-09-04; station creation/saving not tested or implemented |
+| `FEmusic_liked_videos` | Browse | 🔐 | - | Limited liked-song list; Mozaic uses `VLLM` for pagination |
 
 ### Infrastructure/Internal Endpoints
 
@@ -874,11 +1072,11 @@ These endpoints exist but are primarily for YouTube's internal use:
 
 | Endpoint | Type | Auth | Parameters | Notes |
 |----------|------|------|------------|-------|
-| `account/account_menu` | Action | 🌐/🔐 | `{}` | Returns account menu structure (settings, premium promo) |
+| `account/account_menu` | Action | 🌐/🔐 | `{}` | Not implemented; allowlisted for authentication but has no app caller or parser. Account selection uses `account/accounts_list` |
 | `reel/reel_item_watch` | Action | 🌐 | `{}` | Returns status tracking params (YouTube Shorts related) |
 | `log_event` | Action | 🌐 | `{}` | Analytics/telemetry logging endpoint |
 | `att/get` | Action | 🌐 | `{}` | Anti-bot/botguard challenge data |
-| `FEmusic_listening_review` | Browse | 🌐 | - | Returns only responseContext (Year in Review?) |
+| `FEmusic_listening_review` | Browse | 🔐 | - | Signed-in sample returned a message; usable Recap content remains unverified |
 
 ### Endpoints Requiring Parameters
 
@@ -889,7 +1087,7 @@ These endpoints exist but return HTTP 400 without proper parameters:
 | `comment/create_comment` | Action | 🔐 | 400 | Needs `videoId`, `commentText` |
 | `comment/perform_comment_action` | Action | 🔐 | 400 | Needs action params |
 | `share/get_share_panel` | Action | 🌐 | 400 | Needs `videoId` |
-| `get_transcript` | Action | 🌐 | 400 | Needs `videoId`, `params` |
+| `get_transcript` | Action | Unverified | 400 | Server-issued WEB `next` params also returned HTTP 400 on 2026-09-04; a working request context remains unverified |
 | `live_chat/send_message` | Action | 🔐 | 400 | Needs chat params |
 | `notification/get_unseen_count` | Action | 🔐 | 400 | Needs user context |
 
@@ -992,7 +1190,7 @@ All parsers are located in `Sources/Mozaic/Services/API/Parsers/`. Each parser i
 | `HomeResponseParser` | `HomeResponseParser.swift` | Home/Explore browse response | `HomeResponse` with `[HomeSection]` | `FEmusic_home`, `FEmusic_explore` |
 | `SearchResponseParser` | `SearchResponseParser.swift` | Search response | `SearchResponse` with songs, albums, artists, playlists | `search` endpoint |
 | `SearchSuggestionsParser` | `SearchSuggestionsParser.swift` | Suggestions response | `[SearchSuggestion]` | `music/get_search_suggestions` |
-| `PlaylistParser` | `PlaylistParser.swift` | Playlist/library response | `[Playlist]`, `LibraryContent` | `VL{id}`, `VLLM`, `FEmusic_liked_playlists`, `FEmusic_library_landing` |
+| `PlaylistParser` | `PlaylistParser.swift` | Playlist/library response | `[Playlist]`, `[Album]`, `LibraryContent` | `VL{id}`, `VLLM`, `FEmusic_liked_playlists`, `FEmusic_liked_albums`, `FEmusic_library_landing` |
 | `ArtistParser` | `ArtistParser.swift` | Artist browse response | `ArtistDetail` with songs, albums | `UC{channelId}` |
 | `LyricsParser` | `LyricsParser.swift` | Next/lyrics response | `Lyrics` or lyrics browse ID | `next`, `MPLYt{id}` |
 | `PodcastParser` | `PodcastParser.swift` | Podcast browse response | `[PodcastSection]`, `PodcastShowDetail` | `FEmusic_podcasts`, `MPSPP{id}` |
@@ -1097,31 +1295,341 @@ let result = try await RetryPolicy.execute(
 
 ---
 
-## Implementation Priorities
+## Implementation status
 
-### Phase 1: High-Impact Features
+Checked against the app source on 2026-09-04. Status refers to Mozaic integration,
+not API Explorer support. Partial means the existing behavior and missing parts
+are listed separately in the same row.
 
-| Feature | Endpoint | Effort | Impact |
-|---------|----------|--------|--------|
-| History | `FEmusic_history` | Medium | High |
-| Charts | `FEmusic_charts` | Low | High |
-| Moods & Genres | `FEmusic_moods_and_genres` | Low | High |
-| Queue Display | `music/get_queue` | Low | High |
+| Capability | Mozaic status | Implemented and missing behavior |
+|------------|--------------|----------------------------------|
+| Home, Explore, Moods & Genres, New Releases | Implemented | Browse pages and section parsing exist; Home activity chips are listed separately below |
+| Listening history | Implemented | Recently played tracks grouped by time |
+| Saved albums | Implemented | Album collection with grid pagination |
+| Library content-type filtering | Partial | Local filters cover the existing collections; the server's Songs, Profiles, and podcast Channels filters are not integrated |
+| Library playlists and followed artists | Partial | Dedicated loads display the initial page; complete collection pagination and sorting are not implemented |
+| Library sorting | Not implemented | Signed-in Library and playlist sort reloads are verified; no native sorting controls or sort-specific continuation state |
+| Library Profiles | Not implemented | The server-issued Profiles route works; no dedicated profile collection or Library filter |
+| Uploaded Songs | Implemented | Library tile, playlist-style track rows, and track pagination |
+| Playlist creation, track editing, and deletion | Implemented | Add/remove tracks, create playlists, and delete playlists with ownership checks |
+| Podcasts | Partial | Discovery, show pages, episode progress, and played-state display exist; dedicated Library/Channels requests and explicit Resume and Start Over controls are not implemented |
+| Captions | Implemented | Playback captions exist; a native transcript panel is separate |
+| Music video type parsing | Implemented | Includes `MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC` |
+| Video quality selection | Partial | Regular YouTube has a WebView-backed quality picker; a Music video resolution picker is not implemented |
+| Charts | Partial | Chart sections and pagination exist; country selection is not implemented |
+| Radio and mix queues | Partial | Song/artist radio, mixes, queue display, and continuation exist; radio filter chips are not implemented |
+| Song credits | Not implemented | No credits parser or sheet |
+| Home activity chips | Not implemented | No chip model, selection requests, or filter row |
+| Mobile Speed dial | Not implemented | Known `IOS_MUSIC` Home model; web-cookie authentication returned HTTP 400 on mobile clients. Requires a verified mobile OAuth session before replacing Favorites |
+| Related content for the current Music track | Not implemented | No Music Related view |
+| Full radio builder | Not implemented | No form-driven station creation or saving |
+| Native YouTube transcript | Not implemented | No working transcript request or native panel |
+| Recommendation dismissal | Not implemented | Dislike and library add/remove feedback exist; Not interested for recommendations does not |
+| Taste profile onboarding | Not implemented | No artist-selection onboarding |
+| Account menu | Not implemented | No `account/account_menu` caller or parser; account selection uses the implemented `account/accounts_list` endpoint |
+| Uploaded albums/artists | Not implemented | Their issued browse routes return signed-in empty states; Uploaded Songs is implemented separately |
+| Recap | Not implemented | No Recap page or parser |
+| Audio/video counterpart switch | Not implemented | The existing video button changes presentation, not the recording |
 
-### Phase 2: Library Enhancements
+The initial probes ran on 2026-09-04 in guest mode before an authentication
+export was available. Later Speed dial and account discovery used the saved web
+login. Each result below identifies its authentication mode. Counts describe
+renderers in individual responses, not unique records or fixed limits. No account
+mutations or playback behavior were tested.
 
-| Feature | Endpoint | Effort | Impact |
-|---------|----------|--------|--------|
-| Library Albums | `FEmusic_library_albums` | Medium | Medium |
-| Library Artists | `FEmusic_library_corpus_track_artists` | Medium | Medium |
-| Add to Playlist | `playlist/get_add_to_playlist` + `browse/edit_playlist` | Implemented | Medium |
+### Authenticated Library and account discovery
 
-### Phase 3: Discovery
+Verified on 2026-09-04 with saved Mozaic cookies and the `WEB_REMIX` client.
+Home, Library, and the successful account-specific requests explicitly reported
+a signed-in server session. Credentials and personalized response values stayed
+out of reports. These probes used the web session; they do not establish mobile
+OAuth authentication.
 
-| Feature | Endpoint | Effort | Impact |
-|---------|----------|--------|--------|
-| New Releases | `FEmusic_new_releases` | Low | Medium |
-| Create Playlist | `playlist/create` | Implemented | Medium |
+| Read | Verified response |
+|------|-------------------|
+| Library landing | HTTP 200, 25 grid items, six content chips, and three sort choices. Its next-page request returned eight more items. |
+| Library sorting | Following the issued Recently saved reload returned HTTP 200, 25 grid items, and a sort-menu title of Recently saved. |
+| Playlist sorting | The dedicated playlist page offered Recently saved, A to Z, and Z to A. Following A to Z returned HTTP 200, 20 grid items, and a matching sort-menu title. |
+| Playlist pagination | Following the default playlist page's next continuation returned HTTP 200 with no additional item renderers or next-page navigation. |
+| Podcast library | Following Podcasts returned HTTP 200 and nine grid items through `FEmusic_library_non_music_audio_list`. |
+| Podcast Channels | The Channels chip issued `FEmusic_library_non_music_audio_channels_list` with params. It returned 25 user-channel rows and selected both Podcasts and Channels. The next continuation returned 21 more channel rows. |
+| Profiles | The Profiles chip issued `FEmusic_library_user_profile_channels_list` with params. It returned HTTP 200, one user-channel row, a message, and three sort choices. |
+| Upload Albums and Artists | Their issued routes returned HTTP 200 with selected filter chips and a message, without album or artist rows. The Albums route is `FEmusic_library_privately_owned_releases`; the older `privately_owned_albums` probe still returned HTTP 400 while signed in. |
+| Listening history | HTTP 200 with 199 track rows across four shelves. Removal commands were observed but not sent. |
+| Taste profile | HTTP 200 with `tastebuilderRenderer`, 120 item lists, and 1,700 item renderers containing selection and impression form fields. No acceptance or selection submission was sent. |
+| Recap | HTTP 200 with a signed-in session and a `messageRenderer`, without Recap data. |
+| YouTube transcript | Signed-in WEB `next` issued `getTranscriptEndpoint` for `jNQXAC9IVRw`; replaying its exact params returned HTTP 400 `FAILED_PRECONDITION`. Authentication alone did not make this request work. |
+
+The six Library chips target Playlists, Podcasts, Songs, Albums, Artists, and
+Profiles. Songs currently issues `FEmusic_liked_videos`. The issued Profiles and
+podcast Channels requests include params; this investigation did not establish
+an equivalent params-free request.
+
+Library selection commands differ from the direct browse navigation seen in
+guest Home. A chip's read is under
+`chipCloudChipRenderer.navigationEndpoint.commandExecutorCommand.commands[].browseEndpoint`.
+The batch also contains `musicLibraryPersistLaunchNavigationCommand`.
+Sort options use
+`musicMultiSelectMenuItemRenderer.selectedCommand.commandExecutorCommand.commands[]`
+with a `browseSectionListReloadEndpoint.continuation.reloadContinuationData`
+read and checkbox-update siblings. Explorer extracts the browse read, retains
+the current filter context for reloads, and does not execute the other commands.
+Returned sort-menu titles confirm the selected sort. Sorting across every page
+and native UI ordering remain untested.
+
+The taste builder's `acceptButton` is inspected as schema only. Its browse-like
+shape does not make acceptance an ordinary discovery route. Selection values
+remain private, and discovery does not expose an acceptance navigation entry.
+
+Mozaic's [Library view](../Sources/Mozaic/Views/LibraryView.swift) filters already
+loaded collections locally. Its
+[Library loader](../Sources/Mozaic/Services/API/YTMusicClient.swift) reads podcast
+shows from the landing preview and has no dedicated podcast Channels or Profiles
+load. Library sorting, full collection pagination, and those dedicated reads
+are concrete additions supported by these responses. Uploaded album/artist
+parsers still need a populated account fixture before implementation.
+
+**Explorer status: Implemented.** Bundled chip reads, sort reloads, redacted
+sort-menu titles, and non-replayable taste acceptance are covered by tests.
+**App status:** The missing integrations remain as listed in the table above.
+
+```bash
+swift run api-explorer auth
+swift run api-explorer discover browse '{"browseId":"FEmusic_library_landing"}' --limit 20
+
+# Inspect current indices before following these sampled selections.
+swift run api-explorer discover browse '{"browseId":"FEmusic_library_landing"}' --follow 7
+swift run api-explorer discover browse '{"browseId":"FEmusic_liked_playlists"}' --follow 3
+swift run api-explorer discover browse '{"browseId":"FEmusic_library_landing"}' --follow 1 --follow 2 --follow 6
+swift run api-explorer discover browse '{"browseId":"FEmusic_library_landing"}' --follow 5
+swift run api-explorer discover browse '{"browseId":"FEmusic_library_privately_owned_landing"}' --follow 2
+swift run api-explorer discover browse '{"browseId":"FEmusic_tastebuilder"}'
+swift run api-explorer discover browse '{"browseId":"FEmusic_listening_review"}'
+```
+
+### Song credits
+
+Searching for `Daft Punk Get Lucky` exposed a server-issued `MPTC...` browse ID
+in a row menu. Following it returned HTTP 200 with page type
+`MUSIC_PAGE_TYPE_TRACK_CREDITS`. A `dismissableDialogRenderer` contained four
+populated `dismissableDialogContentSectionRenderer` sections. Each had a title
+and nonempty subtitle runs. The roles were Performed by, Written by, Produced
+by, and Music metadata provided by.
+
+Mozaic's [Song model](../Sources/Mozaic/Models/Song.swift),
+[SongMetadataParser](../Sources/Mozaic/Services/API/Parsers/SongMetadataParser.swift),
+and [song context menus](../Sources/Mozaic/Views/SharedViews/SongContextMenus.swift)
+do not expose credits. The browse ID comes from navigation and cannot be
+constructed from the video ID. Credit titles can be localized or unfamiliar;
+the observed four roles are not an exhaustive schema. Credits require a
+separate detail request, which can be deferred until the user opens them.
+
+### Home activity chips
+
+Guest Home returned 11 chips: Podcasts, Energize, Relax, Workout, Feel good,
+Commute, Sleep, Romance, Party, Focus, and Sad. Following Focus with its issued
+`FEmusic_home` browse params returned HTTP 200, `isSelected=true` for Focus,
+and three shelves instead of two. These chips are distinct from the existing
+Moods & Genres destination pages.
+
+[HomeResponse](../Sources/Mozaic/Models/HomeResponse.swift) stores sections but
+no chips, and [HomeResponseParser](../Sources/Mozaic/Services/API/Parsers/HomeResponseParser.swift)
+does not parse the filter bar. [YTMusicClient](../Sources/Mozaic/Services/API/YTMusicClient.swift)
+owns continuation state by page type; it has no separate Home filter cache or
+continuation identity. Selecting a chip changes the request params and the
+content to which subsequent continuations belong.
+
+### Mobile Speed dial
+
+Speed dial is exposed by an existing client through the Home browse request,
+using `clientName: IOS_MUSIC`. It is not a separate known browse ID. The
+[client's Home parser](https://github.com/itsnebulalol/resonance-addons/blob/a9a6ac6d1adfd7c36da83d086bfad6840296eff9/packages/youtubemusic-addon/src/routes/catalog.ts)
+reads this path:
+
+```text
+contents.singleColumnBrowseResultsRenderer.tabs[].tabRenderer.content
+  .sectionListRenderer.contents[].itemSectionRenderer.contents[]
+  .elementRenderer.newElement.type.componentType.model
+  .musicSpeedDialShelfModel.data.items[]
+```
+
+The associated [request implementation](https://github.com/itsnebulalol/resonance-addons/blob/a9a6ac6d1adfd7c36da83d086bfad6840296eff9/packages/youtubemusic-addon/src/auth.ts)
+sends `POST https://music.youtube.com/youtubei/v1/browse?prettyPrint=false` with
+`browseId: FEmusic_home`. Its profile uses version `9.06.4`, platform `MOBILE`,
+iOS `26.2.1`, and device `iPhone18,4`. It authenticates with mobile OAuth.
+
+Initial probes ran on 2026-09-04. The guest mobile rows and Android web-cookie
+comparisons were rechecked on 2026-09-05. Guest mobile probes omit browser
+headers; Android uses a matching Android 13 / API level 33 profile.
+
+| Probe | Result |
+|-------|--------|
+| Guest `WEB_REMIX` Home | HTTP 200 with two `musicCarouselShelfRenderer` sections; no Speed dial model |
+| Guest `IOS_MUSIC` Home | HTTP 200, explicitly guest, with mobile `elementRenderer` and `musicGridItemCarouselModel` content; no Speed dial model |
+| Signed-in `WEB_REMIX` Home | HTTP 200; `logged_in=1` and `yt_li=1`. Returned Listen again with 20 items, but no Speed dial model |
+| `IOS_MUSIC` with web cookies and SAPISIDHASH | HTTP 400 `INVALID_ARGUMENT`. Repeated with matching client headers and with the resolved web API key; same rejection |
+| `IOS_MUSIC` with cookies but no Authorization header | HTTP 200, explicitly guest in service metadata; no Speed dial model. Adding the web API key did not authenticate it |
+| `ANDROID_MUSIC` with SAPISIDHASH | Versions `5.34.51` and `7.21.50` returned HTTP 400 `INVALID_ARGUMENT` |
+| Guest `ANDROID_MUSIC` Home | Both tested versions returned HTTP 200 with a `messageRenderer`, not a populated Home feed |
+| Mobile OAuth Home | Not tested; Mozaic has no mobile OAuth session or token export |
+
+The Home request and guest iOS response format are verified. The current Mozaic
+login authenticates the web client, but did not authenticate any tested mobile
+profile. A response body or HTTP 200 alone is insufficient: the cookie-only
+mobile response explicitly reported a guest session. The linked client's
+[authentication configuration](https://github.com/itsnebulalol/resonance-addons/blob/a9a6ac6d1adfd7c36da83d086bfad6840296eff9/packages/youtubemusic-addon/src/index.ts)
+requires a Google OAuth refresh token, which its request implementation exchanges
+for a mobile access token. Mozaic currently has no such exchange or login flow.
+
+The Speed dial item shape below comes from that client implementation, not a
+locally captured signed-in response:
+
+| Item field | Purpose in the linked parser |
+|------------|------------------------------|
+| `title`, `thumbnail.image.sources` | Tile label and artwork |
+| `navigationCommand.innertubeCommand.browseEndpoint` | Playlist, album, or artist navigation |
+| `startPlaybackCommand.innertubeCommand.watchEndpoint` | Playback seed and playlist context |
+| `startPlaybackCommand.serialCommand.commands[].innertubeCommand.watchEndpoint` | Playback seed inside a command sequence |
+| `onLongPress.innertubeCommand.menuEndpoint.menu.menuRenderer.title.musicMenuTitleRenderer.secondaryText` | Additional metadata in the long-press menu |
+| `isShortcut` | Marks a shortcut tile; it does not establish ordinary song semantics |
+
+An artist tile can carry both browse navigation and a radio playback command.
+Those are distinct actions. Preserve issued commands rather than reducing every
+tile to a song or synthesizing a Speed dial browse ID.
+
+**App status: Not implemented.** Favorites remains unchanged. Listen again is
+not used as a substitute for the requested mobile Speed dial section. The next
+step is to establish mobile OAuth authentication and capture a populated
+`musicSpeedDialShelfModel` before implementing its parser and interface.
+
+Mozaic currently requests `WEB_REMIX`, and
+[HomeResponseParser](../Sources/Mozaic/Services/API/Parsers/HomeResponseParser.swift)
+does not parse `elementRenderer` mobile models. Speed dial has no dedicated app
+model or interface. API Explorer reports mobile model names, Speed dial item
+and shortcut counts, redacted read navigation, fixed API error categories, and
+server login flags from `responseContext.serviceTrackingParams`. It also reports
+web shelf labels and item counts separately, so Listen again cannot be mistaken
+for a mobile Speed dial model.
+
+**Explorer status: Implemented.** iOS and Android request profiles, web-cookie
+comparison options, and private-file OAuth input are available:
+
+```bash
+swift run api-explorer discover browse '{"browseId":"FEmusic_home"}' --ios-music --guest
+swift run api-explorer discover browse '{"browseId":"FEmusic_home"}' --ios-music -v -o /tmp/mobile-home.txt
+swift run api-explorer discover browse '{"browseId":"FEmusic_home"}' --ios-music --mobile-cookie-only
+swift run api-explorer discover browse '{"browseId":"FEmusic_home"}' --android-music --client-version 7.21.50 --guest
+swift run api-explorer discover browse '{"browseId":"FEmusic_home"}' --ios-music --mobile-token-file /path/to/private-access-token -o /tmp/mobile-oauth-home.txt
+```
+
+Without `--mobile-token-file`, mobile discovery uses saved web cookies if
+available, or guest mode when `--guest` is supplied. Discovery captures cookies
+once and reuses them for every followed request and web configuration lookup.
+`--mobile-cookie-only`
+retains available cookies even when no signing cookie is present, but omits
+SAPISIDHASH for comparison. `--mobile-web-key` adds
+the resolved web API key; it did not fix the iOS authentication rejection.
+
+The token-file option reads an existing OAuth **access token**, not a refresh
+token. The file must be owned by the current user, have mode 0600 and no extended
+ACL, and be a regular file rather than a symlink. Its value stays in memory and
+is sent only to mobile discovery requests as Bearer authorization; web cookies
+and account-selection headers are omitted. It cannot be combined with guest
+mode, cookie-only mode, or web account selection. A report destination that refers
+to the token file, selected cookie archive, or request-body file is rejected
+before loading credentials or making requests. This includes symlink and
+hard-link aliases and a regular file redirected into `--body-file -`.
+Invalid token files produce a separate diagnostic without printing their contents.
+Do not put credentials in command arguments, documentation, fixtures, or chat.
+This option does not obtain,
+refresh, or validate a mobile credential by itself; a populated signed-in
+response still needs live verification.
+
+Both mobile profiles are restricted to `discover`, cannot be combined with
+`--youtube` or each other, and stay active on every followed request. They omit
+the web API-key lookup by default and send matching client headers and user
+agents. Guest and OAuth requests omit `Origin`, `Referer`, `X-Origin`, and web
+account-selection headers. These headers are retained for web-cookie comparisons.
+The Android profile pairs Android 13 with SDK level 33; its user agent
+also declares Android 13. `--client-version` overrides the configured version. The Android default
+`5.34.51` comes from the
+[YouTube.js client definitions](https://github.com/LuanRT/YouTube.js/blob/a480854c501406cf55c9eb7ad5b540ab36a65b56/src/utils/Constants.ts)
+and is a diagnostic baseline, not a verified Home feed profile. The model and
+item counts distinguish an absent shelf from an empty one without exposing
+listening history.
+
+### Chart countries
+
+Charts exposed 69 distinct country choices across 70 menu items, including one
+duplicate. The menu uses `musicMultiSelectMenuItemRenderer` and
+`musicBrowseFormBinderCommand`. Its choices are backed by
+`frameworkUpdates.entityBatchUpdate.mutations[].payload.musicFormBooleanChoice`.
+The observed `opaqueToken` values were public two-letter country codes,
+including `ZZ` for Global.
+
+The [Japan request](#charts-femusic_charts) returned HTTP 200, explicitly
+selected `JP`, 40 list rows, and two carousels. Country selection is separate
+from `context.client.gl`, which the app currently sets to US.
+[ChartsViewModel](../Sources/Mozaic/ViewModels/ChartsViewModel.swift) and
+[ChartsView](../Sources/Mozaic/Views/ChartsView.swift) have no country selection;
+`getCharts` has no country argument or country-specific state.
+
+The read-only form handling verified here applies only to Charts. Home and
+tastebuilder forms can update recommendation preferences.
+
+### Related Music content
+
+For `dQw4w9WgXcQ`, `next` returned a Related tab with an `MPTR...` browse ID
+alongside the `MPLY...` Lyrics tab. Following the issued Related navigation
+returned HTTP 200, five carousels, 28 track rows, and an artist description.
+Recognized sections included You might also like, Recommended playlists,
+Similar artists, and About the artist. The page type is
+`MUSIC_PAGE_TYPE_TRACK_RELATED`. The page uses the shelf structure
+already handled by [HomeResponseParser](../Sources/Mozaic/Services/API/Parsers/HomeResponseParser.swift),
+but Mozaic does not load or display this tab. Preserve the issued browse ID.
+
+A recommendation is not evidence of an audio/video counterpart. None of the
+sampled queues exposed explicit counterpart fields. A recording switch remains
+unverified even though Related browsing works.
+
+### Radio queue filters
+
+A `next` request with a video seed, its `RDAMVM...` playlist, `isAudioOnly=true`,
+and `enablePersistentPlaylistPanel=true` returned 50 queue entries and eight
+chips. Recognized labels included All, Popular, Discover, Deep cuts, and Party.
+Following the issued Popular command returned HTTP 200 and 24 queue entries.
+That response did not repeat the full filter bar.
+
+[RadioQueueResult](../Sources/Mozaic/Services/API/Parsers/RadioQueueParser.swift)
+stores songs and a continuation, but no filter commands. The commands carry
+server-issued playlist IDs and params. API Explorer retains the seed's audio
+and persistent-panel flags when following them.
+
+An unfiltered `nextRadioContinuationData` replay also returned HTTP 200 and 49
+entries. These probes establish queue reads, not filtered or infinite
+pagination, selected-chip persistence, or in-app playback behavior. The app's
+continuation request sends fewer fields than Explorer; comparing different
+request contexts does not establish a parser defect.
+
+### Other discovery results and limits
+
+| Area | API evidence and remaining limits |
+|------|-----------------------------------|
+| Full radio builder | `FEmusic_radio_builder` returned HTTP 200, a dialog, two chip groups, five choices, `musicWatchFormBinderCommand`, and form entities. Familiar, Popular, and Discover controls were present. Multiple artist seeds and station creation/saving were not verified. |
+| Native YouTube transcript | WEB `next` exposed `getTranscriptEndpoint` for `aircAruvnKk` and `jNQXAC9IVRw`. Guest exact-params replays returned HTTP 400. The signed-in replay for `jNQXAC9IVRw` also returned HTTP 400 `FAILED_PRECONDITION`. A working request remains unverified; existing captions do not establish transcript support. |
+| Recommendation dismissal | Guest and signed-in Home cards exposed Not interested and `feedbackEndpoint`; signed-in Home also exposed Don't recommend channel. No mutation was sent, so action semantics and responses remain unverified. Library add/remove feedback is a separate implemented use of the same endpoint. |
+| Taste profile | Signed-in content is verified in [account discovery](#authenticated-library-and-account-discovery). Artist choices exist; acceptance and submission remain untested. |
+| Uploaded albums/artists and library sorting | [Account discovery](#authenticated-library-and-account-discovery) verified the issued upload routes with empty states, populated sort reloads, and collection continuations. Populated upload records and sorting across all pages remain unverified. |
+| Recap | Guest `FEmusic_listening_review` returned context/tracking only; the signed-in request returned a message. Neither response established usable Recap data. |
+| Podcast resume | Source inspection only: episode models and UI carry progress, but conversion to `Song` drops it. WebView may already restore progress, so runtime instrumentation is needed before calling this a playback bug. `PodcastParser` currently accepts integer percentages, marks progress of at least 95% as played, and recognizes the literal English word `played`. |
+
+The [probe commands](#repeat-the-discovery-probes) reproduce the read requests.
+Upstream source helped identify candidates: ytmusicapi's
+[credits and Related methods](https://github.com/sigma67/ytmusicapi/blob/master/ytmusicapi/mixins/browsing.py),
+[country form request](https://github.com/sigma67/ytmusicapi/blob/master/ytmusicapi/mixins/charts.py),
+and [watch queue parameters](https://github.com/sigma67/ytmusicapi/blob/master/ytmusicapi/mixins/watch.py).
+These are independent client implementations, not an official API contract;
+the response claims above come from the live probes.
 
 ---
 
@@ -1154,6 +1662,80 @@ swift run api-explorer action search '{"query":"never gonna give you up"}'
 swift run api-explorer action player '{"videoId":"dQw4w9WgXcQ"}'
 ```
 
+### Read-only discovery
+
+`discover` inventories renderer and mobile model types, recognized UI labels, command kinds,
+and replayable navigation. It keeps opaque request parameters in memory and
+prints browse-ID families instead of content or account identifiers. Only known
+schema names, public routes, and content types are printed; unknown names are
+redacted. Labels are recognized only on specific chip, header, and menu renderers,
+so a song or playlist named Focus does not become a UI label. `-v` adds schema
+paths and value types, never raw response values.
+
+#### Repeat the discovery probes
+
+Start with `swift run api-explorer auth` and `swift run api-explorer list`.
+These commands reproduce the September discoveries:
+
+```bash
+swift run api-explorer discover help
+
+# Credits. Inspect the current MPTC entry before choosing its index.
+swift run api-explorer discover search '{"query":"Daft Punk Get Lucky"}' --guest
+swift run api-explorer discover search '{"query":"Daft Punk Get Lucky"}' --guest --follow 0
+
+# Home. Inspect the Focus entry, then select it with --follow N.
+swift run api-explorer discover browse '{"browseId":"FEmusic_home"}' --guest
+
+# Mobile Home. Speed dial requires a populated shelf to confirm availability.
+swift run api-explorer discover browse '{"browseId":"FEmusic_home"}' --ios-music --guest
+
+# Chart menu and a country selection, saved as a redacted report.
+swift run api-explorer discover browse '{"browseId":"FEmusic_charts"}' --guest --limit 100
+swift run api-explorer discover browse '{"browseId":"FEmusic_charts","formData":{"selectedValues":["JP"]}}' --guest -o /tmp/charts-discovery.txt
+
+# Related. Entry 0 was the Related tab in the sampled response.
+swift run api-explorer discover next '{"videoId":"dQw4w9WgXcQ"}' --guest --follow 0
+
+# Radio queue with filter commands and continuation options.
+swift run api-explorer discover next '{"videoId":"dQw4w9WgXcQ","playlistId":"RDAMVMdQw4w9WgXcQ","isAudioOnly":true,"enablePersistentPlaylistPanel":true}' --guest
+
+# Radio form schema, without submission or station creation.
+swift run api-explorer discover browse '{"browseId":"FEmusic_radio_builder"}' --guest -v
+
+# Transcript commands. Entry 0 was get_transcript in both samples.
+swift run api-explorer discover next '{"videoId":"aircAruvnKk"}' --youtube --guest --follow 0
+swift run api-explorer discover next '{"videoId":"jNQXAC9IVRw"}' --youtube --guest --follow 0
+```
+
+Indices can change when YouTube reorders content. Check each printed hop before
+using it as evidence. Repeat `--follow` for up to five hops; each index selects
+from the preceding response. Explorer reports the selected route even when its
+index is beyond the displayed `--limit`. A `get_transcript` entry is an observed read
+command, not a promise that its replay works. The September probes returned
+HTTP 400. Discovery returns a nonzero exit status on a failed request, and `-o`
+saves a redacted report even for failed HTTP responses.
+
+The allowlist includes `browse`, `search`, `next`, `player`, `music/get_queue`,
+`music/get_search_suggestions`, and `get_transcript`. Discovery refuses mutation
+endpoints and request fields. The only form exception is a single two-letter
+country selection for `FEmusic_charts`. It extracts direct browse reads from
+Library chip and sort-selection batches, without executing persistence or
+checkbox-update siblings. Other service commands remain schema-only, except
+explicit transcript reads. Taste-profile acceptance is not replayable.
+
+Authentication stays consistent across hops. Cookies are used when available;
+`--guest` suppresses them. The report distinguishes the requested auth mode from
+the server's explicit session marker. Music responses often omit that marker.
+HTTP 200 and a content envelope alone do not establish authenticated content.
+Rechecked on 2026-09-05 with saved cookies available: a guest Home request and
+its followed chip request both explicitly reported guest sessions.
+Use `--body-file` for private request IDs or opaque parameters. Reports use
+owner-only file permissions and never contain raw payloads.
+Discovery rejects report paths that alias either the request-body file or mobile
+token file, including symlink and hard-link aliases. Standard input via
+`--body-file -` is not a file destination.
+
 ### Regular YouTube Mode
 
 Pass `--youtube` (or `--yt`) to target `www.youtube.com` with the WEB client instead of `music.youtube.com` with WEB_REMIX:
@@ -1171,7 +1753,303 @@ swift run api-explorer --youtube action search '{"query":"swift concurrency"}'
 swift run api-explorer --youtube action next '{"videoId":"VIDEO_ID"}'
 ```
 
+#### YouTube chapter markers (verified 2026-07-07)
+
+Regular YouTube chapter data is exposed by the WEB `next` watch-page response,
+not by the `player` endpoint. `api-explorer` now summarizes both known chapter
+shapes when they appear:
+
+```bash
+swift run api-explorer --youtube --guest action next '{"videoId":"u2rYp8AMuSg"}'
+```
+
+Observed chapter paths:
+
+```text
+playerOverlays.playerOverlayRenderer.decoratedPlayerBarRenderer
+  .decoratedPlayerBarRenderer.playerBar.multiMarkersPlayerBarRenderer
+  .markersMap[].value.chapters[].chapterRenderer
+
+engagementPanels[].engagementPanelSectionListRenderer.content
+  .macroMarkersListRenderer.contents[].macroMarkersListItemRenderer
+
+engagementPanels[].engagementPanelSectionListRenderer.content
+  .structuredDescriptionContentRenderer.items[]
+  .horizontalCardListRenderer.cards[].macroMarkersListItemRenderer
+```
+
+Field notes:
+
+- `chapterRenderer` is the best watch-page source for navigation markers.
+  It includes `timeRangeStartMillis`, `title.simpleText`, and chapter
+  thumbnails.
+- `macroMarkersListItemRenderer` appears in the chapters panel and may be
+  duplicated in the structured description or search result metadata. It adds
+  `onTap.watchEndpoint.startTimeSeconds`, `timeDescription`, and repeat-chapter
+  commands whose `startTimeMs` / `endTimeMs` can provide chapter bounds.
+- Videos without chapters may still expose heatmap markers through
+  `macroMarkersListEntity.markersList`; do not treat heatmap markers as
+  chapters.
+- Auth was not required for the verified chapter response: both `--guest` and
+  signed-in `--youtube action next` returned the same chapter marker counts for
+  the test video.
+- `--youtube action player '{"videoId":"..."}'` returned metadata/captions and
+  streaming/player state, but no `chapterRenderer` or
+  `macroMarkersListItemRenderer` chapter data in the verified probes.
+
 Prefer the destination feeds documented in [youtube.md](youtube.md) for Explore; YouTube's old `FEtrending` feed is no longer a reliable target.
+
+#### YouTube Ask Gemini / YouChat investigation (2026-07-27)
+
+YouTube's **Ask Gemini** watch-page experience is an undocumented, internal
+YouChat engagement-panel surface. It is not a public API, and its availability,
+request schemas, and frontend identifiers are subject to account eligibility,
+server rollout, client version, and video-specific changes.
+
+Start with the redacted read-only audit. Use the separate live command only when
+an explicit request to contact the live AI service has been approved:
+
+```bash
+# Read-only: audits watch responses and frontend capability markers
+swift run api-explorer ask-video-audit <VIDEO_ID>
+
+# Read-only: compares the ordered production/request-compatibility profiles
+swift run api-explorer ask-video-parity <VIDEO_ID>
+
+# Live: replays only the server-issued summary suggestion
+swift run api-explorer ask-video-live-test <VIDEO_ID> --confirm-live-ai
+
+# Live: summary plus the first server-issued follow-up suggestion
+swift run api-explorer ask-video-live-test <VIDEO_ID> --confirm-live-ai --follow-up
+
+# Live: two independent watch/panel bootstraps, capped at three
+swift run api-explorer ask-video-live-test <VIDEO_ID> --confirm-live-ai --fresh-chats 2
+
+# Live: one guarded free-text request from a private prompt source
+swift run api-explorer ask-video-free-text-test <VIDEO_ID> --confirm-live-ai --prompt-file <MODE_0600_PATH_OR_->
+
+# Manual structural probe for object, array, streaming, or opaque responses
+swift run api-explorer --youtube wire-action <ENDPOINT> '<JSON_OBJECT>'
+```
+
+`ask-video-audit` redacts opaque values, does not save raw payloads, and never
+submits a query. `ask-video-live-test` requires `--confirm-live-ai`, keeps all
+opaque continuations and message state in memory, rejects raw output files, and
+accepts no arbitrary prompt text. Its generated answer display strips control
+and bidirectional formatting characters, hides links and high-entropy opaque
+strings, and is bounded to 16,000 characters per answer.
+
+`ask-video-free-text-test` is a separate, one-shot validation command. It
+captures one immutable authenticated runtime-WEB request snapshot, fetches a
+fresh `next` response, and selects the first complete eligible `PAyouchat`
+panel, matching the browser's mirrored-panel behavior without merging opaque
+commands from responsive duplicates. If `next` contains the validated
+`sendUserQueryCommand`, the loader uses it directly. Otherwise, when the same
+bootstrap has one safe panel continuation, the loader sends its prompt-free
+initial `get_panel` body through that same snapshot and accepts only the strict
+parser's confirmed materialized `freeTextCommand`. The accepted command schema
+is intentionally narrow and may originate in either response. The August 2
+watch response placed it at
+`engagementPanelSectionListRenderer.footer.chatInputViewModel.sendUserQueryCommand`;
+confirmed materialized panel items may expose the same command under
+`youChatItemViewModel.sendUserQueryCommand`:
+
+```text
+sendUserQueryCommand
+└── innertubeCommand
+    ├── clickTrackingParams: nonempty string
+    └── continuationCommand
+        ├── request: CONTINUATION_REQUEST_TYPE_GET_PANEL
+        └── opaque continuation token is present
+```
+
+Initial materialization contains only the exact panel continuation plus the
+snapshot's request context; it has no `formData`, message ID, prompt, or click-
+tracking injection and cannot generate an answer. The resolved command then
+sends one generated `get_panel` request, without retry, using the exact server
+continuation and click-tracking context plus:
+
+```text
+formData.inputComposerFormData.clientMessageId: youchat-<Unix epoch milliseconds>
+formData.inputComposerFormData.playerOffsetMs: decimal millisecond string
+formData.inputComposerFormData.userInputText: private prompt contents
+```
+
+The runtime WEB `context` is added by the authenticated request transport.
+The same immutable context, headers, API identifier, cookie/account snapshot,
+and origin are used for `next`, optional initial materialization, and prompt
+submission; the backing identity is revalidated before either `get_panel`.
+Prompts must come from stdin or a regular file owned by the current user with
+exact mode `0600`, no extended ACL, valid UTF-8, at most 16,000 characters, and
+at most 64 KiB of UTF-8. The command rejects guest, `--authuser`, brand-account,
+client-version override, verbose, output, raw-body, follow-up, and multi-chat
+options. Responses use the bounded `YouTubeAskCore` decoder and strict confirmed
+YouChat parser; only sanitized assistant text and redacted structural metrics are
+printed. Raw prompts, commands, responses, and conversation values are never
+displayed or saved.
+
+**Live validation on August 2, 2026:**
+
+- The first guarded API candidate used `streaming_panel` and returned HTTP 400
+  before generation, confirming the earlier transport interpretation was stale.
+- A user-approved browser capture then submitted one 25-character prompt. The
+  frontend posted to `get_panel`, not `streaming_panel`, with top-level
+  `context`, `continuation`, and `formData` only.
+- `inputComposerFormData` contained exactly `clientMessageId`, string
+  `playerOffsetMs`, and `userInputText`; click tracking was nested in
+  `context.clickTracking`.
+- The response returned HTTP 200 as a JSON object with the confirmed singular
+  `onResponseReceivedCommand.listMutationCommand` shape. The existing bounded
+  decoder and strict conversation parser accept that response container.
+- No second arbitrary-text turn was sent in this browser capture, so multi-turn
+  behavior remained unvalidated at that point.
+
+**Read-only production-parity matrix (added July 28, 2026):**
+
+`ask-video-parity` tests the credential-free profiles defined by
+`YouTubeAskRequestProfile` in this order:
+
+1. Fixed production client version, no API key, no visitor data, and one SID proof.
+2. The same fixed production configuration with all available SID proof schemes.
+3. The runtime WEB client-version/API-key/visitor-data bundle with all available
+   SID proof schemes.
+
+For each profile, the command makes an authenticated `next` request and, only
+when strict parsing finds one unambiguous panel bootstrap, materializes the
+initial `get_panel`. It never submits a suggestion chip, free text, or any other
+generation request. Both responses use the bounded `YouTubeAskCore` wire decoder
+and strict parser. Terminal output is limited to the profile name, HTTP status,
+response size, wire format, eligibility, chip counts, whether a validated
+free-text capability was present in `next` and initial `get_panel`, and a
+redacted failure category. It never prints command continuations or click-
+tracking values. The command stops at the first passing profile and rejects
+raw-output, private-body, client-version override, follow-up, and multi-chat
+options.
+
+The read-only run on **July 28, 2026** completed all three profiles. Every
+`next` request returned HTTP 200, but each response reported the exported
+session as signed out, so `get_panel` was not run and no profile passed. This is
+an authentication rejection, not evidence that any request profile is valid or
+invalid for an eligible signed-in session. No profile passed that historical
+run. Production was later enabled through the explicitly selected fixed profile;
+future compatibility checks must still confirm signed-in primary-account
+eligibility and fail closed on unsupported responses.
+
+`get_panel`, `streaming_panel`, and `get_answer` must use `wire-action` for manual
+probes; the raw `action` command rejects them. Supply manual panel JSON through
+`--body-file` using a mode-0600 regular file, or use `--body-file -` to read
+stdin, so opaque values do not appear in argv or normal shell history. Endpoint
+arguments must be plain relative API paths.
+
+**Observed frontend identifiers**:
+
+- `PAyouchat`
+- `engagement-panel-youchat`
+- `PAai_companion`
+
+**Observed transport behavior**:
+
+| Transport | Current interpretation |
+|-----------|------------------------|
+| `get_panel` | Prompt-free initial panel materialization, direct suggestion chips, materialized free-text capability discovery, and the validated free-text composer transport |
+| `streaming_panel` | Frontend capability remains present, but the August 2 free-text candidate returned HTTP 400; not used by production |
+| `get_watch` | Combined player/watch bootstrap; observed responses use a top-level JSON array |
+| `get_answer` | Separate AI answer transport; not used by the verified watch-page suggestion flow |
+
+A direct suggestion chip does **not** submit its visible text. The current
+frontend creates a `CONTINUATION_REQUEST_TYPE_GET_PANEL` command from the exact
+server-issued `chipData.continuation` and posts it to `get_panel` with:
+
+```text
+continuation: exact server-issued chip continuation
+formData.inputComposerFormData.clientMessageId: youchat-<Unix epoch milliseconds>
+```
+
+The browser also supplies optional playback/page/previous-message timing context
+when available. API Explorer omits unavailable optional fields rather than
+inventing them. The chip's `id`, visible text, click-tracking command, and the
+free-text composer's `sendUserQueryCommand` are not copied into this direct-chip
+request.
+
+**Current direct-chip response container (August 1, 2026):**
+
+Successful `get_panel` responses used a top-level singular
+`onResponseReceivedCommand.listMutationCommand`. Assistant text items and
+follow-up chips were inserted under:
+
+```text
+operations.operations[].insertItemSectionContent.contents[].youChatItemViewModel
+```
+
+The confirmed insertion metadata uses `position: INSERTION_POSITION_LAST` with a
+nonempty section target. Other positions or missing placement metadata fail
+closed.
+
+Text-bearing `youChatItemViewModel` objects expose `text.content` plus optional
+style/action metadata. Chip-bearing objects expose `chipsData`. Mozaic parses only
+those two visible surfaces under the confirmed insertion path; result/link
+objects such as `videoResultsData` and `webData`, plus sibling `frameworkUpdates`,
+remain ignored. The older
+`onResponseReceivedCommands[].appendContinuationItemsAction.continuationItems[]`
+shape remains supported for previously validated responses.
+
+**Signed-in production compatibility check on August 1, 2026**:
+
+- The authenticated watch response exposed validated direct chips whose
+  `chipData` entries could include a top-level `onClick` callback containing one
+  local interaction command.
+- The root `chipData.continuation` remained the only replayed capability. Mozaic
+  ignores the callback only when it matches the observed `listMutationCommand`
+  structure, inserts the same visible label plus the allowlisted loading-animation
+  placeholder, and contains no extra keys or request capability.
+- The same response exposed multiple distinct panel-bootstrap continuations.
+  When direct chips are already present, Mozaic discards the ambiguous panel
+  command instead of guessing; ambiguity still rejects bootstraps that have no
+  direct chips.
+- A read-only production-client probe then parsed the watch bootstrap
+  successfully. No panel materialization or suggestion submission was performed.
+
+The free-text composer uses the exact server-issued `sendUserQueryCommand`
+continuation and click tracking. Strict parsing may obtain that capability from
+the canonical eligible `next` panel or from the confirmed prompt-free initial
+`get_panel` materialization. `next` wins when it already supplies the command;
+the initial panel is queried only as a fallback, and distinct commands are never
+merged. The August 2 browser capture showed that the frontend posts the resolved
+command to `get_panel` with `clientMessageId`, decimal-string `playerOffsetMs`,
+and `userInputText`. Production permits that exact shape once per bound
+conversation revision. A successful response advances the revision and retains
+the validated composer command when the response omits a replacement; no
+additional multi-turn fields are invented.
+
+**Live production validation on August 3, 2026:**
+
+- Two free-text prompts succeeded in the same watch-scoped chat.
+- The first response contained no replacement `sendUserQueryCommand`; Mozaic
+  retained the original validated composer command after advancing the bound
+  conversation revision.
+- The second request reused the validated `get_panel` shape with a fresh
+  monotonic `clientMessageId`, current playback offset, and new `userInputText`.
+- Each revision remained single-consumption: stale pending copies were rejected
+  before network access, and there was no automatic retry.
+
+**Live validation on July 27, 2026**:
+
+- The refreshed cookie export was accepted as a signed-in YouTube WEB session.
+- The watch bootstrap exposed `PAyouchat`, a summary chip, and a fresh panel
+  continuation.
+- Replaying the summary chip through `get_panel` returned HTTP 200 and a generated
+  summary.
+- Replaying the first follow-up chip from that response returned HTTP 200 and a
+  generated follow-up answer in the same flow.
+- Two independent watch/panel bootstraps both returned HTTP 200 summaries; the
+  generated text was not exactly identical.
+- Sending the chip continuation to `streaming_panel` without form data returned
+  HTTP 400, confirming that it is not the direct-chip transport.
+
+These results validate the current eligible-account flow, not a stable contract.
+Treat the surface as rollout-fragile. Never commit or display cookies,
+authorization material, account identifiers, conversation identifiers, visitor
+or session values, opaque params, continuations, or server-issued commands.
 
 ### Authenticated Endpoints
 
@@ -1184,7 +2062,7 @@ swift run api-explorer auth
 # If authenticated, explore library endpoints
 swift run api-explorer browse FEmusic_liked_playlists
 swift run api-explorer browse FEmusic_history
-swift run api-explorer browse FEmusic_library_albums ggMGKgQIARAA
+swift run api-explorer browse FEmusic_liked_albums
 ```
 
 Debug builds export auth cookies for the API explorer to `~/Library/Application Support/Mozaic/cookies.dat`.
@@ -1196,7 +2074,7 @@ Debug builds export auth cookies for the API explorer to `~/Library/Application 
 swift run api-explorer brandaccounts
 
 # Access a brand account's library
-swift run api-explorer browse FEmusic_liked_playlists --brand 111997145576882617490
+swift run api-explorer browse FEmusic_liked_playlists --brand <BRAND_ID>
 ```
 
 The `--brand` flag sets `context.user.onBehalfOfUser` in the request body. See [Brand Account Support](#brand-account-support) in the Authentication section for details.
@@ -1206,8 +2084,15 @@ The `--brand` flag sets `context.user.onBehalfOfUser` in the request body. See [
 | Command | Description |
 |---------|-------------|
 | `browse <id> [params]` | Explore a browse endpoint |
-| `action <endpoint> <json>` | Explore an action endpoint |
-| `continuation <token> [ep]` | Explore a continuation (`browse` or `next`) |
+| `action <endpoint> <json>` | Explore an action endpoint that returns a top-level JSON object |
+| `wire-action <endpoint> <json>` | Safely inspect object, array, streaming, or opaque wire responses without printing raw values |
+| `discover <endpoint> <json>` | Inventory and follow read-only navigation; `discover help` lists the supported request fields |
+| `ask-video-audit <videoId>` | Run a redacted, read-only Ask Gemini / YouChat audit without sending a prompt |
+| `ask-video-parity <videoId>` | Test ordered read-only Ask request profiles using only `next` and initial `get_panel`; never submits a chip |
+| `ask-video-live-test <videoId>` | With `--confirm-live-ai`, replay the server-issued summary chip; optionally add `--follow-up` or `--fresh-chats N` |
+| `ask-video-free-text-test <videoId>` | With `--confirm-live-ai` and `--prompt-file`, resolve the command from `next` or a prompt-free initial `get_panel`, then validate one exact server-commanded free-text request with no retry |
+| `search-audit <query>` | Audit live Music search shapes, filter chips, continuations, and parser coverage |
+| `continuation <token> [ep]` | Explore a continuation (`browse`, `search`, or `next`); use the same auth mode as the originating request (`--guest` for guest search) |
 | `list` | List all known endpoints |
 | `auth` | Check authentication status |
 | `accounts` | Discover accounts via authuser header |
@@ -1218,10 +2103,22 @@ The `--brand` flag sets `context.user.onBehalfOfUser` in the request body. See [
 
 | Option | Description |
 |--------|-------------|
-| `-v, --verbose` | Show full raw JSON response |
-| `-o, --output <file>` | Save raw JSON to file |
+| `-v, --verbose` | Show full raw JSON for browse/action/continuation commands; expand audit and search samples |
+| `-o, --output <file>` | Save raw output with owner-only permissions; `discover` saves only a redacted report, and `ask-video-audit` ignores this option |
+| `--follow N` | Follow a numbered `discover` navigation entry; repeat for up to five hops |
+| `--limit N` | Show 1-500 `discover` entries, default 40 |
+| `--ios-music`, `--android-music` | Select one mobile Music profile for `discover`; web-cookie authentication was rejected in tested profiles |
+| `--mobile-web-key` | Include the resolved web API key in mobile discovery for request comparison |
+| `--mobile-cookie-only` | Keep web cookies but omit SAPISIDHASH in mobile discovery; tested iOS responses were guest sessions |
+| `--mobile-token-file <path>` | Use an existing OAuth access token from an owner-only mode-0600 regular file; mobile discovery only, without web cookies or web account selection |
 | `--authuser N` | Use Google account at index N |
 | `--brand <ID>` | Use brand account (21-digit ID) |
+| `--client-version <version>` | Override the resolved InnerTube client version for compatibility probes |
+| `--body-file <path\|->` | Read a sensitive JSON action body from a mode-0600 regular file or stdin; required for panel/answer transports |
+| `--prompt-file <path\|->` | Read the free-text validation prompt from an exact mode-0600 regular file or stdin; accepted only by `ask-video-free-text-test` |
+| `--confirm-live-ai` | Required explicit acknowledgement before either guarded Ask live-test command sends an AI request |
+| `--follow-up` | Replay the first follow-up chip returned by the live summary response |
+| `--fresh-chats N` | Run 1-3 independent summary bootstraps (default: 1) |
 | `--youtube`, `--yt` | Target regular YouTube (`www.youtube.com`, WEB client) instead of YouTube Music |
 
 ---
@@ -1241,6 +2138,18 @@ The `--brand` flag sets `context.user.onBehalfOfUser` in the request body. See [
 
 | Date | Changes |
 |------|---------|
+| 2026-09-05 | Tightened discovery redaction, JSON scalar validation, and token-file diagnostics and overwrite protection. Rechecked Android with a consistent OS/SDK profile and verified guest hops; corrected Account menu implementation status |
+| 2026-09-04 | Verified signed-in Library filters, sort reloads, pagination, podcast Channels, Profiles, upload empty states, and taste-builder data. Added safe selection-read extraction and blocked taste acceptance in Explorer; recorded Recap and authenticated transcript limits |
+| 2026-09-04 | Located the mobile Speed dial Home model in an existing client; verified guest `IOS_MUSIC` Home requests, added a read-only mobile profile and model/item counts to Explorer, and recorded the missing signed-in validation |
+| 2026-09-04 | Confirmed the new web login works while tested mobile clients reject SAPISIDHASH; cookie-only iOS responses explicitly report guest. Added Android comparison, server login/error diagnostics, and private OAuth input to Explorer. Actual Speed dial remains blocked on mobile authentication; Favorites was not replaced with Listen again |
+| 2026-09-04 | Added redacted `discover` traversal, chart form selection, transcript-command inspection, and behavioral tests; verified credits, Home chips, country charts, Related content, and radio filter reads; consolidated findings, guest-only limits, and [implementation status](#implementation-status) in this reference |
+| 2026-08-03 | Live-validated two free-text prompts in one chat; retained the validated composer command across successful bound revisions, enforced one action per revision, and preserved stale-revision rejection/no-retry behavior |
+| 2026-08-02 | Browser-validated the `get_panel` free-text request and response shape; added the guarded `ask-video-free-text-test`; selected the first content-equivalent mirrored YouChat panel; documented and implemented `sendUserQueryCommand` provenance from the watch footer `chatInputViewModel`, an eligible YouChat item, or prompt-free initial `get_panel`; added redacted parity capability reporting; deduplicated repeated visible suggestions; retained server-chip follow-ups |
+| 2026-08-01 | Revalidated an eligible signed-in production watch response; added strict support for the observed local user-turn/loading `onClick` mutation, preserved direct chips while discarding ambiguous panel-only commands, and added one bounded read-only retry for internal identity-fence cancellation |
+| 2026-07-30 | Enabled the fixed WEB Ask request profile in the production app by explicit product direction; eligibility and all strict parser, identity, and transport gates remain enforced |
+| 2026-07-28 | Added redacted read-only `ask-video-parity` tooling backed by `YouTubeAskCore`; all three profiles returned HTTP 200 `next` responses but the exported session was treated as signed out, so no profile passed and production remains disabled |
+| 2026-07-27 | Live-validated YouTube Ask Gemini / YouChat summary, follow-up, and two fresh chats; added guarded `ask-video-live-test`, corrected direct chips to `get_panel`, retained read-only `ask-video-audit`, and documented redaction/auth constraints |
+| 2026-07-19 | Revalidated Music search: `itemSectionRenderer` mixed rows, watch-endpoint Top Results, audiobooks, videos/profiles/episodes filters, shelf and action-envelope continuations, and `/search` routing; added `search-audit` |
 | 2026-06-24 | Documented regular YouTube `--youtube` API Explorer mode alongside YouTube Music |
 | 2026-01-16 | Added comprehensive Podcast ID Format section: MPSPP→PL conversion, L-prefix validation, double-L bug documentation |
 | 2026-01-14 | Added Brand Account Support: `account/accounts_list` endpoint, `--brand` flag, `brandaccounts` command |
@@ -1263,14 +2172,19 @@ This section documents API functionality for the floating video window feature. 
 
 The `musicVideoType` field distinguishes between actual music videos and audio-only tracks. This is available in both `player` and `next` endpoint responses.
 
-| Video Type | Constant | Description | Has Video Content |
+| Video Type | Constant | Description | Mozaic video toggle |
 |------------|----------|-------------|-------------------|
 | Official Music Video | `MUSIC_VIDEO_TYPE_OMV` | Full video from artist/label | ✅ Yes |
 | Audio Track Video | `MUSIC_VIDEO_TYPE_ATV` | Static image or visualizer | ❌ No |
-| User Generated Content | `MUSIC_VIDEO_TYPE_UGC` | Fan-made or unofficial | ⚠️ Varies |
+| User Generated Content | `MUSIC_VIDEO_TYPE_UGC` | Fan-made or unofficial | ❌ No |
+| Official-source music | `MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC` | Official-source video search result | ❌ No |
 | Podcast Episode | `MUSIC_VIDEO_TYPE_PODCAST_EPISODE` | Audio podcast | ❌ No |
 
+All listed constants are parsed. `hasVideoContent` enables the video toggle
+only for `.omv`; `isSearchVideo` also includes `.ugc` and `.officialSourceMusic`.
+
 **Implementation**: The `MusicVideoType` enum and parsing are implemented in:
+
 - [Sources/Mozaic/Models/MusicVideoType.swift](../Sources/Mozaic/Models/MusicVideoType.swift) - Enum definition
 - [Sources/Mozaic/Models/Song.swift](../Sources/Mozaic/Models/Song.swift) - `musicVideoType` property
 - [Sources/Mozaic/Services/API/Parsers/SongMetadataParser.swift](../Sources/Mozaic/Services/API/Parsers/SongMetadataParser.swift) - Parsing logic
@@ -1296,13 +2210,21 @@ if song.musicVideoType?.hasVideoContent == true {
 
 ---
 
-### Video Quality Options (Future Enhancement)
+### Video quality selection
 
-The `player` endpoint returns video streaming data in `streamingData.adaptiveFormats`. This could enable a video quality selector feature.
+Regular YouTube quality selection is implemented in
+[YouTubePlayerBar](../Sources/Mozaic/Views/YouTube/YouTubePlayerBar.swift) and
+[YouTubeWatchWebView](../Sources/Mozaic/Views/YouTube/YouTubeWatchWebView+Scripts.swift).
+The picker reads the WebView player's available quality levels and requests
+the chosen level through `setPlaybackQualityRange`, with a
+`setPlaybackQuality` fallback. A Music video resolution picker is not implemented.
 
-> ⚠️ **Not Implemented**: Due to DRM requirements, Mozaic uses WebView for playback. Direct URL streaming would bypass DRM protection. Quality selection would need to be implemented via WebView JavaScript.
+Historical `player` responses exposed formats in `streamingData.adaptiveFormats`.
+Mozaic uses WebView playback rather than those URLs. Guest responses may omit
+streaming data, and the formats below are sample observations, not guaranteed
+quality choices for every video.
 
-**Available Qualities** (from `adaptiveFormats`):
+**Historical format sample** from `adaptiveFormats`:
 
 | Quality | Resolution | Codec Options |
 |---------|------------|---------------|
@@ -1334,35 +2256,26 @@ The `player` endpoint returns video streaming data in `streamingData.adaptiveFor
 }
 ```
 
-**Future Implementation Path**:
-1. Inject JavaScript into WebView to access player API
-2. Use `player.setPlaybackQuality()` or similar YouTube player methods
-3. Or: Parse available qualities and let WebView auto-select
-
 ---
 
-### Related Content / Video Alternatives (Future Enhancement)
+### Audio/video counterparts
 
-The `next` endpoint returns a Related tab that can find song/video counterparts.
+A switch between paired audio and video recordings is not implemented. The
+existing Music video button changes the presentation of the current recording.
 
-> ⚠️ **Not Implemented**: Could be used to find video version of audio-only tracks or vice versa.
-
-**Related Tab browseId Pattern**: `MPTRt_{trackId}`
-
-**Example**: For song `DyDfgMOUjCI`, the Related tab browseId is `MPTRt_5OAD9vk2OaS`
-
-**Page Type**: `MUSIC_PAGE_TYPE_TRACK_RELATED`
-
-**Use Cases**:
-- "Watch Video" button for ATV tracks that have an OMV version
-- "Listen to Audio" for users who prefer audio-only playback
-- Finding alternative versions (live, remix, etc.)
+[Related Music content](#related-music-content) was verified on 2026-09-04,
+but its recommendations do not establish a pairing. No explicit counterpart
+fields appeared in the sampled queues. Related browse IDs are server-issued
+navigation values, not values to construct from a track ID.
 
 ---
 
 ## Verification Summary
 
-The following endpoints were tested without authentication on 2024-12-21. `FEmusic_library_corpus_track_artists` was re-validated on 2026-03-24:
+The table below records historical probes from 2024-12-21, with later library
+checks noted in the rows and endpoint sections. `FEmusic_library_corpus_track_artists`
+was revalidated on 2026-03-24. See [implementation status](#implementation-status)
+for the 2026-09-04 discoveries and their verification limits.
 
 ### ✅ Working Without Auth
 
@@ -1376,7 +2289,7 @@ The following endpoints were tested without authentication on 2024-12-21. `FEmus
 | `FEmusic_podcasts` | HTTP 200 | Full response |
 | `FEmusic_library_landing` | HTTP 200 | Returns login prompt (no content) |
 | `FEmusic_library_corpus_track_artists` | HTTP 200 | Returns sign-in prompt (no artist rows) |
-| `player` | HTTP 200 | Full metadata + streaming info |
+| `player` | HTTP 200 | Streaming data appeared in the 2024 sample; 2026-07-01 guest probes returned `UNPLAYABLE` without streaming data |
 | `music/get_queue` | HTTP 200 | Full queue data |
 | `search` | HTTP 200 | Full results |
 
@@ -1385,6 +2298,7 @@ The following endpoints were tested without authentication on 2024-12-21. `FEmus
 | Endpoint | Status | Notes |
 |----------|--------|-------|
 | `FEmusic_liked_playlists` | HTTP 200 | Works with session cookies |
+| `FEmusic_liked_albums` | HTTP 200* | Returns saved album rows with current auth; stale or missing auth returns a sign-in prompt |
 | `FEmusic_liked_videos` | HTTP 200 | Works with session cookies |
 | `FEmusic_history` | HTTP 200 | Returns login prompt without full auth |
 
@@ -1394,14 +2308,14 @@ The following endpoints were tested without authentication on 2024-12-21. `FEmus
 |----------|--------|-------|
 | `FEmusic_history` | HTTP 200* | Returns content with full auth, login prompt without |
 | `FEmusic_library_corpus_track_artists` | HTTP 200* | Returns library artist rows with full auth, sign-in prompt without |
-| `FEmusic_library_albums` | HTTP 400 | Needs auth + specific `params` value |
+| `FEmusic_library_albums` | HTTP 400 | Legacy saved-albums browse ID; use `FEmusic_liked_albums` |
 | `FEmusic_library_artists` | HTTP 400 | Rejected as invalid argument in current authenticated sessions |
 | `FEmusic_library_corpus_artists` | HTTP 200* | Returns followed artists with full auth and public `UC...` browseIds |
-| `FEmusic_library_songs` | HTTP 400 | Needs auth + specific `params` value |
-| `FEmusic_recently_played` | HTTP 400 | Needs auth |
+| `FEmusic_library_songs` | HTTP 400 | No working request established; required context remains unverified |
+| `FEmusic_recently_played` | HTTP 400 | No working request established; Mozaic uses `FEmusic_history` |
 | `playlist/get_add_to_playlist` | HTTP 401 | Needs full auth; app caches with `APICache.TTL.library` |
 | `playlist/create` | HTTP 401 | Needs full auth; response playlist ID may be top-level or nested |
-| `browse/edit_playlist` | HTTP 401 | Needs full auth; app uses `ACTION_ADD_VIDEO` for adding tracks |
+| `browse/edit_playlist` | HTTP 401 | Needs full auth; app uses `ACTION_ADD_VIDEO` and `ACTION_REMOVE_VIDEO` for track edits |
 | `playlist/delete` | HTTP 401 | Needs full auth and user-owned playlist |
 
 > **Note on Library Artists endpoints**: `FEmusic_library_corpus_track_artists` is the sign-in-backed Artists chip browseId and returns `MPLAUC...` library artist pages. Those `MPLAUC...` pages also require authentication when browsed directly. In current authenticated sessions, the library chip also exposes `FEmusic_library_corpus_artists` with `params=ggMCCAU=`; that endpoint returns followed artists with public `UC...` browseIds and is a better source for navigation. By contrast, `FEmusic_library_artists` currently returns HTTP 400 invalid argument even with full SAPISIDHASH authentication.

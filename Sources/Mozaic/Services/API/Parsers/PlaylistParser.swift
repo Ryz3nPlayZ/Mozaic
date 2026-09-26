@@ -17,6 +17,7 @@ enum PlaylistParser {
         var duration: String?
     }
 
+    typealias LibraryAlbumsSource = LibraryContentParser.LibraryAlbumsSource
     typealias LibraryArtistsSource = LibraryContentParser.LibraryArtistsSource
     typealias LibraryContent = LibraryContentParser.LibraryContent
 
@@ -25,7 +26,22 @@ enum PlaylistParser {
         LibraryContentParser.parseLibraryPlaylists(data)
     }
 
-    /// Parses library content from browse response, returning playlists, artists, and podcast shows.
+    /// Parses albums from the dedicated saved-albums browse response.
+    static func parseLibraryAlbums(_ data: [String: Any]) -> [Album] {
+        LibraryContentParser.parseLibraryAlbums(data)
+    }
+
+    /// Parses the first saved-albums page and its continuation token.
+    static func parseLibraryAlbumsPage(_ data: [String: Any]) -> LibraryContentParser.LibraryAlbumsPage {
+        LibraryContentParser.parseLibraryAlbumsPage(data)
+    }
+
+    /// Parses a saved-albums continuation response.
+    static func parseLibraryAlbumsContinuation(_ data: [String: Any]) -> LibraryContentParser.LibraryAlbumsPage {
+        LibraryContentParser.parseLibraryAlbumsContinuation(data)
+    }
+
+    /// Parses library content from browse response, returning playlists, albums, artists, and podcast shows.
     static func parseLibraryContent(_ data: [String: Any]) -> LibraryContent {
         LibraryContentParser.parseLibraryContent(data)
     }
@@ -33,6 +49,11 @@ enum PlaylistParser {
     /// Merges library playlists using the dedicated endpoint as authoritative while retaining landing-only items.
     static func mergedLibraryPlaylists(dedicated dedicatedPlaylists: [Playlist], fallback fallbackPlaylists: [Playlist]) -> [Playlist] {
         LibraryContentParser.mergedLibraryPlaylists(dedicated: dedicatedPlaylists, fallback: fallbackPlaylists)
+    }
+
+    /// Merges dedicated saved albums with any landing-page preview albums.
+    static func mergedLibraryAlbums(dedicated dedicatedAlbums: [Album], fallback fallbackAlbums: [Album]) -> [Album] {
+        LibraryContentParser.mergedLibraryAlbums(dedicated: dedicatedAlbums, fallback: fallbackAlbums)
     }
 
     /// Parses artists from the dedicated library artists browse response.
@@ -63,7 +84,12 @@ enum PlaylistParser {
             canDelete: PlaylistEditability.canDeletePlaylist(from: data)
         )
 
-        return PlaylistDetail(playlist: playlist, tracks: tracks, duration: header.duration)
+        return PlaylistDetail(
+            playlist: playlist,
+            tracks: tracks,
+            duration: header.duration,
+            libraryTargetId: Self.extractAlbumLibraryTargetId(from: data, albumId: playlistId)
+        )
     }
 
     /// Parses playlist detail from browse response with pagination support.
@@ -84,7 +110,12 @@ enum PlaylistParser {
             canDelete: PlaylistEditability.canDeletePlaylist(from: data)
         )
 
-        let detail = PlaylistDetail(playlist: playlist, tracks: tracks, duration: header.duration)
+        let detail = PlaylistDetail(
+            playlist: playlist,
+            tracks: tracks,
+            duration: header.duration,
+            libraryTargetId: Self.extractAlbumLibraryTargetId(from: data, albumId: playlistId)
+        )
         let continuationToken = Self.extractPlaylistContinuationToken(from: data)
 
         Self.logger.debug("parsePlaylistWithContinuation: tracks=\(tracks.count), hasToken=\(continuationToken != nil)")
@@ -233,124 +264,7 @@ enum PlaylistParser {
         contents.compactMap { self.parseTrackItem($0, fallbackThumbnailURL: nil) }
     }
 
-    /// Parses liked songs response with pagination support.
-    /// Checks both legacy continuations format and 2025 continuationItemRenderer format.
-    static func parseLikedSongs(_ data: [String: Any]) -> LikedSongsResponse {
-        let tracks = self.parsePlaylistTracks(data, fallbackThumbnailURL: nil)
-        let continuationToken = Self.extractContinuationToken(from: data)
-        Self.logger.info("Parsed \(tracks.count) liked songs, hasMore: \(continuationToken != nil)")
-        return LikedSongsResponse(songs: tracks, continuationToken: continuationToken)
-    }
-
-    /// Parses liked songs continuation response.
-    /// Handles both legacy musicShelfContinuation and 2025 onResponseReceivedActions formats.
-    static func parseLikedSongsContinuation(_ data: [String: Any]) -> LikedSongsResponse {
-        var tracks: [Song] = []
-
-        // Try legacy musicShelfContinuation format
-        if let continuationContents = data["continuationContents"] as? [String: Any],
-           let shelfContinuation = continuationContents["musicShelfContinuation"] as? [String: Any],
-           let contents = shelfContinuation["contents"] as? [[String: Any]]
-        {
-            Self.logger.debug("Parsing liked songs continuation (legacy format) with \(contents.count) items")
-            for itemData in contents {
-                if let track = parseTrackItem(itemData, fallbackThumbnailURL: nil) {
-                    tracks.append(track)
-                }
-            }
-        }
-
-        // Try 2025 format: onResponseReceivedActions -> appendContinuationItemsAction
-        if tracks.isEmpty,
-           let onResponseReceivedActions = data["onResponseReceivedActions"] as? [[String: Any]],
-           let firstAction = onResponseReceivedActions.first,
-           let appendAction = firstAction["appendContinuationItemsAction"] as? [String: Any],
-           let continuationItems = appendAction["continuationItems"] as? [[String: Any]]
-        {
-            Self.logger.debug("Parsing liked songs continuation (2025 format) with \(continuationItems.count) items")
-            for itemData in continuationItems {
-                if let track = parseTrackItem(itemData, fallbackThumbnailURL: nil) {
-                    tracks.append(track)
-                }
-            }
-        }
-
-        let continuationToken = Self.extractContinuationTokenFromContinuation(data)
-        Self.logger.debug("Liked songs continuation parsed: \(tracks.count) tracks, hasMore: \(continuationToken != nil)")
-        return LikedSongsResponse(songs: tracks, continuationToken: continuationToken)
-    }
-
     // MARK: - Continuation Token Extraction
-
-    /// Extracts continuation token from initial browse response (liked songs).
-    /// Checks both legacy continuations format and 2025 continuationItemRenderer format.
-    private static func extractContinuationToken(from data: [String: Any]) -> String? {
-        guard let contents = data["contents"] as? [String: Any],
-              let singleColumnBrowseResults = contents["singleColumnBrowseResultsRenderer"] as? [String: Any],
-              let tabs = singleColumnBrowseResults["tabs"] as? [[String: Any]],
-              let firstTab = tabs.first,
-              let tabRenderer = firstTab["tabRenderer"] as? [String: Any],
-              let tabContent = tabRenderer["content"] as? [String: Any],
-              let sectionListRenderer = tabContent["sectionListRenderer"] as? [String: Any],
-              let sectionContents = sectionListRenderer["contents"] as? [[String: Any]]
-        else {
-            return nil
-        }
-
-        // Look for continuation in musicShelfRenderer
-        for sectionData in sectionContents {
-            if let shelfRenderer = sectionData["musicShelfRenderer"] as? [String: Any] {
-                // Try legacy continuations format
-                if let token = Self.extractTokenFromRenderer(shelfRenderer) {
-                    Self.logger.debug("Found liked songs continuation token (legacy format)")
-                    return token
-                }
-                // Try 2025 format - continuationItemRenderer at end of contents
-                if let shelfContents = shelfRenderer["contents"] as? [[String: Any]],
-                   let token = Self.extractTokenFromContents(shelfContents)
-                {
-                    Self.logger.debug("Found liked songs continuation token (2025 format)")
-                    return token
-                }
-            }
-        }
-
-        return nil
-    }
-
-    /// Extracts continuation token from a continuation response (liked songs).
-    /// Checks both legacy continuations format and 2025 continuationItemRenderer format.
-    private static func extractContinuationTokenFromContinuation(_ data: [String: Any]) -> String? {
-        if let continuationContents = data["continuationContents"] as? [String: Any],
-           let shelfContinuation = continuationContents["musicShelfContinuation"] as? [String: Any]
-        {
-            // Try legacy continuations format
-            if let token = extractTokenFromRenderer(shelfContinuation) {
-                self.logger.debug("Found liked songs continuation token from continuation (legacy format)")
-                return token
-            }
-            // Try 2025 format - continuationItemRenderer at end of contents
-            if let contents = shelfContinuation["contents"] as? [[String: Any]],
-               let token = Self.extractTokenFromContents(contents)
-            {
-                Self.logger.debug("Found liked songs continuation token from continuation (2025 format)")
-                return token
-            }
-        }
-
-        // Try 2025 format: onResponseReceivedActions -> appendContinuationItemsAction
-        if let onResponseReceivedActions = data["onResponseReceivedActions"] as? [[String: Any]],
-           let firstAction = onResponseReceivedActions.first,
-           let appendAction = firstAction["appendContinuationItemsAction"] as? [String: Any],
-           let continuationItems = appendAction["continuationItems"] as? [[String: Any]],
-           let token = Self.extractTokenFromContents(continuationItems)
-        {
-            Self.logger.debug("Found liked songs continuation token from 2025 format response")
-            return token
-        }
-
-        return nil
-    }
 
     /// Extracts continuation token from playlist browse response (handles multiple renderer types).
     private static func extractPlaylistContinuationToken(from data: [String: Any]) -> String? {
@@ -621,11 +535,10 @@ enum PlaylistParser {
         if let descData = renderer["description"] as? [String: Any],
            let runs = descData["runs"] as? [[String: Any]]
         {
-            header.description = runs.compactMap { $0["text"] as? String }.joined()
+            header.description = ParsingHelpers.joinedRunText(runs)
         }
 
-        let thumbnails = ParsingHelpers.extractThumbnails(from: renderer)
-        header.thumbnailURL = thumbnails.last.flatMap { URL(string: $0) }
+        header.thumbnailURL = ParsingHelpers.extractThumbnailURL(from: renderer)
 
         if let subtitleData = renderer["subtitle"] as? [String: Any],
            let runs = subtitleData["runs"] as? [[String: Any]]
@@ -652,15 +565,14 @@ enum PlaylistParser {
         }
 
         if header.thumbnailURL == nil {
-            let thumbnails = ParsingHelpers.extractThumbnails(from: renderer)
-            header.thumbnailURL = thumbnails.last.flatMap { URL(string: $0) }
+            header.thumbnailURL = ParsingHelpers.extractThumbnailURL(from: renderer)
         }
 
         if header.description == nil,
            let descData = renderer["description"] as? [String: Any],
            let runs = descData["runs"] as? [[String: Any]]
         {
-            header.description = runs.compactMap { $0["text"] as? String }.joined()
+            header.description = ParsingHelpers.joinedRunText(runs)
         }
 
         if let subtitleData = renderer["subtitle"] as? [String: Any],
@@ -683,8 +595,7 @@ enum PlaylistParser {
         }
 
         if header.thumbnailURL == nil {
-            let thumbnails = ParsingHelpers.extractThumbnails(from: renderer)
-            header.thumbnailURL = thumbnails.last.flatMap { URL(string: $0) }
+            header.thumbnailURL = ParsingHelpers.extractThumbnailURL(from: renderer)
         }
     }
 
@@ -701,8 +612,7 @@ enum PlaylistParser {
         }
 
         if header.thumbnailURL == nil {
-            let thumbnails = ParsingHelpers.extractThumbnails(from: detailHeader)
-            header.thumbnailURL = thumbnails.last.flatMap { URL(string: $0) }
+            header.thumbnailURL = ParsingHelpers.extractThumbnailURL(from: detailHeader)
         }
 
         if let subtitleData = detailHeader["subtitle"] as? [String: Any],
@@ -782,8 +692,7 @@ enum PlaylistParser {
         }
 
         if header.thumbnailURL == nil {
-            let thumbnails = ParsingHelpers.extractThumbnails(from: renderer)
-            header.thumbnailURL = thumbnails.last.flatMap { URL(string: $0) }
+            header.thumbnailURL = ParsingHelpers.extractThumbnailURL(from: renderer)
         }
 
         if header.description == nil,
@@ -792,7 +701,7 @@ enum PlaylistParser {
            let bodyText = descriptionShelfRenderer["description"] as? [String: Any],
            let runs = bodyText["runs"] as? [[String: Any]]
         {
-            header.description = runs.compactMap { $0["text"] as? String }.joined()
+            header.description = ParsingHelpers.joinedRunText(runs)
         }
 
         if let facepileArtist = ParsingHelpers.extractFacepileArtist(from: renderer) {
@@ -918,14 +827,20 @@ enum PlaylistParser {
             return true
         }
 
-        guard let regex = try? NSRegularExpression(
-            pattern: #"^\d+\+?\s+(?:hours?|minutes?|seconds?)$"#,
-            options: .caseInsensitive
-        ) else {
-            return false
-        }
+        let components = text.lowercased().split(whereSeparator: \.isWhitespace)
+        guard components.count == 2 else { return false }
 
-        return regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+        let amount = components[0]
+        let unit = components[1]
+        let unitMatches = unit == "hour" || unit == "hours"
+            || unit == "minute" || unit == "minutes"
+            || unit == "second" || unit == "seconds"
+        guard unitMatches else { return false }
+
+        if amount.hasSuffix("+") {
+            return amount.dropLast().allSatisfy(\.isNumber)
+        }
+        return amount.allSatisfy(\.isNumber)
     }
 
     // MARK: - Track Parsing
@@ -988,12 +903,18 @@ enum PlaylistParser {
     }
 
     private static func parseTracksFromSections(_ sections: [[String: Any]], fallbackThumbnailURL: URL?) -> [Song] {
-        let playlistShelfTracks = sections.flatMap { sectionData -> [Song] in
+        var playlistShelfTracks: [Song] = []
+        for sectionData in sections {
             guard let playlistShelfRenderer = sectionData["musicPlaylistShelfRenderer"] as? [String: Any],
                   let playlistContents = playlistShelfRenderer["contents"] as? [[String: Any]]
-            else { return [] }
+            else { continue }
 
-            return playlistContents.compactMap { self.parseTrackItem($0, fallbackThumbnailURL: fallbackThumbnailURL) }
+            playlistShelfTracks.reserveCapacity(playlistShelfTracks.count + playlistContents.count)
+            for itemData in playlistContents {
+                if let track = self.parseTrackItem(itemData, fallbackThumbnailURL: fallbackThumbnailURL) {
+                    playlistShelfTracks.append(track)
+                }
+            }
         }
 
         // When the browse response has a musicPlaylistShelfRenderer, that shelf is
@@ -1012,6 +933,7 @@ enum PlaylistParser {
                   let shelfContents = shelfRenderer["contents"] as? [[String: Any]]
             else { continue }
 
+            tracks.reserveCapacity(tracks.count + shelfContents.count)
             for itemData in shelfContents {
                 if let track = parseTrackItem(itemData, fallbackThumbnailURL: fallbackThumbnailURL) {
                     tracks.append(track)
@@ -1057,12 +979,18 @@ enum PlaylistParser {
 
         let title = ParsingHelpers.extractTitleFromFlexColumns(responsiveRenderer) ?? "Unknown"
         let artists = ParsingHelpers.extractArtistsFromFlexColumns(responsiveRenderer)
-        let thumbnails = ParsingHelpers.extractThumbnails(from: responsiveRenderer)
-        let thumbnailURL = thumbnails.last.flatMap { URL(string: $0) } ?? fallbackThumbnailURL
+        let thumbnailURL = ParsingHelpers.extractThumbnailURL(from: responsiveRenderer) ?? fallbackThumbnailURL
         let duration = ParsingHelpers.extractDurationFromFlexColumns(responsiveRenderer)
         let album = ParsingHelpers.extractAlbumFromFlexColumns(responsiveRenderer)
         let isPlayable = ParsingHelpers.isPlayableMusicItem(from: responsiveRenderer)
         let isExplicit = ParsingHelpers.extractIsExplicit(from: responsiveRenderer)
+        let playlistSetVideoId = ParsingHelpers.extractPlaylistSetVideoId(from: responsiveRenderer)
+        let musicVideoType = ParsingHelpers.extractMusicVideoType(from: responsiveRenderer)
+
+        // Music-video rows advertise their audio recording through the credits menu.
+        // Ignore the credits ID when it just repeats the row (ordinary audio tracks).
+        let creditsVideoId = ParsingHelpers.extractTrackCreditsVideoId(from: responsiveRenderer)
+        let audioTrackVideoId = creditsVideoId == videoId ? nil : creditsVideoId
 
         return Song(
             id: videoId,
@@ -1073,7 +1001,10 @@ enum PlaylistParser {
             thumbnailURL: thumbnailURL,
             videoId: videoId,
             isPlayable: isPlayable,
-            isExplicit: isExplicit
+            musicVideoType: musicVideoType,
+            isExplicit: isExplicit,
+            playlistSetVideoId: playlistSetVideoId,
+            audioTrackVideoId: audioTrackVideoId
         )
     }
 
@@ -1099,7 +1030,9 @@ enum PlaylistParser {
                         tracks.append(contentsOf: self.findTracksRecursively(in: item, depth: depth + 1, fallbackThumbnailURL: fallbackThumbnailURL))
                     }
                 }
-                if !tracks.isEmpty { break }
+                if !tracks.isEmpty {
+                    break
+                }
             }
         }
 
@@ -1116,8 +1049,7 @@ enum PlaylistParser {
             return nil
         }
 
-        let thumbnails = ParsingHelpers.extractThumbnails(from: data)
-        let thumbnailURL = thumbnails.last.flatMap { URL(string: $0) }
+        let thumbnailURL = ParsingHelpers.extractThumbnailURL(from: data)
         let title = ParsingHelpers.extractTitle(from: data) ?? "Unknown Playlist"
 
         return Playlist(
@@ -1140,8 +1072,7 @@ enum PlaylistParser {
             return nil
         }
 
-        let thumbnails = ParsingHelpers.extractThumbnails(from: data)
-        let thumbnailURL = thumbnails.last.flatMap { URL(string: $0) }
+        let thumbnailURL = ParsingHelpers.extractThumbnailURL(from: data)
         let title = ParsingHelpers.extractTitleFromFlexColumns(data) ?? "Unknown Playlist"
 
         return Playlist(
@@ -1301,7 +1232,7 @@ enum PlaylistParser {
 
         let subtitle = Self.extractText(from: data["subtitle"] as? [String: Any])
             ?? Self.extractText(from: data["secondaryText"] as? [String: Any])
-        let thumbnailURL = ParsingHelpers.extractThumbnails(from: data).last.flatMap { URL(string: $0) }
+        let thumbnailURL = ParsingHelpers.extractThumbnailURL(from: data)
 
         return AddToPlaylistOption(
             playlistId: playlistId,
@@ -1338,6 +1269,29 @@ enum PlaylistParser {
         return nil
     }
 
+    private static func extractAlbumLibraryTargetId(from data: [String: Any], albumId: String) -> String? {
+        if albumId.hasPrefix("OLAK") {
+            return albumId
+        }
+        guard albumId.hasPrefix("MPRE") else { return nil }
+
+        let headerRendererNames = [
+            "musicResponsiveHeaderRenderer",
+            "musicDetailHeaderRenderer",
+            "musicImmersiveHeaderRenderer",
+            "musicVisualHeaderRenderer",
+        ]
+        for rendererName in headerRendererNames {
+            if let headerRenderer = ResponseTreeSearch.firstDictionary(named: rendererName, in: data),
+               let targetId = ParsingHelpers.extractAlbumLibraryTargetId(from: headerRenderer)
+            {
+                return targetId
+            }
+        }
+
+        return nil
+    }
+
     private static func extractSelectedState(from data: [String: Any]) -> Bool {
         if let selected = data["selected"] as? Bool ?? data["isSelected"] as? Bool ?? data["checked"] as? Bool {
             return selected
@@ -1369,9 +1323,15 @@ enum PlaylistParser {
             Self.extractText(from: data["subtitle"] as? [String: Any]),
         ].compactMap(\.self).joined(separator: " ").uppercased()
 
-        if possibleText.contains("PRIVATE") { return .private }
-        if possibleText.contains("UNLISTED") { return .unlisted }
-        if possibleText.contains("PUBLIC") { return .public }
+        if possibleText.contains("PRIVATE") {
+            return .private
+        }
+        if possibleText.contains("UNLISTED") {
+            return .unlisted
+        }
+        if possibleText.contains("PUBLIC") {
+            return .public
+        }
         return nil
     }
 
@@ -1385,7 +1345,7 @@ enum PlaylistParser {
             return content
         }
         if let runs = data["runs"] as? [[String: Any]] {
-            let text = runs.compactMap { $0["text"] as? String }.joined()
+            let text = ParsingHelpers.joinedRunText(runs)
             return text.isEmpty ? nil : text
         }
         return nil
@@ -1438,9 +1398,14 @@ enum PlaylistParser {
             .flatMap { ($0 as? [[String: Any]])?.first?["text"] as? String }
             ?? "Unknown"
 
-        let artistRuns = (renderer["shortBylineText"] as? [String: Any])?["runs"] as? [[String: Any]]
-        let artistName = artistRuns?.first?["text"] as? String ?? "Unknown Artist"
-        let artistId = Self.extractArtistId(from: artistRuns)
+        // Curated queues keep artist links in the long byline; the short byline is display-only.
+        var artists = SongMetadataParser.parseArtists(from: renderer)
+        if artists.isEmpty {
+            let artistRuns = (renderer["shortBylineText"] as? [String: Any])?["runs"] as? [[String: Any]]
+            let artistName = artistRuns?.first?["text"] as? String ?? "Unknown Artist"
+            let artistId = Self.extractArtistId(from: artistRuns)
+            artists = [Artist(id: artistId ?? "", name: artistName)]
+        }
 
         let durationText = (renderer["lengthText"] as? [String: Any])?["runs"]
             .flatMap { ($0 as? [[String: Any]])?.first?["text"] as? String }
@@ -1455,7 +1420,7 @@ enum PlaylistParser {
         return Song(
             id: videoId,
             title: title,
-            artists: [Artist(id: artistId ?? "", name: artistName, thumbnailURL: nil)],
+            artists: artists,
             album: nil,
             duration: durationText.flatMap { ParsingHelpers.parseDuration($0) },
             thumbnailURL: thumbnailURL,

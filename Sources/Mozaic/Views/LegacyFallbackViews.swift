@@ -12,12 +12,18 @@ import SwiftUI
 /// Minimal playlist view used on macOS 15 (no Liquid Glass, no AI refine).
 struct SimplePlaylistDetailView: View {
     let playlist: Playlist
+    let playerBarNavigationAction: PlayerBarNavigationAction
     @State var viewModel: PlaylistDetailViewModel
     @Environment(PlayerService.self) private var playerService
     @Environment(SongLikeStatusManager.self) private var likeStatusManager
 
-    init(playlist: Playlist, viewModel: PlaylistDetailViewModel) {
+    init(
+        playlist: Playlist,
+        viewModel: PlaylistDetailViewModel,
+        playerBarNavigationAction: PlayerBarNavigationAction = .disabled
+    ) {
         self.playlist = playlist
+        self.playerBarNavigationAction = playerBarNavigationAction
         self._viewModel = State(initialValue: viewModel)
     }
 
@@ -48,6 +54,8 @@ struct SimplePlaylistDetailView: View {
             if case .error = self.viewModel.loadingState {
             } else {
                 PlayerBar()
+                    .environment(\.playerBarNavigationAction, self.playerBarNavigationAction)
+                    .environment(\.playerBarCurrentAlbumID, self.playlist.isAlbum ? self.playlist.id : nil)
             }
         }
         .task {
@@ -58,10 +66,12 @@ struct SimplePlaylistDetailView: View {
         .refreshable {
             await self.viewModel.refresh()
         }
-        .onChange(of: self.likeStatusManager.lastLikeEvent) { _, event in
-            guard let event else { return }
-            guard LikedMusicPlaylist.matches(id: self.playlist.id) else { return }
-            self.viewModel.handleLikeStatusChange(event)
+        .onChange(of: self.likeStatusManager.lastLikeEventBatch) { _, batch in
+            guard let batch, batch.accountID == self.likeStatusManager.activeAccountID else { return }
+            for event in batch.events {
+                guard LikedMusicPlaylist.matches(id: self.playlist.id) else { return }
+                self.viewModel.handleLikeStatusChange(event)
+            }
         }
     }
 
@@ -82,7 +92,7 @@ struct SimplePlaylistDetailView: View {
 
         return HStack(alignment: .top, spacing: 20) {
             AsyncImage(url: detail.thumbnailURL) { image in
-                image.resizable().aspectRatio(contentMode: .fill)
+                image.resizable().scaledToFill()
             } placeholder: {
                 Color.secondary.opacity(0.2)
             }
@@ -103,7 +113,7 @@ struct SimplePlaylistDetailView: View {
                     Button {
                         Task { await self.play(playableTracks, startingAt: 0) }
                     } label: {
-                        Label("Play", systemImage: "play.fill")
+                        Label(String(localized: "Play"), systemImage: "play.fill")
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(playableTracks.isEmpty)
@@ -114,7 +124,7 @@ struct SimplePlaylistDetailView: View {
                         }
                         Task { await self.play(playableTracks, startingAt: 0) }
                     } label: {
-                        Label("Shuffle", systemImage: "shuffle")
+                        Label(String(localized: "Shuffle"), systemImage: "shuffle")
                     }
                     .buttonStyle(.bordered)
                     .disabled(playableTracks.isEmpty)
@@ -137,7 +147,7 @@ struct SimplePlaylistDetailView: View {
                             .foregroundStyle(.secondary)
                             .frame(width: 28, alignment: .trailing)
                         AsyncImage(url: track.thumbnailURL) { image in
-                            image.resizable().aspectRatio(contentMode: .fill)
+                            image.resizable().scaledToFill()
                         } placeholder: {
                             Color.secondary.opacity(0.15)
                         }
@@ -276,7 +286,8 @@ struct SimpleLyricsView: View {
             case let .synced(synced):
                 SyncedLyricsDisplayView(
                     lyrics: synced,
-                    currentTimeMs: self.playerService.currentTimeMs,
+                    currentLineIndex: self.playerService.currentLyricsLineIndex,
+                    displayTimeMs: self.playerService.currentLyricsDisplayTimeMs,
                     onSeek: { timeMs in
                         Task { await self.playerService.seek(to: Double(timeMs) / 1000.0) }
                     }
@@ -365,10 +376,14 @@ struct SimpleLyricsView: View {
     }
 
     private func updateLyricsPolling(for result: LyricResult) {
-        if case .synced = result {
-            SingletonPlayerWebView.shared.startLyricsPoll()
+        if case let .synced(synced) = result {
+            self.playerService.currentLyricsLineIndex = nil
+            self.playerService.currentLyricsDisplayTimeMs = nil
+            SingletonPlayerWebView.shared.startLyricsPoll(lineRanges: synced.bridgeLineRanges)
         } else {
             SingletonPlayerWebView.shared.stopLyricsPoll()
+            self.playerService.currentLyricsLineIndex = nil
+            self.playerService.currentLyricsDisplayTimeMs = nil
         }
     }
 

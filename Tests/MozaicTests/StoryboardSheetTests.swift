@@ -157,11 +157,55 @@ struct AmbientBackdropStyleTests {
         #expect(Set(ids).count == ids.count)
     }
 
-    @Test("Display and debug names are non-empty for every case")
-    func namesNonEmpty() {
+    @Test("Display names are non-empty for every case")
+    func displayNamesNonEmpty() {
         for style in AmbientBackdropStyle.allCases {
             #expect(!style.displayName.isEmpty)
-            #expect(!style.debugLabel.isEmpty)
         }
+    }
+
+    @Test("Default ambient style favors the steady low-energy glow")
+    func defaultAmbientStyleIsSteady() {
+        #expect(SettingsManager.defaultAmbientBackdropStyle == .soft)
+    }
+
+    @Test("Resolved ambient style only reflects stored user preference")
+    func resolvedAmbientStyleReflectsStoredPreference() {
+        #expect(SettingsManager.resolveAmbientStyle(
+            enabled: false,
+            preferredStyle: .live
+        ) == .off)
+        #expect(SettingsManager.resolveAmbientStyle(
+            enabled: true,
+            preferredStyle: .live
+        ) == .live)
+        #expect(SettingsManager.resolveAmbientStyle(
+            enabled: true,
+            preferredStyle: .glow
+        ) == .glow)
+    }
+
+    @Test("Ambient rendering downgrades live for Reduce Motion or Low Power Mode")
+    func ambientRenderingDowngradesLiveForEnergyAndAccessibility() {
+        #expect(AmbientVideoBackdrop.effectiveStyle(
+            requestedStyle: .live,
+            reduceMotion: true,
+            lowPowerModeEnabled: false
+        ) == .soft)
+        #expect(AmbientVideoBackdrop.effectiveStyle(
+            requestedStyle: .live,
+            reduceMotion: false,
+            lowPowerModeEnabled: true
+        ) == .soft)
+        #expect(AmbientVideoBackdrop.effectiveStyle(
+            requestedStyle: .glow,
+            reduceMotion: true,
+            lowPowerModeEnabled: false
+        ) == .glow)
+    }
+
+    @Test("Animated ambient cadence is periodic rather than display-link paced")
+    func animatedAmbientCadenceIsThrottled() {
+        #expect(AmbientVideoBackdrop.animatedTimelineInterval >= 0.1)
     }
 }
