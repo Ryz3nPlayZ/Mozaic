@@ -575,3 +575,7 @@
 "Start a new chat to continue." = "Devam etmek için yeni bir sohbet başlatın.";
 "Ask Gemini response ready" = "Gemini'ye Sor yanıtı hazır";
 "New Ask Gemini chat ready" = "Yeni Gemini sohbeti hazır";
+"Block Ads" = "Reklamları Engelle";
+"Ad Blocking" = "Reklam Engelleme";
+"Remove ads from songs and videos during playback" = "Oynatma sırasında şarkı ve videolardaki reklamları kaldır";
+"Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Reklamlar yüklenmeden kaldırılır, yine de başlayanlar atlanır. Bir sonraki şarkı veya videodan itibaren geçerlidir.";

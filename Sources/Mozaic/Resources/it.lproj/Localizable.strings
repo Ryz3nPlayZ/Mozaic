@@ -575,3 +575,7 @@
 "Start a new chat to continue." = "Avvia una nuova chat per continuare.";
 "Ask Gemini response ready" = "Risposta di Chiedi a Gemini pronta";
 "New Ask Gemini chat ready" = "Nuova chat di Chiedi a Gemini pronta";
+"Block Ads" = "Blocca annunci";
+"Ad Blocking" = "Blocco annunci";
+"Remove ads from songs and videos during playback" = "Rimuovi gli annunci da brani e video durante la riproduzione";
+"Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Gli annunci vengono rimossi prima del caricamento e quelli che partono comunque vengono saltati. Si applica dal brano o video successivo.";

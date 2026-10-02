@@ -1407,6 +1407,9 @@ final class SingletonPlayerWebView {
         )
         contentController.addUserScript(playbackAudioQualityBootstrapScript)
 
+        // Prune ad payloads before YouTube's player scripts run.
+        PlaybackAdBlocker.install(on: contentController, enabled: SettingsManager.shared.blockAds)
+
         // Inject mediaSession override at document end without allowing duplicate RAF loops.
         let mediaOverrideScript = WKUserScript(
             source: Self.mediaControlOverrideScript,

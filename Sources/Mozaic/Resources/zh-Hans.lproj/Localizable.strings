@@ -573,3 +573,7 @@
 "e.g., Remove slow songs, reorder by energy..." = "例如：移除慢歌、按能量重新排序…";
 "songs" = "首歌曲";
 "tracks" = "首曲目";
+"Block Ads" = "拦截广告";
+"Ad Blocking" = "广告拦截";
+"Remove ads from songs and videos during playback" = "播放时移除歌曲和视频中的广告";
+"Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "广告会在加载前被移除，仍然开始播放的广告会被跳过。从下一首歌曲或下一个视频开始生效。";

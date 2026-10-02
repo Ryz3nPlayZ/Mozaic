@@ -570,3 +570,7 @@
 "e.g., Remove slow songs, reorder by energy..." = "例：ゆったりした曲を削除、エネルギー順に並べ替えなど…";
 "songs" = "曲";
 "tracks" = "トラック";
+"Block Ads" = "広告をブロック";
+"Ad Blocking" = "広告ブロック";
+"Remove ads from songs and videos during playback" = "再生中の曲と動画から広告を取り除きます";
+"Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "広告は読み込まれる前に取り除かれ、それでも始まった広告はスキップされます。次の曲または動画から適用されます。";

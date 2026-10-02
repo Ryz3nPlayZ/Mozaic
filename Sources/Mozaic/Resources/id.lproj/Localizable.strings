@@ -575,3 +575,7 @@
 "Start a new chat to continue." = "Mulai chat baru untuk melanjutkan.";
 "Ask Gemini response ready" = "Respons Tanya Gemini siap";
 "New Ask Gemini chat ready" = "Chat Tanya Gemini baru siap";
+"Block Ads" = "Blokir Iklan";
+"Ad Blocking" = "Pemblokiran Iklan";
+"Remove ads from songs and videos during playback" = "Hapus iklan dari lagu dan video saat diputar";
+"Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Iklan dihapus sebelum dimuat, dan iklan yang tetap diputar akan dilewati. Berlaku mulai lagu atau video berikutnya.";

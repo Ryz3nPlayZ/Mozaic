@@ -575,3 +575,7 @@
 "Start a new chat to continue." = "Start een nieuwe chat om door te gaan.";
 "Ask Gemini response ready" = "Antwoord van Vraag Gemini is klaar";
 "New Ask Gemini chat ready" = "Nieuwe chat met Vraag Gemini is klaar";
+"Block Ads" = "Advertenties blokkeren";
+"Ad Blocking" = "Advertentieblokkering";
+"Remove ads from songs and videos during playback" = "Advertenties uit nummers en video's verwijderen tijdens het afspelen";
+"Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Advertenties worden verwijderd voordat ze laden en advertenties die toch starten worden overgeslagen. Geldt vanaf het volgende nummer of de volgende video.";

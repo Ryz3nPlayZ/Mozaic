@@ -60,6 +60,19 @@ struct GeneralSettingsView: View {
                 Text(String(localized: "Behavior"))
             }
 
+            // MARK: - Ad Blocking Section
+
+            Section {
+                Toggle(String(localized: "Block Ads"), isOn: self.$settings.blockAds)
+                    .help(String(localized: "Remove ads from songs and videos during playback"))
+            } header: {
+                Text(String(localized: "Ad Blocking"))
+            } footer: {
+                Text(String(localized: "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             // MARK: - Language Section
 
             Section {

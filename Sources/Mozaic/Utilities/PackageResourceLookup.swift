@@ -20,7 +20,7 @@ enum PackageResourceLookup {
             }
         }
 
-        return NSColor(srgbRed: 1.0, green: 0.0, blue: 0.337, alpha: 1.0)
+        return NSColor.systemBlue
     }()
 
     static let brandAccent = Color(nsColor: Self.brandAccentNSColor)

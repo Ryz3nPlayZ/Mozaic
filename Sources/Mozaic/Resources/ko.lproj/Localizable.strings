@@ -575,3 +575,7 @@
 "Start a new chat to continue." = "계속하려면 새 채팅을 시작하세요.";
 "Ask Gemini response ready" = "Gemini에게 질문 응답 준비됨";
 "New Ask Gemini chat ready" = "새 Gemini 채팅이 준비되었습니다";
+"Block Ads" = "광고 차단";
+"Ad Blocking" = "광고 차단";
+"Remove ads from songs and videos during playback" = "재생 중 노래와 동영상에서 광고를 제거합니다";
+"Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "광고는 로드되기 전에 제거되며, 그래도 시작되는 광고는 건너뜁니다. 다음 노래나 동영상부터 적용됩니다.";

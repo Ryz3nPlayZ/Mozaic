@@ -849,6 +849,9 @@ extension YouTubeWatchWebView {
         )
         contentController.addUserScript(blackout)
 
+        // Prune ad payloads before YouTube's player scripts run.
+        PlaybackAdBlocker.install(on: contentController, enabled: SettingsManager.shared.blockAds)
+
         let observer = WKUserScript(
             source: Self.observerScript,
             injectionTime: .atDocumentEnd,

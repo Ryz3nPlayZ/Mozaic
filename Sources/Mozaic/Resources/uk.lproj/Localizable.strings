@@ -575,3 +575,7 @@
 "Start a new chat to continue." = "Почніть новий чат, щоб продовжити.";
 "Ask Gemini response ready" = "Відповідь «Запитати Gemini» готова";
 "New Ask Gemini chat ready" = "Новий чат «Запитати Gemini» готовий";
+"Block Ads" = "Блокувати рекламу";
+"Ad Blocking" = "Блокування реклами";
+"Remove ads from songs and videos during playback" = "Прибирати рекламу з пісень і відео під час відтворення";
+"Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Реклама прибирається до завантаження, а та, що все ж починається, пропускається. Діє з наступної пісні чи відео.";

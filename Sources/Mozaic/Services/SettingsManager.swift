@@ -35,6 +35,7 @@ final class SettingsManager {
         static let ambientBackdropStyle = "settings.ambientBackdropStyle"
         static let popOutVideoOnNavigateAway = "settings.popOutVideoOnNavigateAway"
         static let showYouTubeControlsOnVideo = "settings.showYouTubeControlsOnVideo"
+        static let blockAds = "settings.blockAds"
         #if DEBUG
             static let useLegacyMacOS15UI = "settings.debug.useLegacyMacOS15UI"
         #endif
@@ -462,6 +463,14 @@ final class SettingsManager {
         }
     }
 
+    /// Whether the playback WebViews strip and skip YouTube ads.
+    /// Applies from the next song or video that loads.
+    var blockAds: Bool {
+        didSet {
+            UserDefaults.standard.set(self.blockAds, forKey: Keys.blockAds)
+        }
+    }
+
     /// The style the YouTube watch page should request: the chosen style when
     /// enabled, `.off` when the feature is disabled. Runtime energy/accessibility
     /// downgrades are applied inside `AmbientVideoBackdrop`, which observes those
@@ -512,6 +521,10 @@ final class SettingsManager {
         defaults.object(forKey: Keys.showYouTubeControlsOnVideo) as? Bool ?? false
     }
 
+    static func loadBlockAds(from defaults: UserDefaults) -> Bool {
+        defaults.object(forKey: Keys.blockAds) as? Bool ?? true
+    }
+
     private init() {
         // Load persisted settings or use defaults
         self.showNowPlayingNotifications = UserDefaults.standard.object(forKey: Keys.showNowPlayingNotifications) as? Bool ?? true
@@ -550,6 +563,7 @@ final class SettingsManager {
         self.ambientBackdropEnabled = UserDefaults.standard.object(forKey: Keys.ambientBackdropEnabled) as? Bool ?? true
         self.popOutVideoOnNavigateAway = UserDefaults.standard.object(forKey: Keys.popOutVideoOnNavigateAway) as? Bool ?? true
         self.showYouTubeControlsOnVideo = Self.loadShowYouTubeControlsOnVideo(from: UserDefaults.standard)
+        self.blockAds = Self.loadBlockAds(from: UserDefaults.standard)
         #if DEBUG
             self.useLegacyMacOS15UI = UserDefaults.standard.object(forKey: Keys.useLegacyMacOS15UI) as? Bool ?? false
         #endif

@@ -73,3 +73,5 @@ What becomes easier or more difficult because of this change?
 | [0036](0036-music-audio-output-continuity.md) | Music audio output continuity | Accepted |
 | [0037](0037-deferred-cookie-restoration.md) | Deferred cookie restoration | Accepted |
 | [0038](0038-native-appkit-home-shelves.md) | Native AppKit cards for Home-style shelves | Accepted |
+| [1000](1000-built-in-playback-ad-blocker.md) | Built-in playback ad blocker (Mozaic) | Accepted |
+| [1001](1001-separate-notch-app.md) | Ship Mozaic Notch as a separate app (Mozaic) | Accepted |

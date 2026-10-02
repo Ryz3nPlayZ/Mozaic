@@ -575,3 +575,7 @@
 "Start a new chat to continue." = "Starta en ny chatt för att fortsätta.";
 "Ask Gemini response ready" = "Svaret från Fråga Gemini är klart";
 "New Ask Gemini chat ready" = "Ny Fråga Gemini-chatt är klar";
+"Block Ads" = "Blockera annonser";
+"Ad Blocking" = "Annonsblockering";
+"Remove ads from songs and videos during playback" = "Ta bort annonser från låtar och videor under uppspelning";
+"Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Annonser tas bort innan de läses in, och de som ändå startar hoppas över. Gäller från nästa låt eller video.";
