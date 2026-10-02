@@ -103,6 +103,7 @@
 "Continue" = "Ga door";
 "Continue Watching" = "Verder kijken";
 "Control playback with your keyboard" = "Bedien het afspelen met je toetsenbord";
+"Controls appear when you move the pointer over the video and fade out while it plays." = "De bediening verschijnt wanneer je de aanwijzer over de video beweegt en vervaagt tijdens het afspelen.";
 "Could not create AI session" = "Kon geen AI-sessie maken";
 "Couldn't capture Mozaic's audio (status %d). Check Screen & System Audio Recording permission in System Settings." = "Kon het audio van Mozaic niet vastleggen (status %d). Controleer de toestemming voor Scherm- en systeemaudio-opname in Systeeminstellingen.";
 "Couldn't configure the audio unit (%lld)." = "Kon de audio-eenheid niet configureren (%lld).";
@@ -334,11 +335,11 @@
 "Open the command bar to control music with natural language. Try saying \"play something chill\" or \"add jazz to queue\"." = "Open de opdrachtbalk om muziek met natuurlijke taal te bedienen. Probeer bijvoorbeeld \"play something chill\" of \"add jazz to queue\".";
 "Options…" = "Opties…";
 "Output" = "Uitvoer";
-"Passkey sign-in is not available in this window. Google will ask for your password or another sign-in method instead." = "Inloggen met een passkey is niet beschikbaar in dit venster. Google vraagt in plaats daarvan om je wachtwoord of een andere inlogmethode.";
 "Pause" = "Pauze";
 "Permission needed" = "Toestemming vereist";
 "Piano" = "Piano";
 "Picture in Picture" = "Picture in Picture";
+"Place the playback controls on the video instead of in the bar at the bottom of the window" = "De afspeelbediening op de video plaatsen in plaats van in de balk onder in het venster";
 "Play" = "Speel af";
 "Play a song to view its lyrics here." = "Speel een nummer af om hier de songtekst te bekijken.";
 "Play All" = "Alles afspelen";
@@ -350,6 +351,7 @@
 "Playback Audio Quality" = "Audiokwaliteit bij afspelen";
 "Playback position" = "Afspeelpositie";
 "Played" = "Afgespeeld";
+"Player Controls" = "Spelerbediening";
 "Playing" = "Speelt af";
 "Playlist" = "Afspeellijst";
 "Playlist not found" = "Afspeellijst niet gevonden";
@@ -429,6 +431,7 @@
 "Show a notification when a new track starts playing" = "Toon een melding wanneer een nieuw nummer begint met afspelen";
 "Show a soft color glow, drawn from the video, behind the player" = "Een zachte kleurglans uit de video achter de speler tonen";
 "Show All" = "Toon alles";
+"Show Controls on Video" = "Bediening op video tonen";
 "Show Large Artwork" = "Grote illustratie tonen";
 "Show Lyrics" = "Toon songteksten";
 "Show more comments" = "Meer reacties tonen";
