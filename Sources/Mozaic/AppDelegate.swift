@@ -63,19 +63,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Restore saved queue if available
         self.playerService?.restoreQueueFromPersistence()
 
-        // Launch the Notch helper app if present inside Contents/Helpers/MozaicNotch.app
-        let helperURL = Bundle.main.bundleURL
-            .appendingPathComponent("Contents/Helpers/MozaicNotch.app")
-        if FileManager.default.fileExists(atPath: helperURL.path) {
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.addsToRecentItems = false
-            configuration.activates = false
-            NSWorkspace.shared.openApplication(at: helperURL, configuration: configuration) { _, error in
-                if let error = error {
-                    DiagnosticsLogger.app.error("Failed to launch MozaicNotch: \(error.localizedDescription)")
-                } else {
-                    DiagnosticsLogger.app.info("Successfully launched MozaicNotch helper app.")
-                }
+        self.openMozaicNotchIfInstalled()
+    }
+
+    /// Mozaic Notch is a separate app with its own TCC identity (ADR-1001).
+    /// Open it alongside Mozaic when the user has installed it.
+    private func openMozaicNotchIfInstalled() {
+        let notchBundleID = "com.zemuliu.MozaicNotch"
+        guard !UITestConfig.isUITestMode,
+              NSRunningApplication.runningApplications(withBundleIdentifier: notchBundleID).isEmpty,
+              let notchURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: notchBundleID)
+        else { return }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.addsToRecentItems = false
+        configuration.activates = false
+        NSWorkspace.shared.openApplication(at: notchURL, configuration: configuration) { _, error in
+            if let error {
+                DiagnosticsLogger.app.error("Failed to open Mozaic Notch: \(error.localizedDescription, privacy: .public)")
             }
         }
     }

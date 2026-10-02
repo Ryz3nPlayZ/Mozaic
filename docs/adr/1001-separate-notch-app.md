@@ -20,13 +20,17 @@ Mozaic cannot do that without dropping its sandbox and diverging from Kaset.
 ## Decision
 
 The notch is its own top-level app, `/Applications/Mozaic Notch.app`
-(`com.zemuliu.MozaicNotch`). It has its own Info.plist usage strings,
-entitlements, and Sparkle feed. It is built and released from the
-boring.notch fork.
+(`com.zemuliu.MozaicNotch`), built from the `mozaic-notch` branch of the
+boring.notch fork. The fork's project sets the bundle ID, product name, and
+usage strings, so no post-build plist rewriting is needed.
 
-Mozaic does not embed or launch it. Mozaic only offers it: when the notch app
-is installed, Mozaic can open it, and otherwise it links to the download. The
-Homebrew tap ships it as a separate cask (`mozaic-notch`).
+`Scripts/build-notch.sh` builds, signs (with the notch's own entitlements), and
+packages `Mozaic Notch.dmg`. Releases attach it next to `Mozaic.dmg`. Its
+Sparkle feed is `notch-appcast.xml` in this repository, signed with the same
+EdDSA key as Mozaic's feed.
+
+Mozaic does not embed it. When Mozaic Notch is installed and not already
+running, Mozaic opens it at launch, as the embedded helper used to.
 
 ## Consequences
 

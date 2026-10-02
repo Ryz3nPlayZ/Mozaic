@@ -243,57 +243,6 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 mkdir -p "$APP_BUNDLE/Contents/Frameworks"
 
-# ── MozaicNotch Helper ────────────────────────────────────────────────────────
-# Built from the sibling boring.notch checkout and embedded as a helper app.
-# NOTE: TCC attributes privacy requests from an app nested inside Mozaic.app to
-# Mozaic.app itself, so every usage description the notch needs (camera,
-# calendars, reminders, Apple Events) must ALSO be in Mozaic's Info.plist below —
-# otherwise macOS kills the notch the moment it asks for that permission.
-
-NOTCH_PROJECT="$ROOT/../boring.notch/boringNotch.xcodeproj"
-NOTCH_DERIVED_DATA="$ROOT/.build/boringNotch-derivedData"
-NOTCH_BUNDLE_ID="com.zemuliu.MozaicNotch"
-NOTCH_APP="$APP_BUNDLE/Contents/Helpers/MozaicNotch.app"
-
-if [[ -d "$NOTCH_PROJECT" ]]; then
-  echo "🔨 Building MozaicNotch helper app..."
-  xcodebuild -project "$NOTCH_PROJECT" \
-    -scheme boringNotch \
-    -configuration Release \
-    -derivedDataPath "$NOTCH_DERIVED_DATA" \
-    CODE_SIGN_IDENTITY="" \
-    CODE_SIGNING_REQUIRED=NO \
-    CODE_SIGNING_ALLOWED=NO
-
-  # Upstream renamed the product from boringNotch.app to "Boring Notch.app";
-  # locate whichever app bundle the scheme produced instead of hardcoding it.
-  NOTCH_PRODUCT=$(find "$NOTCH_DERIVED_DATA/Build/Products/Release" -maxdepth 1 -name '*.app' -print -quit)
-  if [[ -z "$NOTCH_PRODUCT" ]]; then
-    echo "ERROR: boring.notch build produced no .app in $NOTCH_DERIVED_DATA/Build/Products/Release" >&2
-    exit 1
-  fi
-
-  echo "💿 Bundling MozaicNotch helper..."
-  mkdir -p "$APP_BUNDLE/Contents/Helpers"
-  cp -R "$NOTCH_PRODUCT" "$NOTCH_APP"
-
-  # Rebrand the helper application inside the bundle
-  NOTCH_PLIST="$NOTCH_APP/Contents/Info.plist"
-  NOTCH_EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$NOTCH_PLIST")
-  mv "$NOTCH_APP/Contents/MacOS/$NOTCH_EXECUTABLE" "$NOTCH_APP/Contents/MacOS/MozaicNotch"
-  plutil -replace CFBundleExecutable -string "MozaicNotch" "$NOTCH_PLIST"
-  plutil -replace CFBundleName -string "MozaicNotch" "$NOTCH_PLIST"
-  plutil -replace CFBundleDisplayName -string "Mozaic Notch" "$NOTCH_PLIST"
-  plutil -replace CFBundleIdentifier -string "$NOTCH_BUNDLE_ID" "$NOTCH_PLIST"
-  # The helper still carries boring.notch's Sparkle feed; letting it update
-  # itself would install upstream Boring Notch inside Mozaic.app and break the
-  # bundle signature. Mozaic's own updater ships new notch builds instead.
-  plutil -replace SUEnableAutomaticChecks -bool NO "$NOTCH_PLIST"
-  plutil -replace SUAutomaticallyUpdate -bool NO "$NOTCH_PLIST"
-else
-  echo "⚠️  $NOTCH_PROJECT not found; building Mozaic without the notch helper."
-fi
-
 # ── Executable ───────────────────────────────────────────────────────────────
 
 install_binary "$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
@@ -544,21 +493,6 @@ ${APP_LOCALIZATIONS_PLIST}
     <key>NSScreenCaptureUsageDescription</key>
     <string>Mozaic taps its own audio output (not the screen) so the built-in equalizer can apply effects to your music. No screen content is recorded.</string>
 
-    <!-- MozaicNotch helper: TCC attributes the embedded notch's requests to
-         this bundle, so a missing string here crashes the notch on request. -->
-    <key>NSCameraUsageDescription</key>
-    <string>Mozaic Notch uses the camera to display a live mirror preview in the notch.</string>
-    <key>NSCalendarsUsageDescription</key>
-    <string>Mozaic Notch accesses your calendar to display upcoming events.</string>
-    <key>NSCalendarsFullAccessUsageDescription</key>
-    <string>Mozaic Notch accesses your calendar to display upcoming events.</string>
-    <key>NSRemindersUsageDescription</key>
-    <string>Mozaic Notch accesses your reminders to display scheduled tasks.</string>
-    <key>NSRemindersFullAccessUsageDescription</key>
-    <string>Mozaic Notch accesses your reminders to display scheduled tasks.</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Mozaic Notch uses Apple Events to show and control music playing in other apps.</string>
-
     <!-- Build Metadata -->
     <key>MozaicBuildTimestamp</key>
     <string>${BUILD_TIMESTAMP}</string>
@@ -649,66 +583,6 @@ if [[ -d "$SPARKLE" ]]; then
   }
   resign "$SPARKLE/Versions/B" 2>/dev/null || true
   resign "$SPARKLE"
-fi
-
-# Sign the MozaicNotch helper app if bundled
-NOTCH_APP="$APP_BUNDLE/Contents/Helpers/MozaicNotch.app"
-if [[ -d "$NOTCH_APP" ]]; then
-  echo "  → Signing MozaicNotch helper app..."
-  
-  # Sign Sparkle framework inside Notch
-  NOTCH_SPARKLE="$NOTCH_APP/Contents/Frameworks/Sparkle.framework"
-  if [[ -d "$NOTCH_SPARKLE" ]]; then
-    echo "    ↳ Signing Sparkle.framework inside Notch..."
-    [[ -f "$NOTCH_SPARKLE/Versions/B/Sparkle" ]] && resign "$NOTCH_SPARKLE/Versions/B/Sparkle"
-    [[ -f "$NOTCH_SPARKLE/Versions/B/Autoupdate" ]] && resign "$NOTCH_SPARKLE/Versions/B/Autoupdate"
-    [[ -d "$NOTCH_SPARKLE/Versions/B/Updater.app" ]] && {
-      [[ -f "$NOTCH_SPARKLE/Versions/B/Updater.app/Contents/MacOS/Updater" ]] && resign "$NOTCH_SPARKLE/Versions/B/Updater.app/Contents/MacOS/Updater"
-      resign "$NOTCH_SPARKLE/Versions/B/Updater.app"
-    }
-    [[ -d "$NOTCH_SPARKLE/Versions/B/XPCServices/Downloader.xpc" ]] && {
-      [[ -f "$NOTCH_SPARKLE/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader" ]] && resign "$NOTCH_SPARKLE/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
-      resign "$NOTCH_SPARKLE/Versions/B/XPCServices/Downloader.xpc"
-    }
-    [[ -d "$NOTCH_SPARKLE/Versions/B/XPCServices/Installer.xpc" ]] && {
-      [[ -f "$NOTCH_SPARKLE/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer" ]] && resign "$NOTCH_SPARKLE/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer"
-      resign "$NOTCH_SPARKLE/Versions/B/XPCServices/Installer.xpc"
-    }
-    resign "$NOTCH_SPARKLE/Versions/B" 2>/dev/null || true
-    resign "$NOTCH_SPARKLE"
-  fi
-
-  # Sign Lottie framework inside Notch
-  NOTCH_LOTTIE="$NOTCH_APP/Contents/Frameworks/Lottie.framework"
-  if [[ -d "$NOTCH_LOTTIE" ]]; then
-    echo "    ↳ Signing Lottie.framework inside Notch..."
-    [[ -f "$NOTCH_LOTTIE/Versions/A/Lottie" ]] && resign "$NOTCH_LOTTIE/Versions/A/Lottie"
-    resign "$NOTCH_LOTTIE/Versions/A" 2>/dev/null || true
-    resign "$NOTCH_LOTTIE"
-  fi
-
-  # Sign MediaRemoteAdapter framework inside Notch
-  NOTCH_MR="$NOTCH_APP/Contents/Frameworks/MediaRemoteAdapter.framework"
-  if [[ -d "$NOTCH_MR" ]]; then
-    echo "    ↳ Signing MediaRemoteAdapter.framework inside Notch..."
-    [[ -f "$NOTCH_MR/MediaRemoteAdapter" ]] && resign "$NOTCH_MR/MediaRemoteAdapter"
-    resign "$NOTCH_MR"
-  fi
-
-  # Sign XPC Helper
-  XPC_HELPER="$NOTCH_APP/Contents/XPCServices/BoringNotchXPCHelper.xpc"
-  if [[ -d "$XPC_HELPER" ]]; then
-    resign "$XPC_HELPER/Contents/MacOS/BoringNotchXPCHelper" 2>/dev/null || true
-    resign "$XPC_HELPER"
-  fi
-
-  resign "$NOTCH_APP/Contents/MacOS/MozaicNotch"
-  # The source entitlements use Xcode's $(PRODUCT_BUNDLE_IDENTIFIER) variable,
-  # which codesign does not expand; substitute the real bundle ID first.
-  NOTCH_ENTITLEMENTS="$BUILD_DIR/MozaicNotch.entitlements"
-  sed "s/\$(PRODUCT_BUNDLE_IDENTIFIER)/$NOTCH_BUNDLE_ID/g" \
-    "$ROOT/../boring.notch/boringNotch/boringNotch.entitlements" > "$NOTCH_ENTITLEMENTS"
-  codesign "${CODESIGN_ARGS[@]}" --entitlements "$NOTCH_ENTITLEMENTS" "$NOTCH_APP"
 fi
 
 if [[ -f "$ROOT/Mozaic.entitlements" ]]; then
