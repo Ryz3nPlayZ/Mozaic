@@ -67,20 +67,43 @@
 
 ### Download
 
-Download the latest release from the [Releases](https://github.com/Ryz3nPlayZ/Mozaic/releases) page.
+1. Go to the [latest release](https://github.com/Ryz3nPlayZ/Mozaic/releases/latest) page.
+2. Under **Assets**, click the file whose name ends in `.dmg` to download it.
+3. Open the downloaded `.dmg` file from your **Downloads** folder.
+4. In the window that appears, drag the **Mozaic** icon onto the **Applications** folder.
+5. Open **Mozaic** from your **Applications** folder.
+
+### Opening Mozaic for the First Time
+
+Mozaic isn't signed or notarized by Apple, so the first time you open it, macOS shows a warning that the app can't be verified. This is expected. Use **one** of the options below to allow it. You only need to do this once.
+
+**Option 1: System Settings (no Terminal needed)**
+
+1. Try to open Mozaic once, then close the warning by clicking **Done**.
+2. Open **System Settings** and go to **Privacy & Security**.
+3. Scroll down to the **Security** section and click **Open Anyway** next to Mozaic.
+4. Click **Open Anyway** again in the pop-up, then enter your password or use Touch ID.
+
+**Option 2: Terminal**
+
+1. Open **Terminal**: press `⌘ Space`, type `Terminal`, and press Return.
+2. Copy the command below, paste it into the Terminal window, and press Return:
+
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Mozaic.app
+   ```
+
+3. Open Mozaic from your **Applications** folder as usual.
 
 ### Homebrew
+
+If you already use [Homebrew](https://brew.sh), you can install Mozaic with:
 
 ```bash
 brew install sozercan/repo/mozaic
 ```
 
-> **Note:** The app is not signed.
-> If you downloaded the app manually, you can clear extended attributes (including quarantine) with:
->
-> ```bash
-> xattr -cr /Applications/Mozaic.app
-> ```
+Homebrew handles the security warning for you, so you can skip the steps above.
 
 ## Contributing
 

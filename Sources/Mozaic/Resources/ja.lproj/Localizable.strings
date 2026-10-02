@@ -107,6 +107,7 @@
 "Continue" = "続ける";
 "Continue Watching" = "続きから視聴";
 "Control playback with your keyboard" = "キーボードで再生を操作";
+"Controls appear when you move the pointer over the video and fade out while it plays." = "動画の上でポインタを動かすとコントロールが表示され、再生中はフェードアウトします。";
 "Could not create AI session" = "AI セッションを作成できませんでした";
 "Couldn't capture Mozaic's audio (status %d). Check Screen & System Audio Recording permission in System Settings." = "Mozaic のオーディオをキャプチャできませんでした（ステータス %d）。システム設定の「画面とシステムオーディオの録音」権限を確認してください。";
 "Couldn't configure the audio unit (%lld)." = "オーディオユニットを構成できませんでした（%lld）。";
@@ -339,11 +340,11 @@
 "Open the command bar to control music with natural language. Try saying \"play something chill\" or \"add jazz to queue\"." = "自然な言葉で音楽を操作するにはコマンドバーを開きます。「play something chill」や「add jazz to queue」のように話しかけてみてください。";
 "Options…" = "オプション…";
 "Output" = "出力";
-"Passkey sign-in is not available in this window. Google will ask for your password or another sign-in method instead." = "このウィンドウではパスキーによるサインインを利用できません。代わりに Google がパスワードまたは別のサインイン方法を求めます。";
 "Pause" = "一時停止";
 "Permission needed" = "権限が必要です";
 "Piano" = "ピアノ";
 "Picture in Picture" = "ピクチャ・イン・ピクチャ";
+"Place the playback controls on the video instead of in the bar at the bottom of the window" = "再生コントロールをウィンドウ下部のバーではなく動画上に配置";
 "Play" = "再生";
 "Play All" = "すべて再生";
 "Play Latest" = "最新を再生";
@@ -355,6 +356,7 @@
 "Playback Audio Quality" = "再生オーディオ品質";
 "Playback position" = "再生位置";
 "Played" = "再生済み";
+"Player Controls" = "プレイヤーのコントロール";
 "Playing" = "再生中";
 "Playlist" = "プレイリスト";
 "Playlist not found" = "プレイリストが見つかりません";
@@ -436,6 +438,7 @@
 "Shorts" = "ショート";
 "Shorts from your feed appear here." = "フィードのショートがここに表示されます。";
 "Show All" = "すべて表示";
+"Show Controls on Video" = "動画上にコントロールを表示";
 "Show Large Artwork" = "大きなアートワークを表示";
 "Show Lyrics" = "歌詞を表示";
 "Show Now Playing Notifications" = "再生中の通知を表示";

@@ -103,6 +103,7 @@
 "Continue" = "Continuer";
 "Continue Watching" = "Continuer à regarder";
 "Control playback with your keyboard" = "Contrôlez la lecture avec votre clavier";
+"Controls appear when you move the pointer over the video and fade out while it plays." = "Les commandes apparaissent lorsque vous déplacez le pointeur sur la vidéo et s'estompent pendant la lecture.";
 "Could not create AI session" = "Impossible de créer la session IA";
 "Couldn't capture Mozaic's audio (status %d). Check Screen & System Audio Recording permission in System Settings." = "Impossible de capturer l'audio de Mozaic (état %d). Vérifiez l'autorisation Enregistrement de l'écran et de l'audio système dans Réglages Système.";
 "Couldn't configure the audio unit (%lld)." = "Impossible de configurer l'unité audio (%lld).";
@@ -334,11 +335,11 @@
 "Open the command bar to control music with natural language. Try saying \"play something chill\" or \"add jazz to queue\"." = "Ouvrez la barre de commandes pour contrôler la musique en langage naturel. Essayez par exemple \"play something chill\" ou \"add jazz to queue\".";
 "Options…" = "Options…";
 "Output" = "Sortie";
-"Passkey sign-in is not available in this window. Google will ask for your password or another sign-in method instead." = "La connexion par clé d'identification n'est pas disponible dans cette fenêtre. Google vous demandera votre mot de passe ou une autre méthode de connexion à la place.";
 "Pause" = "Pause";
 "Permission needed" = "Autorisation requise";
 "Piano" = "Piano";
 "Picture in Picture" = "Image dans l'image";
+"Place the playback controls on the video instead of in the bar at the bottom of the window" = "Placer les commandes de lecture sur la vidéo plutôt que dans la barre en bas de la fenêtre";
 "Play" = "Lecture";
 "Play a song to view its lyrics here." = "Lancez un morceau pour voir ses paroles ici.";
 "Play All" = "Tout lire";
@@ -350,6 +351,7 @@
 "Playback Audio Quality" = "Qualité audio de lecture";
 "Playback position" = "Position de lecture";
 "Played" = "Lu";
+"Player Controls" = "Commandes du lecteur";
 "Playing" = "En lecture";
 "Playlist" = "Playlist";
 "Playlist not found" = "Playlist introuvable";
@@ -429,6 +431,7 @@
 "Show a notification when a new track starts playing" = "Afficher une notification lorsqu'un nouveau morceau commence";
 "Show a soft color glow, drawn from the video, behind the player" = "Afficher derrière le lecteur une douce lueur colorée tirée de la vidéo";
 "Show All" = "Tout afficher";
+"Show Controls on Video" = "Afficher les commandes sur la vidéo";
 "Show Large Artwork" = "Afficher une grande illustration";
 "Show Lyrics" = "Afficher les paroles";
 "Show more comments" = "Afficher plus de commentaires";
