@@ -37,6 +37,6 @@ swift run api-explorer action search '{"query":"never gonna give you up"}'
 
 - `Sources/APIExplorer/main.swift`
 - `docs/api-discovery.md`
-- `Tests/KasetTests/Fixtures/`
+- `Tests/MozaicTests/Fixtures/`
 
-Authenticated exploration reads the debug cookie export from `~/Library/Application Support/Kaset/cookies.dat`.
+Authenticated exploration reads the debug cookie export from `~/Library/Application Support/Mozaic/cookies.dat`.

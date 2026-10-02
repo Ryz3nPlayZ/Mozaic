@@ -11,7 +11,7 @@ on:
       - "**.swift"
       - "Package.swift"
       - "Info.plist"
-      - "Kaset.entitlements"
+      - "Mozaic.entitlements"
       - "Sources/**"
       - "Tests/**"
       - "Scripts/**"
@@ -21,7 +21,7 @@ on:
       - "**.swift"
       - "Package.swift"
       - "Info.plist"
-      - "Kaset.entitlements"
+      - "Mozaic.entitlements"
       - "Sources/**"
       - "Tests/**"
       - "Scripts/**"
@@ -61,7 +61,7 @@ jobs:
 
       - name: Build app
         env:
-          KASET_SIGNING: adhoc
+          MOZAIC_SIGNING: adhoc
           ARCHES: "arm64 x86_64"
         run: |
           # Override version for dev builds
@@ -70,14 +70,14 @@ jobs:
           Scripts/build-app.sh release
 
       - name: Verify packaged app
-        run: Scripts/verify-release-app.sh .build/app/Kaset.app
+        run: Scripts/verify-release-app.sh .build/app/Mozaic.app
 
       - name: Create DMG
         run: |
-          APP_PATH=".build/app/Kaset.app"
+          APP_PATH=".build/app/Mozaic.app"
 
           if [ ! -d "$APP_PATH" ]; then
-            echo "Error: Could not find Kaset.app"
+            echo "Error: Could not find Mozaic.app"
             exit 1
           fi
 
@@ -88,15 +88,15 @@ jobs:
           cp -R "$APP_PATH" dmg_contents/
 
           # Create DMG
-          hdiutil create -volname "Kaset-dev" \
+          hdiutil create -volname "Mozaic-dev" \
             -srcfolder dmg_contents \
             -ov -format UDZO \
-            kaset-dev.dmg
+            mozaic-dev.dmg
 
       - name: Upload DMG
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         if: github.event_name != 'pull_request'
         with:
-          name: kaset-dev-${{ steps.slug.outputs.sha_short }}
-          path: kaset-dev.dmg
+          name: mozaic-dev-${{ steps.slug.outputs.sha_short }}
+          path: mozaic-dev.dmg
           retention-days: 30

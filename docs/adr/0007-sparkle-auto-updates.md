@@ -73,7 +73,7 @@ We integrate [Sparkle 2.x](https://sparkle-project.org/) for automatic update ch
               ┌───────────────────────────────┐
               │   GitHub (appcast.xml)        │
               │   https://raw.githubusercontent│
-              │   .com/sozercan/mozaic/main/   │
+              │   .com/Ryz3nPlayZ/Mozaic/main/  │
               │   appcast.xml                 │
               └───────────────────────────────┘
 ```
@@ -138,7 +138,7 @@ We integrate [Sparkle 2.x](https://sparkle-project.org/) for automatic update ch
 
 ```xml
 <key>SUFeedURL</key>
-<string>https://raw.githubusercontent.com/sozercan/mozaic/main/appcast.xml</string>
+<string>https://raw.githubusercontent.com/Ryz3nPlayZ/Mozaic/main/appcast.xml</string>
 
 <key>SUPublicEDKey</key>
 <string>YOUR_BASE64_ENCODED_PUBLIC_KEY</string>

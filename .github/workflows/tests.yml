@@ -11,7 +11,7 @@ on:
       - "**.swift"
       - "Package.swift"
       - "Info.plist"
-      - "Kaset.entitlements"
+      - "Mozaic.entitlements"
       - "Sources/**"
       - "Scripts/**"
       - "Tests/**"
@@ -22,7 +22,7 @@ on:
       - "**.swift"
       - "Package.swift"
       - "Info.plist"
-      - "Kaset.entitlements"
+      - "Mozaic.entitlements"
       - "Sources/**"
       - "Scripts/**"
       - "Tests/**"
@@ -143,27 +143,27 @@ jobs:
 
       - name: Build app bundle for UI tests
         env:
-          KASET_SIGNING: adhoc
+          MOZAIC_SIGNING: adhoc
           # Xcode 26 actool cannot distill Icon Composer assets on macos-15
           # runners, but UI tests only need a launchable bundle.
-          KASET_SKIP_MAIN_ASSETS: ${{ matrix.os == 'macos-15' && '1' || '0' }}
+          MOZAIC_SKIP_MAIN_ASSETS: ${{ matrix.os == 'macos-15' && '1' || '0' }}
         run: Scripts/build-app.sh debug
 
       - name: Verify packaged app
-        run: Scripts/verify-release-app.sh .build/app/Kaset.app
+        run: Scripts/verify-release-app.sh .build/app/Mozaic.app
 
       - name: Install app for UI tests
         run: |
-          sudo cp -R .build/app/Kaset.app /Applications/Kaset.app
+          sudo cp -R .build/app/Mozaic.app /Applications/Mozaic.app
           # Register with Launch Services so XCUIApplication can find it
-          /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f /Applications/Kaset.app
+          /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f /Applications/Mozaic.app
 
       - name: Run UI tests
         run: |
           set -o pipefail
           xcodebuild \
-            -project KasetUITests.xcodeproj \
-            -scheme KasetUITests \
+            -project MozaicUITests.xcodeproj \
+            -scheme MozaicUITests \
             -destination 'platform=macOS' \
             -derivedDataPath ./build \
             CODE_SIGN_IDENTITY="-" \

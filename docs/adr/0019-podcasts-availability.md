@@ -16,7 +16,7 @@ itself redirects `music.youtube.com/podcasts` to home in those regions.
 Mozaic previously rendered the Podcasts row in the sidebar unconditionally.
 Users in unsupported regions saw `Server Error — Something went wrong (Error
 404)` whenever they opened the tab (issue
-[#100](https://github.com/sozercan/mozaic/issues/100)). Region is determined
+[#100](https://github.com/sozercan/kaset/issues/100)). Region is determined
 by YouTube from cookies/IP, not by the `hl` parameter, so the app cannot
 override it client-side.
 

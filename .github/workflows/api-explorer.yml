@@ -62,7 +62,7 @@ jobs:
       - name: Smoke-test - auth status (offline, expect 'not authenticated')
         run: |
           set -euo pipefail
-          # CI has no Kaset cookie backup, so this should report no auth and exit 0.
+          # CI has no Mozaic cookie backup, so this should report no auth and exit 0.
           OUT=$(swift run -c release -q api-explorer auth)
           echo "$OUT"
 

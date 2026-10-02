@@ -134,7 +134,7 @@ jobs:
             exit 0
           fi
 
-          KEYCHAIN_PATH="$RUNNER_TEMP/kaset-signing.keychain-db"
+          KEYCHAIN_PATH="$RUNNER_TEMP/mozaic-signing.keychain-db"
           CERT_PATH="$RUNNER_TEMP/cert.p12"
 
           if ! printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"; then
@@ -184,7 +184,7 @@ jobs:
 
       - name: Build release app
         env:
-          KASET_SIGNING: ${{ steps.import_cert.outputs.signing_mode }}
+          MOZAIC_SIGNING: ${{ steps.import_cert.outputs.signing_mode }}
           APP_IDENTITY: ${{ steps.import_cert.outputs.identity }}
           ARCHES: "arm64 x86_64"
         run: |
@@ -199,7 +199,7 @@ jobs:
           if [ "${{ steps.import_cert.outputs.signing_mode }}" = "developer-id" ]; then
             VERIFY_ARGS+=(--require-developer-id)
           fi
-          Scripts/verify-release-app.sh "${VERIFY_ARGS[@]}" .build/app/Kaset.app
+          Scripts/verify-release-app.sh "${VERIFY_ARGS[@]}" .build/app/Mozaic.app
 
       - name: Cache Homebrew
         id: cache-homebrew
@@ -215,15 +215,15 @@ jobs:
 
       - name: Create DMG
         run: |
-          APP_PATH=".build/app/Kaset.app"
+          APP_PATH=".build/app/Mozaic.app"
 
           if [ ! -d "$APP_PATH" ]; then
-            echo "Error: Could not find Kaset.app"
+            echo "Error: Could not find Mozaic.app"
             exit 1
           fi
 
           echo "Found app at: $APP_PATH"
-          rm -f kaset.dmg || true
+          rm -f mozaic.dmg || true
 
           # Verify app version matches expected version
           PLIST_VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP_PATH/Contents/Info.plist")
@@ -236,8 +236,8 @@ jobs:
           fi
 
           # Verify Universal Binary (Intel + Apple Silicon)
-          if [ -f "$APP_PATH/Contents/MacOS/Kaset" ]; then
-            ARCHS=$(lipo -archs "$APP_PATH/Contents/MacOS/Kaset" 2>/dev/null || echo "unknown")
+          if [ -f "$APP_PATH/Contents/MacOS/Mozaic" ]; then
+            ARCHS=$(lipo -archs "$APP_PATH/Contents/MacOS/Mozaic" 2>/dev/null || echo "unknown")
           else
             ARCHS="unknown"
           fi
@@ -249,15 +249,15 @@ jobs:
 
           # Create styled DMG with Applications symlink
           create-dmg \
-            --volname "Kaset" \
+            --volname "Mozaic" \
             --window-pos 200 120 \
             --window-size 660 400 \
             --icon-size 100 \
-            --icon "Kaset.app" 180 190 \
+            --icon "Mozaic.app" 180 190 \
             --app-drop-link 480 190 \
-            --hide-extension "Kaset.app" \
+            --hide-extension "Mozaic.app" \
             --no-internet-enable \
-            kaset.dmg \
+            mozaic.dmg \
             "$APP_PATH"
 
       - name: Determine artifact name
@@ -276,10 +276,10 @@ jobs:
           fi
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "filename=kaset-$TAG.dmg" >> "$GITHUB_OUTPUT"
+          echo "filename=mozaic-$TAG.dmg" >> "$GITHUB_OUTPUT"
 
       - name: Rename DMG
-        run: mv kaset.dmg "${{ steps.artifact.outputs.filename }}"
+        run: mv mozaic.dmg "${{ steps.artifact.outputs.filename }}"
 
       - name: Sign and notarize DMG
         env:
@@ -352,7 +352,7 @@ jobs:
           fi
 
           # Write private key to a runner-temp file and always remove it before the step exits.
-          SPARKLE_KEY_FILE=$(mktemp "$RUNNER_TEMP/kaset-sparkle-key.XXXXXX")
+          SPARKLE_KEY_FILE=$(mktemp "$RUNNER_TEMP/mozaic-sparkle-key.XXXXXX")
           trap 'rm -f "$SPARKLE_KEY_FILE"' EXIT
           printf '%s' "$SPARKLE_PRIVATE_KEY" > "$SPARKLE_KEY_FILE"
           chmod 600 "$SPARKLE_KEY_FILE"
@@ -441,7 +441,7 @@ jobs:
       - name: Checkout Homebrew tap repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
-          repository: sozercan/homebrew-repo
+          repository: Ryz3nPlayZ/homebrew-repo
           token: ${{ secrets.HOMEBREW_REPO_TOKEN }}
           path: homebrew-repo
           fetch-depth: 0
@@ -455,15 +455,15 @@ jobs:
 
           # Update the cask file
           mkdir -p Casks
-          cat > Casks/kaset.rb << EOF
-          cask "kaset" do
+          cat > Casks/mozaic.rb << EOF
+          cask "mozaic" do
             version "$VERSION"
             sha256 "${{ steps.sha256.outputs.sha256 }}"
 
-            url "https://github.com/sozercan/kaset/releases/download/v#{version}/kaset-v#{version}.dmg"
-            name "Kaset"
+            url "https://github.com/Ryz3nPlayZ/Mozaic/releases/download/v#{version}/mozaic-v#{version}.dmg"
+            name "Mozaic"
             desc "Native YouTube Music client"
-            homepage "https://github.com/sozercan/kaset"
+            homepage "https://github.com/Ryz3nPlayZ/Mozaic"
 
             auto_updates true
             # Homebrew casks can gate on macOS release symbols, but not this
@@ -471,24 +471,24 @@ jobs:
             # Sparkle's appcast enforce 15.4 at launch/update time.
             depends_on macos: :sequoia
 
-            app "Kaset.app"
+            app "Mozaic.app"
 
             postflight_steps do
               run "/usr/bin/xattr", args: ["-cr", "{{appdir}}/Mozaic.app"], sudo: false
             end
 
             zap trash: [
-              "~/Library/Application Support/Kaset",
-              "~/Library/Caches/com.sertacozercan.Kaset",
-              "~/Library/Preferences/com.sertacozercan.Kaset.plist",
-              "~/Library/Saved Application State/com.sertacozercan.Kaset.savedState",
-              "~/Library/WebKit/com.sertacozercan.Kaset",
+              "~/Library/Application Support/Mozaic",
+              "~/Library/Caches/com.zemuliu.Mozaic",
+              "~/Library/Preferences/com.zemuliu.Mozaic.plist",
+              "~/Library/Saved Application State/com.zemuliu.Mozaic.savedState",
+              "~/Library/WebKit/com.zemuliu.Mozaic",
             ]
           end
           EOF
 
-          git add Casks/kaset.rb
-          git diff --cached --quiet || git commit -m "Update kaset to ${TAG}"
+          git add Casks/mozaic.rb
+          git diff --cached --quiet || git commit -m "Update mozaic to ${TAG}"
           git push origin main
 
       - name: Update Appcast
@@ -525,9 +525,9 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
               <channel>
-                  <title>Kaset Updates</title>
+                  <title>Mozaic Updates</title>
                   <link>https://github.com/${{ github.repository }}/releases</link>
-                  <description>Most recent updates for Kaset, a native macOS YouTube Music client.</description>
+                  <description>Most recent updates for Mozaic, a native macOS YouTube Music client.</description>
                   <language>en</language>
 
                   <item>

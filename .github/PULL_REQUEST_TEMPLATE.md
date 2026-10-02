@@ -53,7 +53,7 @@ new issue using the "Prompt Request" issue template instead of a pull request.
 
 <!-- Describe how you tested these changes -->
 
-- [ ] Unit tests pass (`xcodebuild test -only-testing:KasetTests`)
+- [ ] Unit tests pass (`xcodebuild test -only-testing:MozaicTests`)
 - [ ] Manual testing performed
 - [ ] UI tested on macOS 26+
 
