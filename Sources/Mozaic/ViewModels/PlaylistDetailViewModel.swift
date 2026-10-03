@@ -773,6 +773,8 @@ extension PlaylistDetailViewModel {
     }
 
     private func performRefresh() async -> Bool {
+        // Bypass cached pages so edits made in YouTube Music elsewhere appear.
+        LibraryMutationActions.invalidateResponseCaches()
         self.cancelAllLiveSyncTasks()
         self.replacePlaylistDetail(nil)
         self.hasMore = false

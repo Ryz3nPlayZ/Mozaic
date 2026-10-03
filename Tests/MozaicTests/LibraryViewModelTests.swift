@@ -260,6 +260,17 @@ struct LibraryViewModelTests {
         #expect(self.viewModel.libraryPodcastIds == Set(["MPSPPL2", "MPSPPL3"]))
     }
 
+    @Test("Refresh drops cached browse responses so remote changes appear")
+    func refreshDropsCachedBrowseResponses() async {
+        let cacheKey = "browse:library-refresh-test"
+        APICache.shared.set(key: cacheKey, data: ["cached": true], ttl: APICache.TTL.library)
+        #expect(APICache.shared.get(key: cacheKey) != nil)
+
+        await self.viewModel.refresh()
+
+        #expect(APICache.shared.get(key: cacheKey) == nil)
+    }
+
     @Test("Refresh keeps existing library content visible while background load runs")
     func refreshKeepsExistingContentVisibleWhileLoading() async {
         self.mockClient.libraryPlaylists = [TestFixtures.makePlaylist(id: "VL1", title: "Playlist 1")]

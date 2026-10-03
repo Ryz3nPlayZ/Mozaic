@@ -602,8 +602,12 @@ final class LibraryViewModel {
         }
     }
 
-    /// Refreshes library content.
+    /// Refreshes library content from the server.
+    ///
+    /// Drops cached responses first so playlists and saves made in YouTube Music
+    /// on another device show up instead of a cached copy.
     func refresh() async {
+        LibraryMutationActions.invalidateResponseCaches()
         self.markLibraryStateChanged()
 
         if self.loadingState == .loading || self.loadingState == .loadingMore {
