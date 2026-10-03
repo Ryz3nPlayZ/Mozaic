@@ -579,3 +579,29 @@
 "Ad Blocking" = "Advertentieblokkering";
 "Remove ads from songs and videos during playback" = "Advertenties uit nummers en video's verwijderen tijdens het afspelen";
 "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Advertenties worden verwijderd voordat ze laden en advertenties die toch starten worden overgeslagen. Geldt vanaf het volgende nummer of de volgende video.";
+
+// Playlist import
+"Import Playlist" = "Afspeellijst importeren";
+"Finding songs on YouTube Music…" = "Nummers zoeken op YouTube Music…";
+"%lld of %lld" = "%1$lld van %2$lld";
+"Creating playlist…" = "Afspeellijst maken…";
+"Bring a Spotify playlist to YouTube Music" = "Zet een Spotify-afspeellijst over naar YouTube Music";
+"Mozaic finds each song on YouTube Music and saves them to a new private playlist in your account, so it shows up everywhere you use YouTube Music." = "Mozaic zoekt elk nummer op in YouTube Music en bewaart ze in een nieuwe privéafspeellijst in je account, zodat hij overal verschijnt waar je YouTube Music gebruikt.";
+"Choose File…" = "Kies bestand…";
+"Export a playlist as CSV with Exportify, or use the JSON files from Spotify's account data download. Text files with one “Artist - Title” per line work too." = "Exporteer een afspeellijst als CSV met Exportify, of gebruik de JSON-bestanden uit de gegevensdownload van je Spotify-account. Tekstbestanden met één ‘Artiest - Titel’ per regel werken ook.";
+"Open Exportify" = "Open Exportify";
+"Choose Another File" = "Kies ander bestand";
+"Find Songs" = "Zoek nummers";
+"Found %lld of %lld songs." = "%1$lld van %2$lld nummers gevonden.";
+"Not found on YouTube Music:" = "Niet gevonden op YouTube Music:";
+"Start Over" = "Opnieuw beginnen";
+"Create Playlist" = "Maak afspeellijst";
+"Saved “%@” to your library." = "‘%@’ bewaard in je bibliotheek.";
+"Open Playlist" = "Open afspeellijst";
+"Playlist Name" = "Naam afspeellijst";
+"Couldn't search YouTube Music. Check your connection and sign-in, then try again." = "Kan niet zoeken in YouTube Music. Controleer je verbinding en of je bent ingelogd, en probeer het opnieuw.";
+"This file isn't a playlist export Mozaic can read." = "Dit bestand is geen afspeellijstexport die Mozaic kan lezen.";
+"No songs were found in this playlist." = "Er zijn geen nummers gevonden in deze afspeellijst.";
+"Liked Songs" = "Leuk gevonden nummers";
+"Imported Playlist" = "Geïmporteerde afspeellijst";
+"Import a Spotify playlist into YouTube Music" = "Importeer een Spotify-afspeellijst naar YouTube Music";

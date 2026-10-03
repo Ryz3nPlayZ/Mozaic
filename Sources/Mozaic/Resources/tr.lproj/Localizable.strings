@@ -579,3 +579,29 @@
 "Ad Blocking" = "Reklam Engelleme";
 "Remove ads from songs and videos during playback" = "Oynatma sırasında şarkı ve videolardaki reklamları kaldır";
 "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Reklamlar yüklenmeden kaldırılır, yine de başlayanlar atlanır. Bir sonraki şarkı veya videodan itibaren geçerlidir.";
+
+// Playlist import
+"Import Playlist" = "Çalma Listesini İçe Aktar";
+"Finding songs on YouTube Music…" = "YouTube Music'te şarkılar aranıyor…";
+"%lld of %lld" = "%1$lld / %2$lld";
+"Creating playlist…" = "Çalma listesi oluşturuluyor…";
+"Bring a Spotify playlist to YouTube Music" = "Spotify çalma listenizi YouTube Music'e taşıyın";
+"Mozaic finds each song on YouTube Music and saves them to a new private playlist in your account, so it shows up everywhere you use YouTube Music." = "Mozaic her şarkıyı YouTube Music'te bulur ve hesabınızdaki yeni bir özel çalma listesine kaydeder; böylece YouTube Music'i kullandığınız her yerde görünür.";
+"Choose File…" = "Dosya Seç…";
+"Export a playlist as CSV with Exportify, or use the JSON files from Spotify's account data download. Text files with one “Artist - Title” per line work too." = "Exportify ile bir çalma listesini CSV olarak dışa aktarın veya Spotify hesap verisi indirmenizdeki JSON dosyalarını kullanın. Her satırda bir “Sanatçı - Başlık” bulunan metin dosyaları da çalışır.";
+"Open Exportify" = "Exportify'ı Aç";
+"Choose Another File" = "Başka Dosya Seç";
+"Find Songs" = "Şarkıları Bul";
+"Found %lld of %lld songs." = "%2$lld şarkıdan %1$lld tanesi bulundu.";
+"Not found on YouTube Music:" = "YouTube Music'te bulunamadı:";
+"Start Over" = "Baştan Başla";
+"Create Playlist" = "Çalma Listesi Oluştur";
+"Saved “%@” to your library." = "“%@” kitaplığınıza kaydedildi.";
+"Open Playlist" = "Çalma Listesini Aç";
+"Playlist Name" = "Çalma Listesi Adı";
+"Couldn't search YouTube Music. Check your connection and sign-in, then try again." = "YouTube Music'te arama yapılamadı. Bağlantınızı ve oturumunuzu kontrol edip tekrar deneyin.";
+"This file isn't a playlist export Mozaic can read." = "Bu dosya, Mozaic'in okuyabildiği bir çalma listesi dışa aktarımı değil.";
+"No songs were found in this playlist." = "Bu çalma listesinde şarkı bulunamadı.";
+"Liked Songs" = "Beğenilen Şarkılar";
+"Imported Playlist" = "İçe Aktarılan Çalma Listesi";
+"Import a Spotify playlist into YouTube Music" = "Bir Spotify çalma listesini YouTube Music'e aktar";

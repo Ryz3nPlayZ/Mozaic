@@ -579,3 +579,29 @@
 "Ad Blocking" = "Pemblokiran Iklan";
 "Remove ads from songs and videos during playback" = "Hapus iklan dari lagu dan video saat diputar";
 "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Iklan dihapus sebelum dimuat, dan iklan yang tetap diputar akan dilewati. Berlaku mulai lagu atau video berikutnya.";
+
+// Playlist import
+"Import Playlist" = "Impor Daftar Putar";
+"Finding songs on YouTube Music…" = "Mencari lagu di YouTube Music…";
+"%lld of %lld" = "%1$lld dari %2$lld";
+"Creating playlist…" = "Membuat daftar putar…";
+"Bring a Spotify playlist to YouTube Music" = "Bawa daftar putar Spotify ke YouTube Music";
+"Mozaic finds each song on YouTube Music and saves them to a new private playlist in your account, so it shows up everywhere you use YouTube Music." = "Mozaic mencari setiap lagu di YouTube Music dan menyimpannya ke daftar putar pribadi baru di akun Anda, sehingga muncul di mana pun Anda menggunakan YouTube Music.";
+"Choose File…" = "Pilih File…";
+"Export a playlist as CSV with Exportify, or use the JSON files from Spotify's account data download. Text files with one “Artist - Title” per line work too." = "Ekspor daftar putar sebagai CSV dengan Exportify, atau gunakan file JSON dari unduhan data akun Spotify Anda. File teks dengan satu “Artis - Judul” per baris juga bisa digunakan.";
+"Open Exportify" = "Buka Exportify";
+"Choose Another File" = "Pilih File Lain";
+"Find Songs" = "Cari Lagu";
+"Found %lld of %lld songs." = "Ditemukan %1$lld dari %2$lld lagu.";
+"Not found on YouTube Music:" = "Tidak ditemukan di YouTube Music:";
+"Start Over" = "Mulai Ulang";
+"Create Playlist" = "Buat Daftar Putar";
+"Saved “%@” to your library." = "“%@” disimpan ke pustaka Anda.";
+"Open Playlist" = "Buka Daftar Putar";
+"Playlist Name" = "Nama Daftar Putar";
+"Couldn't search YouTube Music. Check your connection and sign-in, then try again." = "Tidak dapat mencari di YouTube Music. Periksa koneksi dan status masuk Anda, lalu coba lagi.";
+"This file isn't a playlist export Mozaic can read." = "File ini bukan ekspor daftar putar yang dapat dibaca Mozaic.";
+"No songs were found in this playlist." = "Tidak ada lagu yang ditemukan di daftar putar ini.";
+"Liked Songs" = "Lagu yang Disukai";
+"Imported Playlist" = "Daftar Putar yang Diimpor";
+"Import a Spotify playlist into YouTube Music" = "Impor daftar putar Spotify ke YouTube Music";

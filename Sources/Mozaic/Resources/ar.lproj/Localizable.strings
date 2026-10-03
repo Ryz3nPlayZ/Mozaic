@@ -579,3 +579,29 @@
 "Ad Blocking" = "حظر الإعلانات";
 "Remove ads from songs and videos during playback" = "إزالة الإعلانات من الأغاني ومقاطع الفيديو أثناء التشغيل";
 "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "تُزال الإعلانات قبل تحميلها، ويتم تخطي أي إعلان يبدأ رغم ذلك. يسري التغيير من الأغنية أو الفيديو التالي.";
+
+// Playlist import
+"Import Playlist" = "استيراد قائمة تشغيل";
+"Finding songs on YouTube Music…" = "جارٍ البحث عن الأغاني في YouTube Music…";
+"%lld of %lld" = "%1$lld من %2$lld";
+"Creating playlist…" = "جارٍ إنشاء قائمة التشغيل…";
+"Bring a Spotify playlist to YouTube Music" = "انقل قائمة تشغيل من Spotify إلى YouTube Music";
+"Mozaic finds each song on YouTube Music and saves them to a new private playlist in your account, so it shows up everywhere you use YouTube Music." = "يبحث Mozaic عن كل أغنية في YouTube Music ويحفظها في قائمة تشغيل خاصة جديدة في حسابك، لتظهر في كل مكان تستخدم فيه YouTube Music.";
+"Choose File…" = "اختيار ملف…";
+"Export a playlist as CSV with Exportify, or use the JSON files from Spotify's account data download. Text files with one “Artist - Title” per line work too." = "صدِّر قائمة تشغيل بتنسيق CSV باستخدام Exportify، أو استخدم ملفات JSON من تنزيل بيانات حساب Spotify. تعمل أيضًا الملفات النصية التي تحتوي على “الفنان - العنوان” في كل سطر.";
+"Open Exportify" = "فتح Exportify";
+"Choose Another File" = "اختيار ملف آخر";
+"Find Songs" = "البحث عن الأغاني";
+"Found %lld of %lld songs." = "تم العثور على %1$lld من %2$lld أغنية.";
+"Not found on YouTube Music:" = "غير موجودة في YouTube Music:";
+"Start Over" = "البدء من جديد";
+"Create Playlist" = "إنشاء قائمة تشغيل";
+"Saved “%@” to your library." = "تم حفظ “%@” في مكتبتك.";
+"Open Playlist" = "فتح قائمة التشغيل";
+"Playlist Name" = "اسم قائمة التشغيل";
+"Couldn't search YouTube Music. Check your connection and sign-in, then try again." = "تعذّر البحث في YouTube Music. تحقق من اتصالك ومن تسجيل الدخول، ثم حاول مرة أخرى.";
+"This file isn't a playlist export Mozaic can read." = "هذا الملف ليس قائمة تشغيل مُصدَّرة يمكن لـ Mozaic قراءتها.";
+"No songs were found in this playlist." = "لم يتم العثور على أغانٍ في قائمة التشغيل هذه.";
+"Liked Songs" = "الأغاني التي أعجبتني";
+"Imported Playlist" = "قائمة تشغيل مستوردة";
+"Import a Spotify playlist into YouTube Music" = "استيراد قائمة تشغيل من Spotify إلى YouTube Music";

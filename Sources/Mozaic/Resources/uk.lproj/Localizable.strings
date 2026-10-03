@@ -579,3 +579,29 @@
 "Ad Blocking" = "Блокування реклами";
 "Remove ads from songs and videos during playback" = "Прибирати рекламу з пісень і відео під час відтворення";
 "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Реклама прибирається до завантаження, а та, що все ж починається, пропускається. Діє з наступної пісні чи відео.";
+
+// Playlist import
+"Import Playlist" = "Імпортувати плейлист";
+"Finding songs on YouTube Music…" = "Пошук пісень у YouTube Music…";
+"%lld of %lld" = "%1$lld з %2$lld";
+"Creating playlist…" = "Створення плейлиста…";
+"Bring a Spotify playlist to YouTube Music" = "Перенесіть плейлист зі Spotify до YouTube Music";
+"Mozaic finds each song on YouTube Music and saves them to a new private playlist in your account, so it shows up everywhere you use YouTube Music." = "Mozaic знаходить кожну пісню в YouTube Music і зберігає їх у новий приватний плейлист у вашому акаунті, щоб він був доступний скрізь, де ви користуєтеся YouTube Music.";
+"Choose File…" = "Вибрати файл…";
+"Export a playlist as CSV with Exportify, or use the JSON files from Spotify's account data download. Text files with one “Artist - Title” per line work too." = "Експортуйте плейлист у CSV за допомогою Exportify або використайте JSON-файли із завантаження даних акаунта Spotify. Підійдуть і текстові файли з одним рядком «Виконавець - Назва» на пісню.";
+"Open Exportify" = "Відкрити Exportify";
+"Choose Another File" = "Вибрати інший файл";
+"Find Songs" = "Знайти пісні";
+"Found %lld of %lld songs." = "Знайдено пісень: %1$lld з %2$lld.";
+"Not found on YouTube Music:" = "Не знайдено в YouTube Music:";
+"Start Over" = "Почати знову";
+"Create Playlist" = "Створити плейлист";
+"Saved “%@” to your library." = "Плейлист «%@» збережено в медіатеці.";
+"Open Playlist" = "Відкрити плейлист";
+"Playlist Name" = "Назва плейлиста";
+"Couldn't search YouTube Music. Check your connection and sign-in, then try again." = "Не вдалося виконати пошук у YouTube Music. Перевірте з’єднання та вхід в акаунт і спробуйте ще раз.";
+"This file isn't a playlist export Mozaic can read." = "Mozaic не може прочитати цей файл як експорт плейлиста.";
+"No songs were found in this playlist." = "У цьому плейлисті не знайдено пісень.";
+"Liked Songs" = "Вподобані пісні";
+"Imported Playlist" = "Імпортований плейлист";
+"Import a Spotify playlist into YouTube Music" = "Імпортувати плейлист Spotify до YouTube Music";

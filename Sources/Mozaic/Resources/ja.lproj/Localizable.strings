@@ -574,3 +574,29 @@
 "Ad Blocking" = "広告ブロック";
 "Remove ads from songs and videos during playback" = "再生中の曲と動画から広告を取り除きます";
 "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "広告は読み込まれる前に取り除かれ、それでも始まった広告はスキップされます。次の曲または動画から適用されます。";
+
+// Playlist import
+"Import Playlist" = "プレイリストをインポート";
+"Finding songs on YouTube Music…" = "YouTube Musicで曲を検索中…";
+"%lld of %lld" = "%1$lld / %2$lld";
+"Creating playlist…" = "プレイリストを作成中…";
+"Bring a Spotify playlist to YouTube Music" = "SpotifyのプレイリストをYouTube Musicへ";
+"Mozaic finds each song on YouTube Music and saves them to a new private playlist in your account, so it shows up everywhere you use YouTube Music." = "MozaicがYouTube Musicで各曲を探し、アカウントの新しい非公開プレイリストに保存します。YouTube Musicを使うすべての場所に表示されます。";
+"Choose File…" = "ファイルを選択…";
+"Export a playlist as CSV with Exportify, or use the JSON files from Spotify's account data download. Text files with one “Artist - Title” per line work too." = "ExportifyでプレイリストをCSVとして書き出すか、Spotifyのアカウントデータのダウンロードに含まれるJSONファイルを使用してください。1行に1つ「アーティスト - タイトル」と書いたテキストファイルも使えます。";
+"Open Exportify" = "Exportifyを開く";
+"Choose Another File" = "別のファイルを選択";
+"Find Songs" = "曲を検索";
+"Found %lld of %lld songs." = "%2$lld曲中%1$lld曲が見つかりました。";
+"Not found on YouTube Music:" = "YouTube Musicで見つからなかった曲:";
+"Start Over" = "最初からやり直す";
+"Create Playlist" = "プレイリストを作成";
+"Saved “%@” to your library." = "「%@」をライブラリに保存しました。";
+"Open Playlist" = "プレイリストを開く";
+"Playlist Name" = "プレイリスト名";
+"Couldn't search YouTube Music. Check your connection and sign-in, then try again." = "YouTube Musicを検索できませんでした。接続とログイン状態を確認してから、もう一度お試しください。";
+"This file isn't a playlist export Mozaic can read." = "このファイルはMozaicで読み込めるプレイリストのエクスポートではありません。";
+"No songs were found in this playlist." = "このプレイリストに曲が見つかりませんでした。";
+"Liked Songs" = "高く評価した曲";
+"Imported Playlist" = "インポートしたプレイリスト";
+"Import a Spotify playlist into YouTube Music" = "SpotifyのプレイリストをYouTube Musicにインポート";

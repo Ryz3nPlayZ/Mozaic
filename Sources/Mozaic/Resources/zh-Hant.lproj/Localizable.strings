@@ -577,3 +577,29 @@
 "Ad Blocking" = "廣告封鎖";
 "Remove ads from songs and videos during playback" = "播放時移除歌曲和影片中的廣告";
 "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "廣告會在載入前被移除，仍然開始播放的廣告會被略過。從下一首歌曲或下一部影片開始生效。";
+
+// Playlist import
+"Import Playlist" = "匯入播放清單";
+"Finding songs on YouTube Music…" = "正在 YouTube Music 上尋找歌曲…";
+"%lld of %lld" = "%1$lld / %2$lld";
+"Creating playlist…" = "正在建立播放清單…";
+"Bring a Spotify playlist to YouTube Music" = "將 Spotify 播放清單搬到 YouTube Music";
+"Mozaic finds each song on YouTube Music and saves them to a new private playlist in your account, so it shows up everywhere you use YouTube Music." = "Mozaic 會在 YouTube Music 上尋找每首歌曲，並將它們儲存到你帳號中的新私人播放清單，讓它出現在你使用 YouTube Music 的每個地方。";
+"Choose File…" = "選擇檔案…";
+"Export a playlist as CSV with Exportify, or use the JSON files from Spotify's account data download. Text files with one “Artist - Title” per line work too." = "使用 Exportify 將播放清單匯出為 CSV，或使用 Spotify 帳號資料下載中的 JSON 檔案。每行一個「藝人 - 標題」的文字檔也可以使用。";
+"Open Exportify" = "打開 Exportify";
+"Choose Another File" = "選擇其他檔案";
+"Find Songs" = "尋找歌曲";
+"Found %lld of %lld songs." = "已找到 %1$lld 首歌曲，共 %2$lld 首。";
+"Not found on YouTube Music:" = "在 YouTube Music 上找不到：";
+"Start Over" = "重新開始";
+"Create Playlist" = "建立播放清單";
+"Saved “%@” to your library." = "已將「%@」儲存到你的音樂庫。";
+"Open Playlist" = "打開播放清單";
+"Playlist Name" = "播放清單名稱";
+"Couldn't search YouTube Music. Check your connection and sign-in, then try again." = "無法搜尋 YouTube Music。請檢查網路連線和登入狀態，然後再試一次。";
+"This file isn't a playlist export Mozaic can read." = "這個檔案不是 Mozaic 可讀取的播放清單匯出檔。";
+"No songs were found in this playlist." = "這個播放清單中找不到歌曲。";
+"Liked Songs" = "喜歡的歌曲";
+"Imported Playlist" = "匯入的播放清單";
+"Import a Spotify playlist into YouTube Music" = "將 Spotify 播放清單匯入 YouTube Music";

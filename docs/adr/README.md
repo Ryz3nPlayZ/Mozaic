@@ -75,3 +75,4 @@ What becomes easier or more difficult because of this change?
 | [0038](0038-native-appkit-home-shelves.md) | Native AppKit cards for Home-style shelves | Accepted |
 | [1000](1000-built-in-playback-ad-blocker.md) | Built-in playback ad blocker (Mozaic) | Accepted |
 | [1001](1001-separate-notch-app.md) | Ship Mozaic Notch as a separate app (Mozaic) | Accepted |
+| [1002](1002-spotify-playlist-import.md) | Import Spotify playlists from export files (Mozaic) | Accepted |

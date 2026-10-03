@@ -56,6 +56,7 @@ struct LibraryView: View {
 
     @State private var navigationPath = NavigationPath()
     @State private var selectedFilter: LibraryFilter = .all
+    @State private var isImportingPlaylist = false
 
     private let libraryItemSize: CGFloat = 160
     private let libraryItemSpacing: CGFloat = 18
@@ -152,6 +153,11 @@ struct LibraryView: View {
         .refreshable {
             await self.viewModel.refresh()
         }
+        .sheet(isPresented: self.$isImportingPlaylist) {
+            PlaylistImportSheet(viewModel: PlaylistImportViewModel(client: self.viewModel.client)) { playlist in
+                self.navigationPath.append(playlist)
+            }
+        }
         .popsNavigationStackOnSidebarReselect(path: self.$navigationPath, for: .library)
     }
 
@@ -186,6 +192,13 @@ struct LibraryView: View {
                 self.filterChip(filter)
             }
             Spacer()
+            Button {
+                self.isImportingPlaylist = true
+            } label: {
+                Label(String(localized: "Import Playlist"), systemImage: "square.and.arrow.down")
+            }
+            .buttonStyle(.bordered)
+            .help(String(localized: "Import a Spotify playlist into YouTube Music"))
         }
     }
 

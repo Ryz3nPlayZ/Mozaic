@@ -579,3 +579,29 @@
 "Ad Blocking" = "Annonsblockering";
 "Remove ads from songs and videos during playback" = "Ta bort annonser från låtar och videor under uppspelning";
 "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Annonser tas bort innan de läses in, och de som ändå startar hoppas över. Gäller från nästa låt eller video.";
+
+// Playlist import
+"Import Playlist" = "Importera spellista";
+"Finding songs on YouTube Music…" = "Söker efter låtar på YouTube Music…";
+"%lld of %lld" = "%1$lld av %2$lld";
+"Creating playlist…" = "Skapar spellista…";
+"Bring a Spotify playlist to YouTube Music" = "Flytta en Spotify-spellista till YouTube Music";
+"Mozaic finds each song on YouTube Music and saves them to a new private playlist in your account, so it shows up everywhere you use YouTube Music." = "Mozaic hittar varje låt på YouTube Music och sparar dem i en ny privat spellista på ditt konto, så att den syns överallt där du använder YouTube Music.";
+"Choose File…" = "Välj fil…";
+"Export a playlist as CSV with Exportify, or use the JSON files from Spotify's account data download. Text files with one “Artist - Title” per line work too." = "Exportera en spellista som CSV med Exportify, eller använd JSON-filerna från Spotifys nedladdning av kontodata. Textfiler med en ”Artist - Titel” per rad fungerar också.";
+"Open Exportify" = "Öppna Exportify";
+"Choose Another File" = "Välj en annan fil";
+"Find Songs" = "Hitta låtar";
+"Found %lld of %lld songs." = "Hittade %1$lld av %2$lld låtar.";
+"Not found on YouTube Music:" = "Hittades inte på YouTube Music:";
+"Start Over" = "Börja om";
+"Create Playlist" = "Skapa spellista";
+"Saved “%@” to your library." = "”%@” sparades i ditt bibliotek.";
+"Open Playlist" = "Öppna spellista";
+"Playlist Name" = "Spellistans namn";
+"Couldn't search YouTube Music. Check your connection and sign-in, then try again." = "Det gick inte att söka på YouTube Music. Kontrollera anslutningen och inloggningen och försök sedan igen.";
+"This file isn't a playlist export Mozaic can read." = "Den här filen är inte en spellisteexport som Mozaic kan läsa.";
+"No songs were found in this playlist." = "Inga låtar hittades i den här spellistan.";
+"Liked Songs" = "Gillade låtar";
+"Imported Playlist" = "Importerad spellista";
+"Import a Spotify playlist into YouTube Music" = "Importera en Spotify-spellista till YouTube Music";

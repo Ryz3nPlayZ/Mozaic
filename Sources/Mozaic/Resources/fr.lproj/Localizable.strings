@@ -579,3 +579,29 @@
 "Ad Blocking" = "Blocage des publicités";
 "Remove ads from songs and videos during playback" = "Supprimer les publicités des morceaux et des vidéos pendant la lecture";
 "Ads are removed before they load, and any that still start are skipped. Takes effect from the next song or video." = "Les publicités sont supprimées avant leur chargement, et celles qui démarrent quand même sont ignorées. S’applique à partir du morceau ou de la vidéo suivante.";
+
+// Playlist import
+"Import Playlist" = "Importer une playlist";
+"Finding songs on YouTube Music…" = "Recherche des morceaux sur YouTube Music…";
+"%lld of %lld" = "%1$lld sur %2$lld";
+"Creating playlist…" = "Création de la playlist…";
+"Bring a Spotify playlist to YouTube Music" = "Transférez une playlist Spotify vers YouTube Music";
+"Mozaic finds each song on YouTube Music and saves them to a new private playlist in your account, so it shows up everywhere you use YouTube Music." = "Mozaic recherche chaque morceau sur YouTube Music et les enregistre dans une nouvelle playlist privée de votre compte, pour qu’elle apparaisse partout où vous utilisez YouTube Music.";
+"Choose File…" = "Choisir un fichier…";
+"Export a playlist as CSV with Exportify, or use the JSON files from Spotify's account data download. Text files with one “Artist - Title” per line work too." = "Exportez une playlist au format CSV avec Exportify, ou utilisez les fichiers JSON du téléchargement des données de votre compte Spotify. Les fichiers texte avec un « Artiste - Titre » par ligne fonctionnent aussi.";
+"Open Exportify" = "Ouvrir Exportify";
+"Choose Another File" = "Choisir un autre fichier";
+"Find Songs" = "Rechercher les morceaux";
+"Found %lld of %lld songs." = "%1$lld morceaux trouvés sur %2$lld.";
+"Not found on YouTube Music:" = "Introuvables sur YouTube Music :";
+"Start Over" = "Recommencer";
+"Create Playlist" = "Créer la playlist";
+"Saved “%@” to your library." = "« %@ » a été enregistrée dans votre bibliothèque.";
+"Open Playlist" = "Ouvrir la playlist";
+"Playlist Name" = "Nom de la playlist";
+"Couldn't search YouTube Music. Check your connection and sign-in, then try again." = "Impossible d’effectuer une recherche sur YouTube Music. Vérifiez votre connexion et votre identification, puis réessayez.";
+"This file isn't a playlist export Mozaic can read." = "Ce fichier n’est pas un export de playlist que Mozaic peut lire.";
+"No songs were found in this playlist." = "Aucun morceau n’a été trouvé dans cette playlist.";
+"Liked Songs" = "Titres likés";
+"Imported Playlist" = "Playlist importée";
+"Import a Spotify playlist into YouTube Music" = "Importer une playlist Spotify dans YouTube Music";
