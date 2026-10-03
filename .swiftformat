@@ -3,7 +3,7 @@
 
 # File options
 --swiftversion 6.0
---exclude .build,DerivedData,Packages
+--exclude .build,DerivedData,Packages,Notch
 
 # Format options
 --allman false

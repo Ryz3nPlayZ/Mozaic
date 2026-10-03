@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Creates a Mozaic.dmg containing the Mozaic app bundle and a shortcut to Applications, then mounts it.
+# Creates a Mozaic.dmg containing Mozaic.app, Mozaic Notch.app (when built with
+# Scripts/build-notch.sh), and a shortcut to Applications, then mounts it.
 
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD_DIR="$ROOT/.build/app"
 APP_PATH="$BUILD_DIR/Mozaic.app"
+NOTCH_APP_PATH="$BUILD_DIR/Mozaic Notch.app"
 STAGING_DIR="$BUILD_DIR/dmg-staging"
 DMG_PATH="$BUILD_DIR/Mozaic.dmg"
 
@@ -26,6 +28,12 @@ mkdir -p "$STAGING_DIR"
 # Copy app to staging
 echo "  → Copying Mozaic.app..."
 cp -R "$APP_PATH" "$STAGING_DIR/"
+if [[ -d "$NOTCH_APP_PATH" ]]; then
+  echo "  → Copying Mozaic Notch.app..."
+  cp -R "$NOTCH_APP_PATH" "$STAGING_DIR/"
+else
+  echo "  → Mozaic Notch.app not built; run Scripts/build-notch.sh to include it."
+fi
 
 # Create symlink to Applications folder
 echo "  → Creating Applications symlink..."
@@ -44,4 +52,4 @@ echo "✅ DMG created successfully at $DMG_PATH"
 echo "💿 Mounting DMG..."
 hdiutil attach "$DMG_PATH"
 
-echo "🎉 DMG mounted successfully! You can drag and drop Mozaic to your Applications folder."
+echo "🎉 DMG mounted successfully! Drag Mozaic (and Mozaic Notch) to your Applications folder."

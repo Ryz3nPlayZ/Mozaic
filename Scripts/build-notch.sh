@@ -1,31 +1,41 @@
 #!/usr/bin/env bash
-# Builds the standalone "Mozaic Notch.app" from the boring.notch fork and
-# packages it as "Mozaic Notch.dmg" next to Mozaic.app (see ADR-1001).
+# Builds the standalone "Mozaic Notch.app" from the vendored boring.notch fork
+# in Notch/ and places it next to Mozaic.app (see ADR-1001). Scripts/create-dmg.sh
+# and the release workflow package both apps into one DMG.
 #
 # The notch is its own app with its own bundle ID, usage strings, entitlements,
 # and Sparkle feed, so it owns its TCC identity. Do not embed it in Mozaic.app.
 #
 # Env:
-#   NOTCH_ROOT      boring.notch checkout (default: ../boring.notch)
+#   NOTCH_ROOT      boring.notch fork checkout (default: Notch/)
 #   MOZAIC_SIGNING  adhoc | dev | developer-id | unsigned (default: dev)
 #   APP_IDENTITY    explicit codesign identity
+#   ARCHES          architectures to build, e.g. "arm64 x86_64" (default: host)
+#
+# The notch ships with the same MARKETING_VERSION and BUILD_NUMBER as Mozaic
+# (version.env), so both Sparkle feeds advance together.
 
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-NOTCH_ROOT=${NOTCH_ROOT:-"$ROOT/../boring.notch"}
+source "$ROOT/version.env"
+NOTCH_ROOT=${NOTCH_ROOT:-"$ROOT/Notch"}
 SIGNING_MODE=${MOZAIC_SIGNING:-dev}
 BUILD_DIR="$ROOT/.build/app"
 DERIVED_DATA="$ROOT/.build/notch-derivedData"
 APP_NAME="Mozaic Notch"
 BUNDLE_ID="com.zemuliu.MozaicNotch"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
-DMG_PATH="$BUILD_DIR/$APP_NAME.dmg"
 
 PROJECT="$NOTCH_ROOT/boringNotch.xcodeproj"
 if [[ ! -d "$PROJECT" ]]; then
-  echo "ERROR: $PROJECT not found. Clone the Mozaic Notch fork or set NOTCH_ROOT." >&2
+  echo "ERROR: $PROJECT not found. Set NOTCH_ROOT to the Mozaic Notch fork." >&2
   exit 1
+fi
+
+ARCH_SETTINGS=()
+if [[ -n "${ARCHES:-}" ]]; then
+  ARCH_SETTINGS=(ARCHS="$ARCHES" ONLY_ACTIVE_ARCH=NO)
 fi
 
 echo "🔨 Building $APP_NAME..."
@@ -33,6 +43,9 @@ xcodebuild -project "$PROJECT" \
   -scheme boringNotch \
   -configuration Release \
   -derivedDataPath "$DERIVED_DATA" \
+  MARKETING_VERSION="$MARKETING_VERSION" \
+  CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+  ${ARCH_SETTINGS[@]+"${ARCH_SETTINGS[@]}"} \
   CODE_SIGN_IDENTITY="" \
   CODE_SIGNING_REQUIRED=NO \
   CODE_SIGNING_ALLOWED=NO
@@ -119,19 +132,13 @@ else
   echo "🔓 Skipping code signing."
 fi
 
-# ── DMG ───────────────────────────────────────────────────────────────────────
-
-echo "💿 Packaging $APP_NAME.dmg..."
-STAGING_DIR="$BUILD_DIR/notch-dmg-staging"
-rm -rf "$STAGING_DIR" "$DMG_PATH"
-mkdir -p "$STAGING_DIR"
-cp -R "$APP_BUNDLE" "$STAGING_DIR/"
-ln -s /Applications "$STAGING_DIR/Applications"
-hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$STAGING_DIR" -ov -format UDZO "$DMG_PATH"
-rm -rf "$STAGING_DIR"
-
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_BUNDLE/Contents/Info.plist")
+BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_BUNDLE/Contents/Info.plist")
+if [[ "$VERSION" != "$MARKETING_VERSION" || "$BUILD" != "$BUILD_NUMBER" ]]; then
+  echo "ERROR: $APP_NAME is $VERSION ($BUILD), expected $MARKETING_VERSION ($BUILD_NUMBER)." >&2
+  exit 1
+fi
+
 echo ""
-echo "✅ $APP_NAME $VERSION"
+echo "✅ $APP_NAME $VERSION ($BUILD)"
 echo "📍 App: $APP_BUNDLE"
-echo "📍 DMG: $DMG_PATH"

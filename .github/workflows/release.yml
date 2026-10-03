@@ -201,6 +201,22 @@ jobs:
           fi
           Scripts/verify-release-app.sh "${VERIFY_ARGS[@]}" .build/app/Mozaic.app
 
+      - name: Build Mozaic Notch
+        # Separate app with its own TCC identity (ADR-1001), built from the
+        # vendored fork in Notch/ with the same version as Mozaic.
+        env:
+          MOZAIC_SIGNING: ${{ steps.import_cert.outputs.signing_mode }}
+          APP_IDENTITY: ${{ steps.import_cert.outputs.identity }}
+          ARCHES: "arm64 x86_64"
+        run: |
+          Scripts/build-notch.sh
+          ARCHS=$(lipo -archs ".build/app/Mozaic Notch.app/Contents/MacOS/Mozaic Notch")
+          echo "Mozaic Notch architectures: $ARCHS"
+          if [[ "$ARCHS" != *"x86_64"* ]] || [[ "$ARCHS" != *"arm64"* ]]; then
+            echo "Error: Mozaic Notch is not a Universal Binary (found: $ARCHS)"
+            exit 1
+          fi
+
       - name: Cache Homebrew
         id: cache-homebrew
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -247,18 +263,25 @@ jobs:
             exit 1
           fi
 
-          # Create styled DMG with Applications symlink
+          # Ship both apps together in one styled DMG with an Applications symlink.
+          STAGING_DIR=".build/app/release-dmg"
+          rm -rf "$STAGING_DIR"
+          mkdir -p "$STAGING_DIR"
+          cp -R "$APP_PATH" ".build/app/Mozaic Notch.app" "$STAGING_DIR/"
+
           create-dmg \
             --volname "Mozaic" \
             --window-pos 200 120 \
-            --window-size 660 400 \
+            --window-size 720 400 \
             --icon-size 100 \
-            --icon "Mozaic.app" 180 190 \
-            --app-drop-link 480 190 \
+            --icon "Mozaic.app" 150 190 \
+            --icon "Mozaic Notch.app" 340 190 \
+            --app-drop-link 560 190 \
             --hide-extension "Mozaic.app" \
+            --hide-extension "Mozaic Notch.app" \
             --no-internet-enable \
             mozaic.dmg \
-            "$APP_PATH"
+            "$STAGING_DIR"
 
       - name: Determine artifact name
         id: artifact
@@ -277,9 +300,17 @@ jobs:
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "filename=mozaic-$TAG.dmg" >> "$GITHUB_OUTPUT"
+          # Sparkle updates each app from its own archive, since the DMG holds both.
+          echo "app_zip=mozaic-$TAG.zip" >> "$GITHUB_OUTPUT"
+          echo "notch_zip=mozaic-notch-$TAG.zip" >> "$GITHUB_OUTPUT"
 
       - name: Rename DMG
         run: mv mozaic.dmg "${{ steps.artifact.outputs.filename }}"
+
+      - name: Create Sparkle update archives
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent .build/app/Mozaic.app "${{ steps.artifact.outputs.app_zip }}"
+          ditto -c -k --sequesterRsrc --keepParent ".build/app/Mozaic Notch.app" "${{ steps.artifact.outputs.notch_zip }}"
 
       - name: Sign and notarize DMG
         env:
@@ -321,7 +352,10 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
           name: ${{ steps.artifact.outputs.filename }}
-          path: ${{ steps.artifact.outputs.filename }}
+          path: |
+            ${{ steps.artifact.outputs.filename }}
+            ${{ steps.artifact.outputs.app_zip }}
+            ${{ steps.artifact.outputs.notch_zip }}
           retention-days: 30
 
       - name: Calculate SHA256
@@ -330,15 +364,13 @@ jobs:
           SHA256=$(shasum -a 256 "${{ steps.artifact.outputs.filename }}" | awk '{print $1}')
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
 
-      - name: Sign DMG for Sparkle
+      - name: Sign update archives for Sparkle
         id: sparkle_sign
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
             echo "Warning: SPARKLE_PRIVATE_KEY not set, skipping Sparkle signing"
-            echo "signature=" >> "$GITHUB_OUTPUT"
-            echo "length=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -346,8 +378,6 @@ jobs:
           SIGN_UPDATE=$(find ./.build -name "sign_update" -type f 2>/dev/null | head -1)
           if [ -z "$SIGN_UPDATE" ]; then
             echo "Warning: sign_update not found, skipping Sparkle signing"
-            echo "signature=" >> "$GITHUB_OUTPUT"
-            echo "length=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -357,17 +387,18 @@ jobs:
           printf '%s' "$SPARKLE_PRIVATE_KEY" > "$SPARKLE_KEY_FILE"
           chmod 600 "$SPARKLE_KEY_FILE"
 
-          # Sign the DMG and capture output. Do not echo SIGN_OUTPUT: it contains the public update signature.
-          SIGN_OUTPUT=$("$SIGN_UPDATE" --ed-key-file "$SPARKLE_KEY_FILE" "${{ steps.artifact.outputs.filename }}")
-
-          # Parse signature and length from output
-          # Output format: sparkle:edSignature="..." length="..."
-          SIGNATURE=$(echo "$SIGN_OUTPUT" | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/sparkle:edSignature="//;s/"$//')
-          LENGTH=$(stat -f%z "${{ steps.artifact.outputs.filename }}")
-
-          echo "signature=$SIGNATURE" >> "$GITHUB_OUTPUT"
-          echo "length=$LENGTH" >> "$GITHUB_OUTPUT"
-          echo "Sparkle signature generated successfully"
+          # Both apps' feeds use the same EdDSA key (ADR-1001).
+          # Output format: sparkle:edSignature="..." length="...". Do not echo it.
+          sign() {
+            local file="$1" prefix="$2" output signature
+            output=$("$SIGN_UPDATE" --ed-key-file "$SPARKLE_KEY_FILE" "$file")
+            signature=$(echo "$output" | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/sparkle:edSignature="//;s/"$//')
+            echo "${prefix}signature=$signature" >> "$GITHUB_OUTPUT"
+            echo "${prefix}length=$(stat -f%z "$file")" >> "$GITHUB_OUTPUT"
+          }
+          sign "${{ steps.artifact.outputs.app_zip }}" ""
+          sign "${{ steps.artifact.outputs.notch_zip }}" "notch_"
+          echo "Sparkle signatures generated successfully"
 
       - name: Generate release notes
         id: release_notes
@@ -420,7 +451,11 @@ jobs:
           set -eo pipefail
 
           TAG="${{ steps.artifact.outputs.tag }}"
-          FILE="${{ steps.artifact.outputs.filename }}"
+          FILES=(
+            "${{ steps.artifact.outputs.filename }}"
+            "${{ steps.artifact.outputs.app_zip }}"
+            "${{ steps.artifact.outputs.notch_zip }}"
+          )
           TITLE="${TAG}"
           PRERELEASE_FLAG=""
 
@@ -430,9 +465,9 @@ jobs:
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists, uploading asset instead"
-            gh release upload "$TAG" "$FILE" --clobber
+            gh release upload "$TAG" "${FILES[@]}" --clobber
           else
-            gh release create "$TAG" "$FILE" \
+            gh release create "$TAG" "${FILES[@]}" \
               --title "$TITLE" \
               --notes-file release_notes.md \
               $PRERELEASE_FLAG
@@ -462,7 +497,7 @@ jobs:
 
             url "https://github.com/Ryz3nPlayZ/Mozaic/releases/download/v#{version}/mozaic-v#{version}.dmg"
             name "Mozaic"
-            desc "Native YouTube Music client"
+            desc "Native YouTube Music client with a companion notch app"
             homepage "https://github.com/Ryz3nPlayZ/Mozaic"
 
             auto_updates true
@@ -472,15 +507,21 @@ jobs:
             depends_on macos: :sequoia
 
             app "Mozaic.app"
+            app "Mozaic Notch.app"
 
-            postflight_steps do
-              run "/usr/bin/xattr", args: ["-cr", "{{appdir}}/Mozaic.app"], sudo: false
+            postflight do
+              system_command "/usr/bin/xattr",
+                             args: ["-cr", "#{appdir}/Mozaic.app", "#{appdir}/Mozaic Notch.app"],
+                             sudo: false
             end
 
             zap trash: [
               "~/Library/Application Support/Mozaic",
               "~/Library/Caches/com.zemuliu.Mozaic",
+              "~/Library/Caches/com.zemuliu.MozaicNotch",
+              "~/Library/HTTPStorages/com.zemuliu.MozaicNotch",
               "~/Library/Preferences/com.zemuliu.Mozaic.plist",
+              "~/Library/Preferences/com.zemuliu.MozaicNotch.plist",
               "~/Library/Saved Application State/com.zemuliu.Mozaic.savedState",
               "~/Library/WebKit/com.zemuliu.Mozaic",
             ]
@@ -517,7 +558,10 @@ jobs:
           git checkout -b "$BRANCH" "origin/${DEFAULT_BRANCH}"
 
           PUB_DATE=$(date -u "+%a, %d %b %Y %H:%M:%S %z")
-          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${{ steps.artifact.outputs.filename }}"
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${{ steps.artifact.outputs.app_zip }}"
+          NOTCH_DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${{ steps.artifact.outputs.notch_zip }}"
+          NOTCH_SIGNATURE="${{ steps.sparkle_sign.outputs.notch_signature }}"
+          NOTCH_LENGTH="${{ steps.sparkle_sign.outputs.notch_length }}"
           RELEASE_NOTES_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
 
           # Create updated appcast.xml with the new item at the top
@@ -548,13 +592,40 @@ jobs:
           </rss>
           APPCAST_EOF
 
-          git add appcast.xml
+          cat > notch-appcast.xml << APPCAST_EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <channel>
+                  <title>Mozaic Notch Updates</title>
+                  <link>https://github.com/${{ github.repository }}/releases</link>
+                  <description>Most recent updates for Mozaic Notch.</description>
+                  <language>en</language>
+
+                  <item>
+                      <title>Version ${VERSION}</title>
+                      <sparkle:releaseNotesLink>${RELEASE_NOTES_URL}</sparkle:releaseNotesLink>
+                      <pubDate>${PUB_DATE}</pubDate>
+                      <enclosure
+                          url="${NOTCH_DOWNLOAD_URL}"
+                          sparkle:version="${{ github.run_number }}"
+                          sparkle:shortVersionString="${VERSION}"
+                          length="${NOTCH_LENGTH}"
+                          type="application/octet-stream"
+                          sparkle:edSignature="${NOTCH_SIGNATURE}"/>
+                      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+                  </item>
+
+              </channel>
+          </rss>
+          APPCAST_EOF
+
+          git add appcast.xml notch-appcast.xml
           if git diff --cached --quiet; then
             echo "Appcast already up to date; nothing to do"
             exit 0
           fi
 
-          git commit -m "Update appcast to ${TAG}"
+          git commit -m "Update appcasts to ${TAG}"
           git push origin "$BRANCH"
 
           PR_URL=$(gh pr create \
