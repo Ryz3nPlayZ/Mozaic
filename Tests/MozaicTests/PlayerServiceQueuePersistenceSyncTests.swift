@@ -5,6 +5,8 @@ import Testing
 extension PlayerServiceQueueTests {
     @Test("Unavailable cookie restoration preserves playback ownership until startup cleanup", arguments: [true, false], [true, false])
     func unavailableCookieRestorePreservesPlaybackOwnership(wasGuestQueue: Bool, restoresSession: Bool) async throws {
+        let defaults = try Self.makeIsolatedPersistenceDefaults()
+        self.playerService.queuePersistenceDefaults = defaults
         let previousAuth = AuthService(webKitManager: MockWebKitManager())
         if wasGuestQueue {
             await previousAuth.checkLoginStatus()
@@ -15,10 +17,11 @@ extension PlayerServiceQueueTests {
         let songs = TestFixtures.makeSongs(count: 2)
         await self.playerService.playQueue(songs, startingAt: 1)
         self.playerService.saveQueueForPersistence()
-        let savedSession = try #require(UserDefaults.standard.data(forKey: "mozaic.saved.playbackSession"))
+        let savedSession = try #require(defaults.data(forKey: "mozaic.saved.playbackSession"))
         defer { self.playerService.clearSavedQueue() }
 
         let restoredService = PlayerService()
+        restoredService.queuePersistenceDefaults = defaults
         restoredService.setYTMusicClient(self.mockClient)
         #expect(restoredService.restoreQueueFromPersistence())
         let manager = MockWebKitManager()
@@ -37,7 +40,7 @@ extension PlayerServiceQueueTests {
         #expect(restoredService.queue.map(\.id) == songs.map(\.id))
         #expect(restoredService.currentTrack?.id == songs[1].id)
         restoredService.saveQueueForPersistence()
-        #expect(UserDefaults.standard.data(forKey: "mozaic.saved.playbackSession") == savedSession)
+        #expect(defaults.data(forKey: "mozaic.saved.playbackSession") == savedSession)
 
         let cookieReadEntered = AsyncGate()
         let releaseCookieRead = AsyncGate()
@@ -52,13 +55,13 @@ extension PlayerServiceQueueTests {
         await cookieReadEntered.wait()
         // Quitting can save the queue while the recovered cookie read is pending.
         restoredService.saveQueueForPersistence()
-        #expect(UserDefaults.standard.data(forKey: "mozaic.saved.playbackSession") == savedSession)
+        #expect(defaults.data(forKey: "mozaic.saved.playbackSession") == savedSession)
         await releaseCookieRead.open()
         await recovery.value
         #expect(await authService.checkLoginStatusForStartup(expectedState: authService.state))
         // Authentication can publish before the root task performs startup cleanup.
         restoredService.saveQueueForPersistence()
-        #expect(UserDefaults.standard.data(forKey: "mozaic.saved.playbackSession") == savedSession)
+        #expect(defaults.data(forKey: "mozaic.saved.playbackSession") == savedSession)
         restoredService.reloadCurrentTrackForAuthDataStoreChange(usesCookieFreeDataStore: !restoresSession)
         #expect(restoredService.restoredPlaybackSessionOwnerScope == (wasGuestQueue
                 ? PlayerService.playbackSessionScopeGuest : PlayerService.playbackSessionScopeAuthenticated))
@@ -70,7 +73,7 @@ extension PlayerServiceQueueTests {
         if wasGuestQueue != restoresSession {
             #expect(restoredService.queue.map(\.id) == songs.map(\.id))
             #expect(restoredService.currentTrack?.id == songs[1].id)
-            #expect(UserDefaults.standard.data(forKey: "mozaic.saved.playbackSession") != nil)
+            #expect(defaults.data(forKey: "mozaic.saved.playbackSession") != nil)
             if wasGuestQueue {
                 // After startup, a later explicit login can own the preserved guest queue.
                 authService.completeLogin(sapisid: "mock-later-session")
@@ -80,12 +83,14 @@ extension PlayerServiceQueueTests {
         } else {
             #expect(restoredService.queue.isEmpty)
             #expect(restoredService.currentTrack == nil)
-            #expect(UserDefaults.standard.data(forKey: "mozaic.saved.playbackSession") == nil)
+            #expect(defaults.data(forKey: "mozaic.saved.playbackSession") == nil)
         }
     }
 
     @Test("Legacy restored queues stay private until startup cleanup", arguments: [true, false])
-    func legacyQueueOwnershipWaitsForStartupCleanup(restoresSession: Bool) async {
+    func legacyQueueOwnershipWaitsForStartupCleanup(restoresSession: Bool) async throws {
+        let defaults = try Self.makeIsolatedPersistenceDefaults()
+        self.playerService.queuePersistenceDefaults = defaults
         let songs = TestFixtures.makeSongs(count: 2)
         await self.playerService.playQueue(songs, startingAt: 1)
         self.playerService.saveQueueForPersistence()
@@ -94,6 +99,7 @@ extension PlayerServiceQueueTests {
         defer { self.playerService.clearSavedQueue() }
 
         let restoredService = PlayerService()
+        restoredService.queuePersistenceDefaults = defaults
         restoredService.setYTMusicClient(self.mockClient)
         #expect(restoredService.restoreQueueFromPersistence())
         #expect(restoredService.restoredPlaybackSessionOwnerScope == nil)
@@ -113,11 +119,11 @@ extension PlayerServiceQueueTests {
         if restoresSession {
             restoredService.clearGuestPlaybackForAuthenticatedStartup()
             #expect(restoredService.queue.map(\.id) == songs.map(\.id))
-            #expect(UserDefaults.standard.data(forKey: "mozaic.saved.playbackSession") != nil)
+            #expect(defaults.data(forKey: "mozaic.saved.playbackSession") != nil)
         } else {
             restoredService.clearPlaybackForGuestStartup()
             #expect(restoredService.queue.isEmpty)
-            #expect(UserDefaults.standard.data(forKey: "mozaic.saved.playbackSession") == nil)
+            #expect(defaults.data(forKey: "mozaic.saved.playbackSession") == nil)
         }
     }
 
@@ -142,5 +148,13 @@ extension PlayerServiceQueueTests {
         #expect(self.playerService.queuePersistenceWriteCountForTesting == firstWriteCount)
         #expect(self.playerService.injectedWebQueueVideoId == nil)
         #expect(self.playerService.pendingWebQueueInjectionVideoId == nil)
+    }
+
+    /// Queue persistence defaults private to one test, so parallel suites can't overwrite the saved session.
+    private static func makeIsolatedPersistenceDefaults() throws -> UserDefaults {
+        let suiteName = "com.mozaic.tests.queue-persistence-sync.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        return defaults
     }
 }
