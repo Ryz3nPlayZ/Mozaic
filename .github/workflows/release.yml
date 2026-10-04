@@ -514,10 +514,11 @@ jobs:
             app "Mozaic.app"
             app "Mozaic Notch.app"
 
-            postflight do
-              system_command "/usr/bin/xattr",
-                             args: ["-cr", "#{appdir}/Mozaic.app", "#{appdir}/Mozaic Notch.app"],
-                             sudo: false
+            postflight_steps do
+              run "/usr/bin/xattr", args: ["-cr", "{{appdir}}/Mozaic.app"], must_succeed: false
+              run "/usr/bin/xattr", args: ["-d", "com.apple.quarantine", "{{appdir}}/Mozaic.app"], must_succeed: false
+              run "/usr/bin/xattr", args: ["-cr", "{{appdir}}/Mozaic Notch.app"], must_succeed: false
+              run "/usr/bin/xattr", args: ["-d", "com.apple.quarantine", "{{appdir}}/Mozaic Notch.app"], must_succeed: false
             end
 
             zap trash: [
