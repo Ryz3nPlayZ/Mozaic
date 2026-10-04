@@ -62,7 +62,9 @@ final class PlaylistImportViewModel {
     func load(fileURL: URL) {
         let didAccess = fileURL.startAccessingSecurityScopedResource()
         defer {
-            if didAccess { fileURL.stopAccessingSecurityScopedResource() }
+            if didAccess {
+                fileURL.stopAccessingSecurityScopedResource()
+            }
         }
         do {
             let data = try Data(contentsOf: fileURL)
@@ -122,7 +124,9 @@ final class PlaylistImportViewModel {
             var completed = 0
             for await result in group {
                 results[result.index].song = result.song
-                if result.failed { failedSearches += 1 }
+                if result.failed {
+                    failedSearches += 1
+                }
                 completed += 1
                 self.phase = .matching(completed: completed, total: tracks.count)
                 enqueueNext()

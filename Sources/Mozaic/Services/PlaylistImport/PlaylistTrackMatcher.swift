@@ -46,8 +46,12 @@ enum PlaylistTrackMatcher {
         let lhs = Self.normalize(Self.stripVersionSuffix(source))
         let rhs = Self.normalize(Self.stripVersionSuffix(candidate))
         guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
-        if lhs == rhs { return 1 }
-        if lhs.contains(rhs) || rhs.contains(lhs) { return 0.8 }
+        if lhs == rhs {
+            return 1
+        }
+        if lhs.contains(rhs) || rhs.contains(lhs) {
+            return 0.8
+        }
         return Self.tokenOverlap(lhs, rhs)
     }
 

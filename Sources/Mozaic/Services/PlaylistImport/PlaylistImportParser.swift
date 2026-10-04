@@ -65,13 +65,12 @@ enum PlaylistImportParser {
         let fallbackName = Self.playlistName(fromFileName: fileName)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines.union(Self.byteOrderMark))
 
-        let playlists: [ImportedPlaylist]
-        if trimmed.hasPrefix("{") || trimmed.hasPrefix("[") {
-            playlists = try Self.parseSpotifyJSON(data: Data(trimmed.utf8), fallbackName: fallbackName)
+        let playlists: [ImportedPlaylist] = if trimmed.hasPrefix("{") || trimmed.hasPrefix("[") {
+            try Self.parseSpotifyJSON(data: Data(trimmed.utf8))
         } else if fileName.lowercased().hasSuffix(".csv") || Self.looksLikeCSV(trimmed) {
-            playlists = [ImportedPlaylist(name: fallbackName, tracks: try Self.parseCSV(trimmed))]
+            try [ImportedPlaylist(name: fallbackName, tracks: Self.parseCSV(trimmed))]
         } else {
-            playlists = [ImportedPlaylist(name: fallbackName, tracks: Self.parseText(trimmed))]
+            [ImportedPlaylist(name: fallbackName, tracks: Self.parseText(trimmed))]
         }
 
         let nonEmpty = playlists.filter { !$0.tracks.isEmpty }
@@ -161,11 +160,15 @@ enum PlaylistImportParser {
                 row.append(field)
                 field = ""
             case "\r":
-                if pending == "\n" { pending = iterator.next() }
+                if pending == "\n" {
+                    pending = iterator.next()
+                }
                 fallthrough
             case "\n":
                 row.append(field)
-                if row.contains(where: { !$0.isEmpty }) { rows.append(row) }
+                if row.contains(where: { !$0.isEmpty }) {
+                    rows.append(row)
+                }
                 row = []
                 field = ""
             default:
@@ -173,7 +176,9 @@ enum PlaylistImportParser {
             }
         }
         row.append(field)
-        if row.contains(where: { !$0.isEmpty }) { rows.append(row) }
+        if row.contains(where: { !$0.isEmpty }) {
+            rows.append(row)
+        }
         return rows
     }
 
@@ -214,7 +219,7 @@ enum PlaylistImportParser {
     }
 
     /// Parses Spotify's account data download (`Playlist1.json` or `YourLibrary.json`).
-    static func parseSpotifyJSON(data: Data, fallbackName: String) throws -> [ImportedPlaylist] {
+    static func parseSpotifyJSON(data: Data) throws -> [ImportedPlaylist] {
         let decoder = JSONDecoder()
         if let file = try? decoder.decode(SpotifyPlaylistsFile.self, from: data) {
             return file.playlists.map { playlist in
